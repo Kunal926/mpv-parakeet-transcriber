@@ -70,14 +70,14 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
         local temp_dir = "C:/temp" -- Ensure this directory exists and is writable
 
         -- Keybindings (Alt combinations are generally safer from conflicts)
-        local key_binding_default = "ctrl+w"
-        local key_binding_py_float32 = "alt+7"        
-        local key_binding_ffmpeg_preprocess = "alt+8"  
-        local key_binding_ffmpeg_py_float32 = "alt+9"
+        local key_binding_default = "alt+1"
+        local key_binding_py_float32 = "alt+2"        
+        local key_binding_ffmpeg_preprocess = "alt+3"  
+        local key_binding_ffmpeg_py_float32 = "alt+4"
 
         local auto_load_and_cleanup_delay_seconds = 30
 
-        -- FFmpeg audio filter chain for pre-processing modes (alt+8, alt+9)
+        -- FFmpeg audio filter chain for pre-processing modes (alt+3, alt+4)
         -- Start with simpler filters and test.
         -- Example: Gentle compression (worked in tests)
         local ffmpeg_audio_filters = "acompressor=threshold=0.1:ratio=2:attack=20:release=250"
