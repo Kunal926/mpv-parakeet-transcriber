@@ -14,10 +14,10 @@ local ffmpeg_path = "ffmpeg"
 local ffprobe_path = "ffprobe"
 local temp_dir = "C:/temp"
 
-local key_binding_default = "ctrl+w"
-local key_binding_py_float32 = "alt+7"
-local key_binding_ffmpeg_preprocess = "alt+8"
-local key_binding_ffmpeg_py_float32 = "alt+9"
+local key_binding_default = "alt+1"
+local key_binding_py_float32 = "alt+2"
+local key_binding_ffmpeg_preprocess = "alt+3"
+local key_binding_ffmpeg_py_float32 = "alt+4"
 
 local auto_load_and_cleanup_delay_seconds = 30
 
