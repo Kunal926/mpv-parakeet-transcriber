@@ -1,9 +1,7 @@
--- parakeet_mpv_ffmpeg_venv.lua (v8b - Corrected FFmpeg Map)
+-- parakeet_mpv_ffmpeg_venv.lua (v7 - Improved OSD messages for clarity)
 -- Lua script for MPV to transcribe the ENTIRE audio file using parakeet_transcribe.py
 -- from a specified Python virtual environment, after pre-processing with FFmpeg
 -- to select an English audio track.
--- NEW: Detects audio stream start_time offset using ffprobe and passes it to Python.
--- FIX: Uses correct -map 0:index syntax when specific_audio_stream_idx is found.
 
 local mp = require 'mp'
 local utils = require 'mp.utils'
@@ -15,10 +13,9 @@ local python_exe = "C:/venvs/nemo_mpv_py312/Scripts/python.exe"
 -- 2. Path to the parakeet_transcribe.py script.
 local parakeet_script_path = "C:/Parakeet_Caption/parakeet_transcribe.py" -- Hardcoded as per user request
 
--- 3. Full path to your FFmpeg and FFprobe executables.
---    If "ffmpeg"/"ffprobe", it's assumed to be in system PATH. Otherwise, provide full path.
+-- 3. Full path to your FFmpeg executable.
+--    If "ffmpeg", it's assumed to be in system PATH. Otherwise, provide full path.
 local ffmpeg_path = "ffmpeg"
-local ffprobe_path = "ffprobe" -- Added for ffprobe
 
 -- 4. Path to a directory for temporary files.
 local temp_dir = "C:/temp"
@@ -38,26 +35,28 @@ local function to_str_safe(val)
     return tostring(val)
 end
 
--- Ensure temp directory exists
+-- Ensure temp directory exists (basic check)
 if not utils.file_info(temp_dir) then
     mp.msg.warn("[parakeet_mpv] Temporary directory does not exist: " .. temp_dir)
+    mp.msg.warn("[parakeet_mpv] Please create '" .. temp_dir .. "' manually if issues occur, or check permissions.")
     local mkdir_cmd
-    if package.config:sub(1,1) == '\\' then -- Windows
+    if package.config:sub(1,1) == '\\' then -- Likely Windows
         if temp_dir:match("^[A-Za-z]:$") then
              mp.msg.warn("[parakeet_mpv] Cannot 'mkdir' a root drive like '" .. temp_dir .. "'. Please ensure it's accessible.")
         else
             mkdir_cmd = string.format('cmd /C "if not exist "%s" mkdir "%s""', temp_dir:gsub("/", "\\"), temp_dir:gsub("/", "\\"))
-            local _, err_code = os.execute(mkdir_cmd)
+            local ok, err_code = os.execute(mkdir_cmd)
             if err_code == 0 then 
-                 mp.msg.info("[parakeet_mpv] Attempted to create temp directory: " .. temp_dir)
+                 mp.msg.info("[parakeet_mpv] Attempted to create temp directory: " .. temp_dir .. " (Success or already exists)")
             else
-                 mp.msg.warn("[parakeet_mpv] Failed to create temp directory. Exit Code: " .. to_str_safe(err_code))
+                 mp.msg.warn("[parakeet_mpv] Failed to create temp directory (or command failed). Exit Code: " .. to_str_safe(err_code) .. ". Command: " .. mkdir_cmd)
             end
         end
-    else -- Linux/macOS
+    else -- Likely Linux/macOS
         mkdir_cmd = string.format('mkdir -p "%s"', temp_dir)
-        os.execute(mkdir_cmd)
-        mp.msg.info("[parakeet_mpv] Attempted to create temp directory: " .. temp_dir)
+        local ok, err = os.execute(mkdir_cmd)
+        if ok then mp.msg.info("[parakeet_mpv] Attempted to create temp directory: " .. temp_dir)
+        else mp.msg.warn("[parakeet_mpv] Failed to attempt temp directory creation: " .. (err or "unknown")) end
     end
 end
 
@@ -86,7 +85,8 @@ end
 -- Function to safely remove a file
 local function safe_remove(filepath, description)
     if not filepath then return end
-    if utils.file_info(filepath) then
+    local file_info_check = utils.file_info(filepath)
+    if file_info_check then
         local success, err_msg = os.remove(filepath)
         if success then
             log("debug", "Cleaned up temporary file (" .. (description or "") .. "): ", filepath)
@@ -98,170 +98,124 @@ local function safe_remove(filepath, description)
     end
 end
 
--- NEW: Function to get audio stream start offset and specific index
-local function get_audio_stream_info(media_path, target_language_code)
-    local ffprobe_cmd_args = {
-        ffprobe_path,
-        "-v", "quiet",
-        "-print_format", "json",
-        "-show_streams",
-        "-select_streams", "a", -- Select all audio streams
-        media_path
-    }
-    log("debug", "Running ffprobe to find audio streams: ", table.concat(ffprobe_cmd_args, " "))
-    local res = utils.subprocess({args = ffprobe_cmd_args, cancellable = false})
-
-    if res.error or res.status ~= 0 or not res.stdout then
-        log("warn", "ffprobe command failed or produced no output. Error: ", to_str_safe(res.error), ", Status: ", to_str_safe(res.status))
-        if res.stderr and string.len(res.stderr) > 0 then log("warn", "ffprobe stderr: ", res.stderr) end
-        return 0.0, nil -- Default to 0.0 offset, no specific stream index found
-    end
-
-    local success, data = pcall(utils.parse_json, res.stdout)
-    if not success or not data or not data.streams or #data.streams == 0 then
-        log("warn", "Failed to parse ffprobe JSON output or no audio streams found. Data: ", to_str_safe(res.stdout))
-        return 0.0, nil
-    end
-
-    local selected_stream_absolute_index = nil -- This will be the stream index like "0", "1", "2" from ffprobe
-    local selected_stream_start_time = 0.0
-
-    -- Try to find the target language stream
-    if target_language_code then
-        for _, stream in ipairs(data.streams) do
-            if stream.codec_type == "audio" and stream.tags and stream.tags.language and stream.tags.language:lower():match(target_language_code:lower()) then
-                selected_stream_absolute_index = tostring(stream.index) -- FFprobe's absolute stream index
-                selected_stream_start_time = tonumber(stream.start_time) or 0.0
-                log("info", "Found target language stream '", target_language_code, "' with absolute index ", selected_stream_absolute_index, " and start_time ", selected_stream_start_time)
-                return selected_stream_start_time, selected_stream_absolute_index
-            end
-        end
-        log("warn", "Target language '", target_language_code, "' not found in ffprobe metadata tags.")
-    end
-
-    -- If target language not found (or not specified), use the first audio stream as a fallback for offset and index
-    log("info", "No specific language match or no target language. Using first audio stream for offset and index.")
-    for _, stream in ipairs(data.streams) do -- Iterate again to find the first audio stream
-        if stream.codec_type == "audio" then
-            selected_stream_absolute_index = tostring(stream.index)
-            selected_stream_start_time = tonumber(stream.start_time) or 0.0
-            log("info", "Using first available audio stream (absolute index ", selected_stream_absolute_index, ") with start_time ", selected_stream_start_time, " as reference for offset and mapping.")
-            return selected_stream_start_time, selected_stream_absolute_index
-        end
-    end
-    
-    log("warn", "No audio streams found at all by ffprobe.")
-    return 0.0, nil 
-end
-
-
 local function transcribe_current_file()
-    -- Validations (same as before)
-    if not utils.file_info(python_exe) then log("error", "Python executable not found: ", python_exe) return end
-    if not utils.file_info(parakeet_script_path) then log("error", "Parakeet script not found: '", parakeet_script_path) return end
-    if ffmpeg_path ~= "ffmpeg" and not utils.file_info(ffmpeg_path) then log("error", "FFmpeg executable not found: ", ffmpeg_path) return end
-    if ffprobe_path ~= "ffprobe" and not utils.file_info(ffprobe_path) then log("error", "FFprobe executable not found: ", ffprobe_path) return end
-    if not utils.file_info(temp_dir) or not utils.file_info(temp_dir).is_dir then log("error", "Temporary directory '", temp_dir, "' does not exist or is not a directory.") return end
+    -- Validations
+    if not utils.file_info(python_exe) then
+         log("error", "Python executable not found at configured venv path: ", python_exe, ". Please verify 'python_exe' and ensure the virtual environment is correctly set up.")
+         return
+    end
+    if not utils.file_info(parakeet_script_path) then
+        log("error", "parakeet_transcribe.py not found at hardcoded path: '", parakeet_script_path, "'. Please ensure the Python script is correctly located at this path.")
+        return
+    end
+    if ffmpeg_path ~= "ffmpeg" and not utils.file_info(ffmpeg_path) then
+        log("error", "FFmpeg executable not found at specified full path: ", ffmpeg_path, ". Please verify 'ffmpeg_path' or set to 'ffmpeg' if it's in PATH.")
+        return
+    end
+    if not utils.file_info(temp_dir) or not utils.file_info(temp_dir).is_dir then
+        log("error", "Temporary directory '", temp_dir, "' does not exist or is not a directory. Please create it and ensure permissions.")
+        return
+    end
 
     local current_media_path = mp.get_property_native("path")
-    if not current_media_path or current_media_path == "" then log("error", "No file is currently playing.") return end
+    if not current_media_path or current_media_path == "" then
+        log("error", "No file is currently playing.")
+        return
+    end
 
     local file_name_with_ext = current_media_path:match("([^/\\]+)$") or "unknown_file"
     local base_name = file_name_with_ext:match("(.+)%.[^%.]+$") or file_name_with_ext
     local media_dir = ""
     local path_sep_pos = current_media_path:match("^.*[/\\]()")
-    if path_sep_pos then media_dir = current_media_path:sub(1, path_sep_pos -1)
-    else local cwd = utils.getcwd() if cwd then media_dir = cwd end end
-    if media_dir ~= "" and not media_dir:match("[/\\]$") then media_dir = media_dir .. package.config:sub(1,1) end
+    if path_sep_pos then
+        media_dir = current_media_path:sub(1, path_sep_pos -1)
+    else 
+        local cwd = utils.getcwd()
+        if cwd then media_dir = cwd end
+    end
+    if media_dir ~= "" and not media_dir:match("[/\\]$") then
+        media_dir = media_dir .. package.config:sub(1,1) 
+    end
 
     local srt_output_path = utils.join_path(media_dir, base_name .. ".srt")
     local sanitized_base_name = base_name:gsub("[^%w%-_%.]", "_") 
-    local temp_audio_path = utils.join_path(temp_dir, sanitized_base_name .. "_audio_for_transcription.wav")
+    local temp_audio_path = utils.join_path(temp_dir, sanitized_base_name .. "_eng_audio.wav")
 
-    mp.osd_message("Parakeet: Analyzing audio streams...", 3)
-    log("info", "Step 0: Analyzing audio streams with FFprobe...")
-    local audio_stream_offset_seconds, specific_audio_absolute_idx = get_audio_stream_info(current_media_path, "eng")
-    log("info", "Determined audio stream start offset: ", audio_stream_offset_seconds, "s. Specific stream absolute index for FFmpeg: ", to_str_safe(specific_audio_absolute_idx))
+    -- Initial OSD message before FFmpeg processing
+    mp.osd_message("Parakeet: Preparing audio with FFmpeg...", 5) -- MODIFIED OSD Message
 
-    mp.osd_message("Parakeet: Preparing audio with FFmpeg...", 5)
     log("info", "Step 1: Extracting audio track with FFmpeg...")
     log("info", "Outputting temporary audio to: ", temp_audio_path)
 
-    local ffmpeg_common_args = {"-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y"}
-    local ffmpeg_args
-    local ffmpeg_map_value_for_log -- For logging the map value used
+    local ffmpeg_common_args = {
+        "-vn", 
+        "-acodec", "pcm_s16le", 
+        "-ar", "16000",        
+        "-ac", "1",            
+        "-y"                   
+    }
 
-    if specific_audio_absolute_idx then
-        -- If ffprobe found a specific English (or first) stream index, use its absolute index directly
-        ffmpeg_map_value_for_log = "0:" .. specific_audio_absolute_idx -- CORRECTED MAP
-        log("info", "Using specific stream map for FFmpeg: ", ffmpeg_map_value_for_log)
-        ffmpeg_args = {ffmpeg_path, "-i", current_media_path, "-map", ffmpeg_map_value_for_log}
-    else
-        log("warn", "No specific stream index from ffprobe. Attempting FFmpeg default English mapping first.")
-        ffmpeg_map_value_for_log = "0:a:m:language:eng"
-        ffmpeg_args = {ffmpeg_path, "-i", current_media_path, "-map", ffmpeg_map_value_for_log}
-    end
+    -- Attempt 1: Strictly map English audio track
+    local ffmpeg_args_eng = {
+        ffmpeg_path,
+        "-i", current_media_path,
+        "-map", "0:a:m:language:eng" 
+    }
+    for _, v in ipairs(ffmpeg_common_args) do table.insert(ffmpeg_args_eng, v) end
+    table.insert(ffmpeg_args_eng, temp_audio_path)
     
-    for _, v in ipairs(ffmpeg_common_args) do table.insert(ffmpeg_args, v) end
-    table.insert(ffmpeg_args, temp_audio_path)
-    
-    log("debug", "Running FFmpeg with map '", ffmpeg_map_value_for_log, "': ", table.concat(ffmpeg_args, " "))
-    local ffmpeg_res = utils.subprocess({ args = ffmpeg_args, cancellable = false })
+    log("debug", "Running FFmpeg (Strict English map): ", table.concat(ffmpeg_args_eng, " "))
+    local ffmpeg_res_eng = utils.subprocess({ args = ffmpeg_args_eng, cancellable = false })
 
-    -- If the primary attempt failed AND we didn't initially have a specific index (meaning we tried language map)
-    if (ffmpeg_res.error or ffmpeg_res.status ~= 0) and not specific_audio_absolute_idx then
-        log("warn", "FFmpeg (map '", ffmpeg_map_value_for_log ,"') command failed. Error: ", to_str_safe(ffmpeg_res.error), ", Status: ", to_str_safe(ffmpeg_res.status), ", Stderr: ", to_str_safe(ffmpeg_res.stderr))
-        log("warn", "Attempting FFmpeg fallback to map first audio stream explicitly (0:a:0?)...")
-        mp.osd_message("Parakeet: Specific/English audio map failed, trying fallback map 0:a:0?...", 3)
+    if ffmpeg_res_eng.error or ffmpeg_res_eng.status ~= 0 then
+        log("warn", "FFmpeg (Strict English map) command failed. Error: ", to_str_safe(ffmpeg_res_eng.error), ", Status: ", to_str_safe(ffmpeg_res_eng.status), ", Stderr: ", to_str_safe(ffmpeg_res_eng.stderr))
+        log("warn", "Attempting FFmpeg fallback to first audio stream...")
+        mp.osd_message("Parakeet: English audio not found, trying fallback...", 3) -- OSD for fallback
         
-        -- Re-check offset for the first audio stream if we are explicitly falling back to 0:a:0?
-        local fallback_offset_for_0a0, _ = get_audio_stream_info(current_media_path, nil) 
-        if fallback_offset_for_0a0 ~= audio_stream_offset_seconds then
-            log("info", "Updating audio offset for 0:a:0? fallback to: ", fallback_offset_for_0a0, "s.")
-            audio_stream_offset_seconds = fallback_offset_for_0a0
-        end
-        ffmpeg_map_value_for_log = "0:a:0?" -- For logging
-        ffmpeg_args = {ffmpeg_path, "-i", current_media_path, "-map", "0:a:0?"}
-        for _, v in ipairs(ffmpeg_common_args) do table.insert(ffmpeg_args, v) end
-        table.insert(ffmpeg_args, temp_audio_path)
+        local ffmpeg_args_fallback = {
+            ffmpeg_path,
+            "-i", current_media_path,
+            "-map", "0:a:0?" 
+        }
+        for _, v in ipairs(ffmpeg_common_args) do table.insert(ffmpeg_args_fallback, v) end
+        table.insert(ffmpeg_args_fallback, temp_audio_path)
 
-        log("debug", "Running FFmpeg (fallback map 0:a:0?): ", table.concat(ffmpeg_args, " "))
-        ffmpeg_res = utils.subprocess({ args = ffmpeg_args, cancellable = false }) 
+        log("debug", "Running FFmpeg (fallback map): ", table.concat(ffmpeg_args_fallback, " "))
+        local ffmpeg_res_fallback = utils.subprocess({ args = ffmpeg_args_fallback, cancellable = false })
 
-        if ffmpeg_res.error or ffmpeg_res.status ~= 0 then
-            log("error", "FFmpeg fallback audio extraction (0:a:0?) also failed. Error: ", to_str_safe(ffmpeg_res.error), ", Status: ", to_str_safe(ffmpeg_res.status), ", Stderr: ", to_str_safe(ffmpeg_res.stderr))
+        if ffmpeg_res_fallback.error or ffmpeg_res_fallback.status ~= 0 then
+            log("error", "FFmpeg fallback audio extraction also failed. Error: ", to_str_safe(ffmpeg_res_fallback.error), ", Status: ", to_str_safe(ffmpeg_res_fallback.status), ", Stderr: ", to_str_safe(ffmpeg_res_fallback.stderr))
             mp.osd_message("Parakeet: Failed to extract audio with FFmpeg.", 7)
             safe_remove(temp_audio_path, "Failed FFmpeg temp audio")
             return
         end
-    elseif ffmpeg_res.error or ffmpeg_res.status ~= 0 then -- If specific index attempt failed
-        log("error", "FFmpeg with specific map '", ffmpeg_map_value_for_log, "' failed. Error: ", to_str_safe(ffmpeg_res.error), ", Status: ", to_str_safe(ffmpeg_res.status), ", Stderr: ", to_str_safe(ffmpeg_res.stderr))
-        mp.osd_message("Parakeet: Failed to extract audio with FFmpeg (specific map).", 7)
-        safe_remove(temp_audio_path, "Failed FFmpeg temp audio")
-        return
     end
     
-    if not utils.file_info(temp_audio_path) or utils.file_info(temp_audio_path).size == 0 then
-        log("error", "FFmpeg ran but temporary audio file '", temp_audio_path, "' was not created or is empty.")
+    local temp_audio_file_info = utils.file_info(temp_audio_path)
+    if not temp_audio_file_info or temp_audio_file_info.size == 0 then
+        log("error", "FFmpeg ran but temporary audio file '", temp_audio_path, "' was not created or is empty. This can happen if no suitable audio track was found by any FFmpeg attempt. Check FFmpeg logs in console.")
         mp.osd_message("Parakeet: FFmpeg failed to produce audio file.", 7)
         safe_remove(temp_audio_path, "Empty/missing FFmpeg temp audio")
         return
     end
     log("info", "FFmpeg audio extraction seems successful. Temporary audio at: ", temp_audio_path)
 
-    mp.osd_message("Parakeet: Transcribing extracted audio... This may take a while.", 7)
+    -- OSD message before Python script (actual transcription)
+    mp.osd_message("Parakeet: Transcribing extracted audio... This may take a while.", 7) -- MODIFIED OSD Message (kept from previous logic)
     log("info", "Step 2: Starting Parakeet transcription for: ", file_name_with_ext)
 
     local python_command_args = {
         python_exe,
         parakeet_script_path,
         temp_audio_path,    
-        srt_output_path,
-        "--audio_start_offset", tostring(audio_stream_offset_seconds) 
+        srt_output_path
     }
 
     log("debug", "Running Python script: ", table.concat(python_command_args, " "))
-    local python_res = utils.subprocess({ args = python_command_args, cancellable = false })
+    local python_res = utils.subprocess({
+        args = python_command_args,
+        cancellable = false 
+    })
 
     if python_res.error then 
         log("error", "Failed to launch Parakeet Python script: ", (python_res.error or "Unknown error"))
@@ -281,14 +235,19 @@ local function transcribe_current_file()
             end
 
             log("info", "Attempting to load SRT: ", srt_output_path)
-            if utils.file_info(srt_output_path) and utils.file_info(srt_output_path).size > 0 then
-                mp.commandv("sub-add", srt_output_path, "auto")
-                mp.osd_message("Parakeet: Attempted to load " .. (srt_output_path:match("([^/\\]+)$") or srt_output_path), 3)
-            elseif utils.file_info(srt_output_path) then -- File exists but is empty
-                log("warn", "SRT file found but is empty: ", srt_output_path)
-                mp.osd_message("Parakeet: SRT file empty. Check console.", 5)
+            local srt_file_check = io.open(srt_output_path, "r")
+            if srt_file_check then
+                srt_file_check:close()
+                local srt_info = utils.file_info(srt_output_path)
+                if srt_info and srt_info.size > 0 then
+                    mp.commandv("sub-add", srt_output_path, "auto")
+                    mp.osd_message("Parakeet: Attempted to load " .. (srt_output_path:match("([^/\\]+)$") or srt_output_path), 3)
+                else
+                    log("warn", "SRT file found but is empty: ", srt_output_path, ". Python script might have failed to produce output.")
+                    mp.osd_message("Parakeet: SRT file empty. Check console.", 5)
+                end
             else
-                log("warn", "SRT file not found after delay: ", srt_output_path)
+                log("warn", "SRT file not found after delay: ", srt_output_path, ". Transcription might still be running, have failed, or taken longer.")
                 mp.osd_message("Parakeet: SRT not found. Check console for Python errors.", 7)
             end
             log("info", "Cleaning up temporary audio file: ", temp_audio_path)
@@ -302,10 +261,9 @@ end
 
 mp.add_key_binding(key_binding, "parakeet-transcribe-ffmpeg", transcribe_current_file)
 
-log("info", "Parakeet (FFmpeg, Offset Adjust) script loaded. Press '", key_binding, "' to transcribe.")
+log("info", "Parakeet (FFmpeg Preprocess, Full File) script loaded. Press '", key_binding, "' to transcribe.")
 log("info", "Using Python from: ", python_exe)
 log("info", "Using FFmpeg from: ", ffmpeg_path)
-log("info", "Using FFprobe from: ", ffprobe_path)
 log("info", "Parakeet script (hardcoded): ", parakeet_script_path) 
 log("info", "Temporary file directory: ", temp_dir)
 
