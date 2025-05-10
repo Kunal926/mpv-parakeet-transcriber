@@ -6,7 +6,6 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
 
 * **On-the-fly Transcription:** Generate subtitles for currently playing media in MPV.
 * **NVIDIA Parakeet ASR:** Utilizes the high-quality `nvidia/parakeet-tdt-0.6b-v2` model for accurate English transcription.
-   * Key Features:
    * Automatic punctuation and capitalization.
    * Accurate word-level timestamps.
    * Efficiently transcribes long audio segments (updated to support upto 3 hours) (For even longer audios, see this script).
