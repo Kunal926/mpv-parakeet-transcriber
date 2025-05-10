@@ -40,8 +40,8 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
 
 1.  **Clone the Repository (or download the files):**
     ```bash
-    # git clone https://github.com/Kunal926/mpv-parakeet-transcriber.git
-    # cd mpv-parakeet-transcriber
+    git clone https://github.com/Kunal926/mpv-parakeet-transcriber.git
+    cd mpv-parakeet-transcriber
     ```
 
 2.  **Python Environment Setup:**
