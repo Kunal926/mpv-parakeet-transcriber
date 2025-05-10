@@ -54,14 +54,7 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
     * Activate the virtual environment:
         * Windows: `.venv\Scripts\activate`
         * Linux/macOS: `source .venv/bin/activate`
-    * Install required packages. Create a `requirements.txt` file with at least:
-        ```txt
-        nemo_toolkit[asr]>=1.21.0 # Or your specific working version
-        soundfile
-        librosa
-        # Add torch, torchaudio if not covered by nemo_toolkit[asr] for your setup
-        ```
-        Then install:
+    * Install required packages:
         ```bash
         pip install -r requirements.txt
         ```
