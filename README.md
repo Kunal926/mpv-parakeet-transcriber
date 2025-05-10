@@ -164,10 +164,4 @@ This project is licensed under the MIT License - see the `LICENSE` file for deta
 
 Example `LICENSE` file (MIT):
 MIT LicenseCopyright (c) [Year] [Your Name/GitHub Username]Permission is hereby granted, free of charge, to any person obtaining a copyof this software and associated documentation files (the "Software"), to dealin the Software without restriction, including without limitation the rightsto use, copy, modify, merge, publish, distribute, sublicense, and/or sellcopies of the Software, and to permit persons to whom the Software isfurnished to do so, subject to the following conditions:The above copyright notice and this permission notice shall be included in allcopies or substantial portions of the Software.THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS ORIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THEAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHERLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THESOFTWARE.
-## TODO / Future Improvements
 
-* Option to select audio track language directly in MPV if multiple are available.
-* More sophisticated error handling and reporting to the MPV OSD.
-* Allow user to specify custom FFmpeg filter chains more easily (e.g., via a config file).
-* Investigate asynchronous/detached FFmpeg processing for very long filtering tasks to prevent MPV from appearing to hang.
-* Option to process only a selected region of the media file.
