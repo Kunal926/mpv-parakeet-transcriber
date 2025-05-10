@@ -8,10 +8,10 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
 * **NVIDIA Parakeet ASR:** Utilizes the high-quality `nvidia/parakeet-tdt-0.6b-v2` model for accurate English transcription.
 * **Audio Offset Correction:** Automatically detects and compensates for audio stream start time offsets in video files.
 * **Multiple Processing Modes:**
-    * **Standard Mode (`Ctrl+W`):** Default transcription with optimized precision (bfloat16/float16 on GPU).
-    * **Python Float32 Mode (`Alt+7`):** Transcription using full float32 precision in Python for potentially higher accuracy on very subtle audio, at the cost of performance and VRAM.
-    * **FFmpeg Pre-processing Mode (`Alt+8`):** Applies FFmpeg audio filters (e.g., for normalization/denoising) to the extracted audio before transcription with default Python precision.
-    * **FFmpeg Pre-processing + Python Float32 Mode (`Alt+9`):** Combines FFmpeg audio filtering with float32 precision in Python.
+    * **Standard Mode (`Alt+1`):** Default transcription with optimized precision (bfloat16/float16 on GPU).
+    * **Python Float32 Mode (`Alt+2`):** Transcription using full float32 precision in Python for potentially higher accuracy on very subtle audio, at the cost of performance and VRAM.
+    * **FFmpeg Pre-processing Mode (`Alt+3`):** Applies FFmpeg audio filters (e.g., for normalization/denoising) to the extracted audio before transcription with default Python precision.
+    * **FFmpeg Pre-processing + Python Float32 Mode (`Alt+4`):** Combines FFmpeg audio filtering with float32 precision in Python.
 * **Customizable:** Configure paths, keybindings, and FFmpeg filters.
 * **Temporary File Management:** Handles temporary audio files.
 
@@ -106,18 +106,18 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
 
 1.  Play a video or audio file in MPV.
 2.  Press one of the configured keybindings to start transcription:
-    * **`Ctrl+W` (Default):**
+    * **`Alt+1` (Default):**
         * Extracts the English audio track (or fallback).
         * Transcribes using the Parakeet model with default (optimized) precision on GPU.
         * Applies audio stream start offset.
-    * **`Alt+7` (Python Float32):**
+    * **`Alt+2` (Python Float32):**
         * Same as default, but tells the Python script to use `--force_float32` for potentially higher ASR accuracy (slower, more VRAM).
-    * **`Alt+8` (FFmpeg Pre-processing):**
+    * **`Alt+3` (FFmpeg Pre-processing):**
         * Extracts audio.
         * Applies the FFmpeg filters defined in `ffmpeg_audio_filters` to the extracted audio.
         * Transcribes the *filtered* audio using default Python precision.
         * Applies audio stream start offset.
-    * **`Alt+9` (FFmpeg Pre-processing + Python Float32):**
+    * **`Alt+4` (FFmpeg Pre-processing + Python Float32):**
         * Extracts audio.
         * Applies FFmpeg filters.
         * Transcribes the *filtered* audio using `--force_float32` in Python.
