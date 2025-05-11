@@ -1,4 +1,4 @@
--- parakeet_mpv_ffmpeg_venv.lua (v11f - Hotkeys Alt+1/2/3/4, Faster SRT load, shutdown cleanup)
+-- parakeet_mpv_ffmpeg_venv.lua (v11f - Hotkeys Alt+4/5/6/7, Faster SRT load, shutdown cleanup)
 -- Lua script for MPV to transcribe audio using parakeet_transcribe.py.
 -- MODIFIED:
 -- - Changed hotkeys to Alt+1, Alt+2, Alt+3, Alt+4.
