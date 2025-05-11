@@ -71,7 +71,7 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
         *Note: Installing NeMo and PyTorch with the correct CUDA version can be complex. Refer to the [NVIDIA NeMo documentation](https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/starthere/installation.html) for detailed instructions. Also, see the **Troubleshooting** section below for notes on specific Python versions and dependencies like `sentencepiece` and `texterrors`.*
 
 3.  **Configure the Lua Script (`parakeet_caption.lua`):**
-    * Open `parakeet_caption.lua` (the one with version `v11h` or later).
+    * Open `parakeet_caption.lua`.
     * Update the configuration section at the top:
         ```lua
         -- ########## Configuration ##########
@@ -106,7 +106,7 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
         * Windows: Typically `C:\Users\YourUser\AppData\Roaming\mpv\scripts\` or `C:\Users\YourUser\AppData\Roaming\mpv.net\scripts\` (for mpv.net).
         * Linux: Typically `~/.config/mpv/scripts/`.
         * macOS: Typically `~/.config/mpv/scripts/`.
-    * Place `parakeet_transcribe.py` (e.g., `v17f - Robust Error SRT` or later) in the location you specified in `parakeet_script_path`.
+    * Place `parakeet_transcribe.py` in the location you specified in `parakeet_script_path`.
 
 ## Usage
 
