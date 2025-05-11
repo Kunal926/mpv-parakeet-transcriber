@@ -1,3 +1,10 @@
+![Model Arch](https://img.shields.io/badge/Model%20Arch-FastConformer--TDT-blue)
+![Params](https://img.shields.io/badge/Params-0.6B-brightgreen)
+![Language](https://img.shields.io/badge/Language-en-orange)
+![License](https://img.shields.io/badge/License-CC%20BY%204.0-lightgrey)
+![Library](https://img.shields.io/badge/Library-NeMo-success)
+![Pipeline](https://img.shields.io/badge/Pipeline-ASR-informational)
+
 # MPV Parakeet Transcriber
 
 Automatically generate subtitles for media playing in MPV using NVIDIA's Parakeet ASR model, NeMo, FFmpeg, and Python. This system extracts audio from the current video, processes it, transcribes it using a powerful ASR model, and generates an SRT subtitle file.
@@ -196,4 +203,5 @@ It accepts the following command-line arguments:
 
 ## License
 
-This project is licensed under the MIT License - see the `LICENSE` file for details (if one exists in your project).
+The use of the NVIDIA Parakeet model is governed by the CC-BY-4.0 license.
+This project (the Lua and Python scripts) is licensed under the CC-BY-4.0 License. You can find more details in the `LICENSE` file if one is included with the project.
