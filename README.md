@@ -20,7 +20,8 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
 * **Immediate SRT Loading:** Subtitles are loaded as soon as transcription is complete.
 * **Temporary File Management:** Handles temporary audio files, cleaning them up when MPV is closed.
 
-## Prerequisites
+<details>
+<summary><h2>Prerequisites</h2></summary>
 
 1.  **MPV Media Player:** The script is an MPV Lua script.
 2.  **Python Environment:**
@@ -39,8 +40,10 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
 5.  **Build Tools (Potentially for specific dependencies):**
     * **CMake:** May be needed for building packages like `sentencepiece`. See Troubleshooting for version recommendations.
     * **C++ Compiler:** May be needed for building packages like `texterrors` from source (e.g., Visual Studio Build Tools on Windows).
+</details>
 
-## Setup
+<details>
+<summary><h2>Setup</h2></summary>
 
 1.  **Clone the Repository (or download the files):**
     If you have a Git repository for this:
@@ -105,6 +108,7 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
         * Linux: Typically `~/.config/mpv/scripts/`.
         * macOS: Typically `~/.config/mpv/scripts/`.
     * Place `parakeet_transcribe.py` (e.g., `v17f - Robust Error SRT` or later) in the location you specified in `parakeet_script_path`.
+</details>
 
 ## Usage
 
@@ -131,7 +135,8 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
     * Temporary audio files will be cleaned up from the `temp_dir` when you close MPV.
 5.  Check the MPV console (usually opened with `` ` `` (backtick)) for detailed log messages from the Lua script and the Python script.
 
-## Python Script (`parakeet_transcribe.py`)
+<details>
+<summary><h2>Python Script (`parakeet_transcribe.py`)</h2></summary>
 
 This script is the backend that performs the actual ASR using NeMo.
 It accepts the following command-line arguments:
@@ -139,46 +144,58 @@ It accepts the following command-line arguments:
 2.  `srt_output_file_path`: (Positional) Path where the generated SRT file should be saved.
 3.  `--audio_start_offset SECONDS`: (Optional) A float value in seconds to add to all generated timestamps. Used to correct sync issues if the extracted audio doesn't start at time 0 relative to the original video. (Default: 0.0)
 4.  `--force_float32`: (Optional Flag) If present, forces the NeMo model to run in `float32` precision on the GPU, even if lower (faster) precisions like `bfloat16` or `float16` are available. This may slightly improve accuracy in some cases but is slower and uses significantly more VRAM.
+</details>
 
 <details>
 <summary><h2>Troubleshooting</h2></summary>
 
-* **"SRT file not found" or "SRT file empty":**
-    * Check the MPV console for errors from the Lua script or the Python script.
+<details>
+<summary><strong>"SRT file not found" or "SRT file empty"</strong></summary>
+
+* Check the MPV console for errors from the Lua script or the Python script. Potential causes include:
     * **CUDA OutOfMemoryError:** If transcribing long files (especially with `--force_float32` - `Alt+5` or `Alt+7`), you might run out of GPU VRAM. The Python script should attempt to write an error SRT in this case. Try a shorter file or use a less memory-intensive mode (e.g., standard `Alt+4`).
     * **FFmpeg Filtering Failed:** If using a pre-processing mode (`Alt+6`, `Alt+7`), the FFmpeg filtering step might fail (e.g., if filters are too complex, take too long, or there's an issue with FFmpeg itself). The log should indicate this. Try simplifying `ffmpeg_audio_filters` in the Lua script.
     * **Path Issues:** Double-check all configured paths in `parakeet_caption.lua`.
     * **Permissions:** Ensure the script has permission to write to the `temp_dir` and the directory where the media file is located (for saving the SRT).
+</details>
 
-* **Python Environment & Dependency Issues:**
-    * Ensure your Python environment is activated and has all necessary packages correctly installed (especially NeMo and a compatible PyTorch with CUDA).
-    * **Python Version Considerations:**
-        * While the script was developed with Python 3.12, using Python versions **greater than 3.12 is currently not recommended**.Since official pre-compiled ONNX Runtime wheels are not immediately available for the very latest Python releases. Always check the [ONNX Runtime documentation](https://onnxruntime.ai/docs/install/) for supported Python versions.
-        * Some users have reported **Python 3.11** to offer good performance and stability with NeMo and its dependencies. This could be a good version to try if you encounter issues with other versions or are looking for potentially better speed.
-        * Ultimately, ensure your chosen Python version is compatible with all critical dependencies, especially `torch`, `torchaudio`, `nemo_toolkit`, and their underlying requirements like CUDA and ONNX.
-    * **`sentencepiece` Installation:**
-        * `sentencepiece` is a common dependency for NeMo. If you encounter errors during its installation (e.g., build failures), it might be due to an issue with newer CMake versions.
-        * If installing `sentencepiece` fails, try using **CMake version < 4.0 (e.g., 3.22.x, 3.25.x, or even older like 3.17.x up to 3.31.7)**. This can sometimes resolve build issues with `sentencepiece`.
-    * **`texterrors` Version:**
-        * NVIDIA NeMo toolkit does not support texterrors version `>1.0`.
-        * If you see errors related to `texterrors` or its API, you may need to install a version <1.0 or build it from source.
-        * To build `texterrors==0.5.1` from source:
-            1.  Uninstall any existing `texterrors`: `pip uninstall texterrors`
-            2.  Clone the repository: `git clone https://github.com/RuABraun/texterrors.git`
-            3.  `cd texterrors`
-            4.  Checkout the specific tag: `git checkout v0.5.1`
-            5.  Install build tools if needed (e.g., `pip install build`).
-            6.  Build and install (If its still failing use "x64 Native Tools Command Prompt for VS" on Windows): `pip install .`
-    * Refer to the NeMo documentation for the most up-to-date compatibility information.
+<details>
+<summary><strong>Python Environment & Dependency Issues</strong></summary>
 
-* **Timestamps are off:**
-    * The script automatically detects and applies an offset based on the selected audio stream's `start_time` in the original media. If sync is still off, ensure `ffprobe` is working correctly and providing accurate `start_time` information for your files.
+* Ensure your Python environment is activated and has all necessary packages correctly installed (especially NeMo and a compatible PyTorch with CUDA).
+* **Python Version Considerations:**
+    * While the script was developed with Python 3.12, using Python versions **greater than 3.12 is currently not recommended** since official pre-compiled ONNX Runtime wheels are not immediately available for the very latest Python releases. Always check the [ONNX Runtime documentation](https://onnxruntime.ai/docs/install/) for supported Python versions.
+    * Some users have reported **Python 3.11** to offer good performance and stability with NeMo and its dependencies. This could be a good version to try if you encounter issues with other versions or are looking for potentially better speed.
+    * Ultimately, ensure your chosen Python version is compatible with all critical dependencies, especially `torch`, `torchaudio`, `nemo_toolkit`, and their underlying requirements like CUDA and ONNX.
+* **`sentencepiece` Installation:**
+    * `sentencepiece` is a common dependency for NeMo. If you encounter errors during its installation (e.g., build failures), it might be due to an issue with newer CMake versions.
+    * If installing `sentencepiece` fails, try using **CMake version < 4.0 (e.g., 3.22.x, 3.25.x, or even older like 3.17.x up to 3.31.7)**. This can sometimes resolve build issues with `sentencepiece`.
+* **`texterrors` Version:**
+    * NVIDIA NeMo toolkit does not support texterrors version `>1.0`.
+    * If you see errors related to `texterrors` or its API, you may need to install a version <1.0 or build `texterrors==0.5.1` from source:
+        1.  Uninstall any existing `texterrors`: `pip uninstall texterrors`
+        2.  Clone the repository: `git clone https://github.com/RuABraun/texterrors.git`
+        3.  `cd texterrors`
+        4.  Checkout the specific tag: `git checkout v0.5.1`
+        5.  Install build tools if needed (e.g., `pip install build`).
+        6.  Build and install (If it's still failing, use "x64 Native Tools Command Prompt for VS" on Windows): `pip install .`
+* Refer to the NeMo documentation for the most up-to-date compatibility information.
+</details>
 
-* **Transcription Accuracy Issues (Missed Lines, Incorrect Words):**
-    * **Audio Quality:** The cleaner the audio, the better the transcription.
-    * **FFmpeg Filters:** Experiment with the `ffmpeg_audio_filters` in the Lua script. `loudnorm` can help with quiet audio. Denoisers (`anlmdn`, `afftdn`) can help with background noise but need careful tuning to avoid degrading speech. Test on short clips first.
-    * **Python Precision:** Try the `--force_float32` modes (`Alt+5`, `Alt+7`) on shorter, problematic segments to see if it improves accuracy. Be mindful of VRAM usage.
-    * **Model Limitations:** ASR is not perfect. Some complex audio scenarios (heavy overlap, very thick accents, very domain-specific jargon) might always be challenging for the current model.
+<details>
+<summary><strong>Timestamps are off</strong></summary>
+
+* The script automatically detects and applies an offset based on the selected audio stream's `start_time` in the original media. If sync is still off, ensure `ffprobe` is working correctly and providing accurate `start_time` information for your files.
+</details>
+
+<details>
+<summary><strong>Transcription Accuracy Issues (Missed Lines, Incorrect Words)</strong></summary>
+
+* **Audio Quality:** The cleaner the audio, the better the transcription.
+* **FFmpeg Filters:** Experiment with the `ffmpeg_audio_filters` in the Lua script. `loudnorm` can help with quiet audio. Denoisers (`anlmdn`, `afftdn`) can help with background noise but need careful tuning to avoid degrading speech. Test on short clips first.
+* **Python Precision:** Try the `--force_float32` modes (`Alt+5`, `Alt+7`) on shorter, problematic segments to see if it improves accuracy. Be mindful of VRAM usage.
+* **Model Limitations:** ASR is not perfect. Some complex audio scenarios (heavy overlap, very thick accents, very domain-specific jargon) might always be challenging for the current model.
+</details>
 
 </details>
 
