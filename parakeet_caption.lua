@@ -1,3 +1,12 @@
+-- parakeet_mpv_ffmpeg_venv.lua (v11i - Use 'select' for sub-add)
+-- Lua script for MPV to transcribe audio using parakeet_transcribe.py.
+-- MODIFIED:
+-- - Changed `sub-add` flag from "auto" to "select" for immediate subtitle activation.
+-- - Hotkeys: Alt+4, Alt+5, Alt+6, Alt+7.
+-- - Added comprehensive Lua-style docstrings and comments.
+-- - SRT loading now attempted immediately after Python script finishes.
+-- - Temporary file cleanup moved to MPV shutdown event.
+
 local mp = require 'mp'
 local utils = require 'mp.utils'
 
@@ -292,14 +301,11 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         if ffmpeg_res_extract.error or ffmpeg_res_extract.status ~= 0 then
             log("error", "FFmpeg fallback audio extraction ('", ffmpeg_map_value_for_log ,"') also failed. Stderr: ", to_str_safe(ffmpeg_res_extract.stderr))
             mp.osd_message("Parakeet: Failed to extract audio with FFmpeg even with fallback.", 7)
-            -- safe_remove(temp_audio_raw_path, "Failed FFmpeg raw temp audio") -- Already in shutdown cleanup
             return
         end
     elseif ffmpeg_res_extract.error or ffmpeg_res_extract.status ~= 0 then 
-        -- This case handles failure when a specific_audio_absolute_idx was initially found and used, and it failed.
         log("error", "FFmpeg extraction with specific map '", ffmpeg_map_value_for_log, "' failed. Stderr: ", to_str_safe(ffmpeg_res_extract.stderr))
         mp.osd_message("Parakeet: Failed to extract audio with FFmpeg (specific map).", 7)
-        -- safe_remove(temp_audio_raw_path, "Failed FFmpeg raw temp audio") -- Already in shutdown cleanup
         return
     end
     
@@ -310,21 +316,20 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     end
     log("info", "FFmpeg raw audio extraction successful: ", temp_audio_raw_path)
 
-    -- Step 1.5: Apply FFmpeg audio filters (optional)
     if apply_ffmpeg_filters_flag then
         temp_audio_for_python = utils.join_path(temp_dir, sanitized_base_name .. "_audio_filtered.wav")
-        if temp_audio_raw_path ~= temp_audio_for_python then -- Should always be true if this block runs
-             table.insert(files_to_cleanup_on_shutdown, temp_audio_for_python) -- Add filtered file for cleanup
+        if temp_audio_raw_path ~= temp_audio_for_python then 
+             table.insert(files_to_cleanup_on_shutdown, temp_audio_for_python) 
         end
         log("info", "Step 1.5: Applying FFmpeg audio filters: ", ffmpeg_audio_filters)
         mp.osd_message("Parakeet: Applying FFmpeg audio filters...", 5)
         local ffmpeg_args_filter = {
             ffmpeg_path,
-            "-i", temp_audio_raw_path,    -- Input is the raw extracted audio
-            "-af", ffmpeg_audio_filters, -- Apply configured audio filters
-            "-ar", "16000",               -- Explicitly set output sample rate for filtered audio
-            "-y",                         -- Overwrite output file
-            temp_audio_for_python         -- Output filtered audio
+            "-i", temp_audio_raw_path,    
+            "-af", ffmpeg_audio_filters, 
+            "-ar", "16000",               
+            "-y",                         
+            temp_audio_for_python         
         }
         log("debug", "Running FFmpeg filter pass: ", table.concat(ffmpeg_args_filter, " "))
         local ffmpeg_res_filter = utils.subprocess({ args = ffmpeg_args_filter, cancellable = false, capture_stdout = true, capture_stderr = true })
@@ -333,7 +338,6 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
             log("error", "FFmpeg audio filtering failed. Error: ", to_str_safe(ffmpeg_res_filter.error), ", Status: ", to_str_safe(ffmpeg_res_filter.status))
             if ffmpeg_res_filter.stderr and string.len(ffmpeg_res_filter.stderr) > 0 then log("error", "FFmpeg Filter Stderr: ", ffmpeg_res_filter.stderr) end
             mp.osd_message("Parakeet: FFmpeg audio filtering failed.", 7)
-            -- Raw and filtered temp files are already in files_to_cleanup_on_shutdown
             return
         end
         if not utils.file_info(temp_audio_for_python) or utils.file_info(temp_audio_for_python).size == 0 then
@@ -344,23 +348,21 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         log("info", "FFmpeg audio filtering successful. Final audio for transcription: ", temp_audio_for_python)
     end
 
-    -- Step 2: Start Parakeet Python script for transcription
     mp.osd_message("Parakeet (" .. mode_description .. "): Transcribing... This may take a while.", 7)
     log("info", "Step 2.1: Starting Parakeet transcription for: ", file_name_with_ext, " (Using audio: ", temp_audio_for_python, ")")
 
     local python_command_args = {
         python_exe,
         parakeet_script_path,
-        temp_audio_for_python, -- Input audio file (raw or filtered)
-        srt_output_path,       -- Output SRT file path
-        "--audio_start_offset", tostring(audio_stream_offset_seconds) -- Pass audio start offset
+        temp_audio_for_python, 
+        srt_output_path,       
+        "--audio_start_offset", tostring(audio_stream_offset_seconds) 
     }
     if force_python_float32_flag then
         table.insert(python_command_args, "--force_float32")
     end
 
     log("debug", "Running Python script: ", table.concat(python_command_args, " "))
-    -- This is a blocking call: Lua script waits for Python to finish.
     local python_res = utils.subprocess({ args = python_command_args, cancellable = false, capture_stdout = true, capture_stderr = true })
 
     if python_res.error then 
@@ -371,26 +373,22 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         mp.osd_message("Parakeet: Failed to launch Python. Check console.", 7)
     else
         log("info", "Parakeet Python script finished (PID: ", (python_res.pid or "unknown"), "). Status: ", to_str_safe(python_res.status))
-        -- Log stdout/stderr from Python script for debugging if needed
         if python_res.stdout and string.len(python_res.stdout) > 0 then log("debug", "Python script stdout: ", python_res.stdout) end
         if python_res.stderr and string.len(python_res.stderr) > 0 then log("debug", "Python script stderr: ", python_res.stderr) end
 
         if python_res.status ~= nil and python_res.status ~= 0 then
              log("warn", "Python script exited with an error. Status: ", to_str_safe(python_res.status), ". Check Python script's own logging for details.")
              mp.osd_message("Parakeet: Python script error. Check console.", 7)
-             -- Even if Python script reports an error, it might have produced an error SRT.
-             -- So, we still attempt to load whatever SRT file might exist.
         end
 
-        -- Step 3: Attempt to load the generated SRT file immediately
         log("info", "Attempting to load SRT immediately: ", srt_output_path)
         if utils.file_info(srt_output_path) and utils.file_info(srt_output_path).size > 0 then
-            mp.commandv("sub-add", srt_output_path, "auto") -- Load subtitle, "auto" tries to guess encoding and select it
+            mp.commandv("sub-add", srt_output_path, "select") -- Use "select" to force MPV to switch to this subtitle
             mp.osd_message("Parakeet: Loaded " .. (srt_output_path:match("([^/\\]+)$") or srt_output_path), 3)
-        elseif utils.file_info(srt_output_path) then -- File exists but is empty
+        elseif utils.file_info(srt_output_path) then 
             log("warn", "SRT file found but is empty: ", srt_output_path, ". This might indicate a transcription problem or an error SRT with no content.")
             mp.osd_message("Parakeet: SRT file empty. Check console.", 5)
-        else -- File not found
+        else 
             log("warn", "SRT file not found after Python script execution: ", srt_output_path, ". Transcription may have failed.")
             mp.osd_message("Parakeet: SRT not found. Check Python logs.", 7)
         end
@@ -398,39 +396,29 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     log("info", "Transcription process complete. Temporary audio files (if any) will be cleaned on MPV shutdown.")
 end
 
---- Wrapper function for default transcription mode.
--- Calls `do_transcription_core` with standard settings.
 local function transcribe_default_wrapper()
-    do_transcription_core(false, false) -- force_python_float32_flag=false, apply_ffmpeg_filters_flag=false
+    do_transcription_core(false, false) 
 end
 
---- Wrapper function for Python float32 precision transcription mode.
--- Calls `do_transcription_core` forcing float32 in Python.
 local function transcribe_py_float32_wrapper()
-    do_transcription_core(true, false) -- force_python_float32_flag=true, apply_ffmpeg_filters_flag=false
+    do_transcription_core(true, false) 
 end
 
---- Wrapper function for FFmpeg pre-processing transcription mode.
--- Calls `do_transcription_core` with FFmpeg filters enabled.
 local function transcribe_ffmpeg_preprocess_wrapper()
-    do_transcription_core(false, true) -- force_python_float32_flag=false, apply_ffmpeg_filters_flag=true
+    do_transcription_core(false, true) 
 end
 
---- Wrapper function for FFmpeg pre-processing and Python float32 precision mode.
--- Calls `do_transcription_core` with both FFmpeg filters and Python float32 enabled.
 local function transcribe_ffmpeg_py_float32_wrapper()
-    do_transcription_core(true, true) -- force_python_float32_flag=true, apply_ffmpeg_filters_flag=true
+    do_transcription_core(true, true) 
 end
 
--- Register key bindings with MPV
 mp.add_key_binding(key_binding_default, "parakeet-transcribe-default", transcribe_default_wrapper)
 mp.add_key_binding(key_binding_py_float32, "parakeet-transcribe-py-float32", transcribe_py_float32_wrapper)
 mp.add_key_binding(key_binding_ffmpeg_preprocess, "parakeet-transcribe-ffmpeg-preprocess", transcribe_ffmpeg_preprocess_wrapper)
 mp.add_key_binding(key_binding_ffmpeg_py_float32, "parakeet-transcribe-ffmpeg-py-float32", transcribe_ffmpeg_py_float32_wrapper)
 
--- Log script loading and configuration information
-log("info", "Parakeet (Multi-Mode, v11h - Hotkeys Alt+4/5/6/7) script loaded.")
-log("info", "SRT will be loaded immediately after transcription.")
+log("info", "Parakeet (Multi-Mode, v11i - Use 'select' for sub-add) script loaded.")
+log("info", "SRT will be loaded immediately after transcription and selected.")
 log("info", "Temporary files will be cleaned up on MPV shutdown.")
 log("info", "Press '", key_binding_default, "' for Standard Transcription.")
 log("info", "Press '", key_binding_py_float32, "' for Python Float32 Precision.")
@@ -443,15 +431,12 @@ log("info", "Parakeet script: ", parakeet_script_path)
 log("info", "Temporary file directory: ", temp_dir)
 log("info", "FFmpeg pre-processing filters: ", ffmpeg_audio_filters)
 
---- Registers a function to be called when MPV is shutting down.
--- This is used to clean up any temporary files created by the script.
 mp.register_event("shutdown", function()
     log("info", "MPV shutdown event. Cleaning up temporary Parakeet files...")
     if #files_to_cleanup_on_shutdown > 0 then
         for _, filepath in ipairs(files_to_cleanup_on_shutdown) do
             safe_remove(filepath, "Shutdown cleanup")
         end
-        -- Clear the table for the next session (though script reloads on mpv start anyway)
         files_to_cleanup_on_shutdown = {} 
     else
         log("info", "No temporary files registered for cleanup.")
