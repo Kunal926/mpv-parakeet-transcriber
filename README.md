@@ -20,7 +20,8 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
 * **Immediate SRT Loading:** Subtitles are loaded as soon as transcription is complete.
 * **Temporary File Management:** Handles temporary audio files, cleaning them up when MPV is closed.
 
-## Prerequisites
+<details>
+<summary><h2>Prerequisites</h2></summary>
 
 1.  **MPV Media Player:** The script is an MPV Lua script.
 2.  **Python Environment:**
@@ -39,6 +40,7 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
 5.  **Build Tools (Potentially for specific dependencies):**
     * **CMake:** May be needed for building packages like `sentencepiece`. See Troubleshooting for version recommendations.
     * **C++ Compiler:** May be needed for building packages like `texterrors` from source (e.g., Visual Studio Build Tools on Windows).
+</details>
 
 ## Setup
 
@@ -140,17 +142,18 @@ It accepts the following command-line arguments:
 3.  `--audio_start_offset SECONDS`: (Optional) A float value in seconds to add to all generated timestamps. Used to correct sync issues if the extracted audio doesn't start at time 0 relative to the original video. (Default: 0.0)
 4.  `--force_float32`: (Optional Flag) If present, forces the NeMo model to run in `float32` precision on the GPU, even if lower (faster) precisions like `bfloat16` or `float16` are available. This may slightly improve accuracy in some cases but is slower and uses significantly more VRAM.
 
-<details>
-<summary><h2>Troubleshooting</h2></summary>
+## Troubleshooting
 
 <details>
 <summary><strong>"SRT file not found" or "SRT file empty"</strong></summary>
 
-* Check the MPV console for errors from the Lua script or the Python script. Potential causes include:
-    * **CUDA OutOfMemoryError:** If transcribing long files (especially with `--force_float32` - `Alt+5` or `Alt+7`), you might run out of GPU VRAM. The Python script should attempt to write an error SRT in this case. Try a shorter file or use a less memory-intensive mode (e.g., standard `Alt+4`).
-    * **FFmpeg Filtering Failed:** If using a pre-processing mode (`Alt+6`, `Alt+7`), the FFmpeg filtering step might fail (e.g., if filters are too complex, take too long, or there's an issue with FFmpeg itself). The log should indicate this. Try simplifying `ffmpeg_audio_filters` in the Lua script.
-    * **Path Issues:** Double-check all configured paths in `parakeet_caption.lua`.
-    * **Permissions:** Ensure the script has permission to write to the `temp_dir` and the directory where the media file is located (for saving the SRT).
+* First, **check the MPV console** (usually opened with `` ` ``) for any error messages from the Lua script or the Python script.
+    * **Look for specific errors in the console output, such as:**
+        * **CUDA OutOfMemoryError:** If transcribing long files (especially with `--force_float32` - `Alt+5` or `Alt+7`), you might run out of GPU VRAM. The Python script should attempt to write an error SRT in this case. Try a shorter file or use a less memory-intensive mode (e.g., standard `Alt+4`).
+        * **FFmpeg Filtering Failed:** If using a pre-processing mode (`Alt+6`, `Alt+7`), the FFmpeg filtering step might fail (e.g., if filters are too complex, take too long, or there's an issue with FFmpeg itself). The log should indicate this. Try simplifying `ffmpeg_audio_filters` in the Lua script.
+    * **If the console logs are unhelpful, or if issues persist after addressing specific errors found in logs, also verify these common configuration-related issues:**
+        * **Path Issues:** Double-check all configured paths in `parakeet_caption.lua`. Ensure there are no typos and that the paths are absolute and correct for your operating system.
+        * **Permissions:** Ensure the script has write permission to the `temp_dir` you configured in `parakeet_caption.lua`. Also, ensure it has permission to write the `.srt` file in the same directory as the media file.
 </details>
 
 <details>
@@ -189,8 +192,6 @@ It accepts the following command-line arguments:
 * **FFmpeg Filters:** Experiment with the `ffmpeg_audio_filters` in the Lua script. `loudnorm` can help with quiet audio. Denoisers (`anlmdn`, `afftdn`) can help with background noise but need careful tuning to avoid degrading speech. Test on short clips first.
 * **Python Precision:** Try the `--force_float32` modes (`Alt+5`, `Alt+7`) on shorter, problematic segments to see if it improves accuracy. Be mindful of VRAM usage.
 * **Model Limitations:** ASR is not perfect. Some complex audio scenarios (heavy overlap, very thick accents, very domain-specific jargon) might always be challenging for the current model.
-</details>
-
 </details>
 
 ## License
