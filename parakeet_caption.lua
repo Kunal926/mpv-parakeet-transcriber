@@ -1,4 +1,3 @@
--- parakeet_mpv_ffmpeg_venv.lua (v11i - Use 'select' for sub-add)
 -- Lua script for MPV to transcribe audio using parakeet_transcribe.py.
 -- MODIFIED:
 -- - Changed `sub-add` flag from "auto" to "select" for immediate subtitle activation.
@@ -14,67 +13,103 @@ local utils = require 'mp.utils'
 -- These paths should be configured by the user.
 
 --- Path to the Python executable within the virtual environment.
+-- This should be the full path to the `python.exe` (Windows) or `python` (Linux/macOS)
+-- located inside the `Scripts` or `bin` directory of your Python virtual environment
+-- where Riva Canary ASR / Parakeet is installed.
 -- @type string
+-- @example "C:/venvs/nemo_mpv_py312/Scripts/python.exe"
+-- @example "/home/user/venvs/nemo_mpv_py312/bin/python"
 local python_exe = "C:/venvs/nemo_mpv_py312/Scripts/python.exe"
 
 --- Path to the parakeet_transcribe.py script.
+-- This is the full path to the Python script responsible for performing the audio transcription.
 -- @type string
+-- @example "C:/Parakeet_Caption/parakeet_transcribe.py"
+-- @example "/home/user/Parakeet_Caption/parakeet_transcribe.py"
 local parakeet_script_path = "C:/Parakeet_Caption/parakeet_transcribe.py"
 
---- Path to the FFmpeg executable. Can be "ffmpeg" if in PATH.
+--- Path to the FFmpeg executable.
+-- Can be set to just "ffmpeg" if the directory containing ffmpeg.exe (Windows) or ffmpeg (Linux/macOS)
+-- is included in the system's PATH environment variable. Otherwise, provide the full path.
+-- FFmpeg is used for extracting and pre-processing audio from the media file.
 -- @type string
+-- @example "ffmpeg"
+-- @example "C:/ffmpeg/bin/ffmpeg.exe"
 local ffmpeg_path = "ffmpeg"
 
---- Path to the FFprobe executable. Can be "ffprobe" if in PATH.
+--- Path to the FFprobe executable.
+-- Can be set to just "ffprobe" if the directory containing ffprobe.exe (Windows) or ffprobe (Linux/macOS)
+-- is included in the system's PATH environment variable. Otherwise, provide the full path.
+-- FFprobe is used to gather information about audio streams in the media file.
 -- @type string
+-- @example "ffprobe"
+-- @example "C:/ffmpeg/bin/ffprobe.exe"
 local ffprobe_path = "ffprobe"
 
 --- Directory for storing temporary audio files.
--- This directory must exist and be writable by MPV.
+-- This directory must exist and be writable by MPV and the user running MPV.
+-- Temporary WAV files extracted from the media will be stored here before transcription.
+-- These files are cleaned up when MPV shuts down.
 -- @type string
+-- @example "C:/temp_audio_mpv"
+-- @example "/tmp/mpv_parakeet_audio"
 local temp_dir = "C:/temp"
 
 -- Keybindings for different transcription modes.
-local key_binding_default = "Alt+4"                 -- Standard transcription (no FFmpeg preprocessing, default Python precision)
-local key_binding_py_float32 = "Alt+5"            -- Python Float32 precision (no FFmpeg preprocessing)
-local key_binding_ffmpeg_preprocess = "Alt+6"     -- FFmpeg Preprocessing (default Python precision)
-local key_binding_ffmpeg_py_float32 = "Alt+7"   -- FFmpeg Preprocessing + Python Float32 Precision
+local key_binding_default = "Alt+4"             -- Standard transcription (no FFmpeg preprocessing, default Python precision)
+local key_binding_py_float32 = "Alt+5"          -- Python Float32 precision (no FFmpeg preprocessing)
+local key_binding_ffmpeg_preprocess = "Alt+6"   -- FFmpeg Preprocessing (default Python precision)
+local key_binding_ffmpeg_py_float32 = "Alt+7" -- FFmpeg Preprocessing + Python Float32 Precision
 
 --- FFmpeg audio filter chain for pre-processing mode.
--- Example: "loudnorm=I=-16:LRA=7:TP=-1.5" for loudness normalization.
--- Other filters like denoisers (anlmdn, afftdn) or compressors can be added.
+-- This string defines the audio filters FFmpeg will apply when the
+-- FFmpeg pre-processing mode is activated (e.g., via Alt+6 or Alt+7).
+-- Filters can help improve transcription accuracy by normalizing volume, reducing noise, etc.
+-- The filter chain should be a valid FFmpeg -af argument.
 -- @type string
+-- @example "loudnorm=I=-16:LRA=7:TP=-1.5" (Loudness normalization)
+-- @example "anlmdn" (Audio Non-Local Means de-noiser)
+-- @example "afftdn" (FFT-based de-noiser)
+-- @example "loudnorm,anlmdn" (Apply multiple filters, comma-separated)
 local ffmpeg_audio_filters = "loudnorm=I=-16:LRA=7:TP=-1.5"
 -- ###################################
 
 --- Table to store paths of temporary files for cleanup on MPV shutdown.
+-- When temporary audio files are created, their paths are added to this table.
+-- The `mp.register_event("shutdown", ...)` function iterates through this table
+-- to remove these files when MPV closes.
 -- @type table<string>
 local files_to_cleanup_on_shutdown = {}
 
 --- Safely converts a value to its string representation.
--- Handles nil values by returning "nil".
--- @param val any The value to convert.
--- @return string The string representation of the value.
+-- Handles `nil` values by returning the string "nil", preventing errors
+-- that would occur if `tostring(nil)` was called directly in concatenations.
+-- @param val any The value to convert to a string.
+-- @return string The string representation of the value, or "nil" if `val` is `nil`.
+-- @usage local str_val = to_str_safe(my_variable)
 local function to_str_safe(val)
     if val == nil then return "nil" end
     return tostring(val)
 end
 
--- Ensure the temporary directory exists. Create it if it doesn't.
+-- Ensure the temporary directory exists. Attempt to create it if it doesn't.
+-- This block checks for the existence of `temp_dir`. If not found, it tries
+-- to create it using OS-specific commands. Warnings are logged if creation fails
+-- or if `temp_dir` points to a root drive on Windows (which `mkdir` cannot create).
 if not utils.file_info(temp_dir) then
     mp.msg.warn("[parakeet_mpv] Temporary directory does not exist: " .. temp_dir)
     local mkdir_cmd
     if package.config:sub(1,1) == '\\' then -- Windows OS
         if temp_dir:match("^[A-Za-z]:$") then -- Check if it's a root drive like C:
-             mp.msg.warn("[parakeet_mpv] Cannot 'mkdir' a root drive like '" .. temp_dir .. "'. Please ensure it's accessible and not a root drive itself for mkdir.")
+            mp.msg.warn("[parakeet_mpv] Cannot 'mkdir' a root drive like '" .. temp_dir .. "'. Please ensure it's accessible and not a root drive itself for mkdir.")
         else
             -- For Windows, use cmd /C to handle spaces in paths correctly for mkdir
             mkdir_cmd = string.format('cmd /C "if not exist "%s" mkdir "%s""', temp_dir:gsub("/", "\\"), temp_dir:gsub("/", "\\"))
             local _, err_code = os.execute(mkdir_cmd)
             if err_code == 0 then
-                 mp.msg.info("[parakeet_mpv] Attempted to create temp directory: " .. temp_dir)
+                mp.msg.info("[parakeet_mpv] Attempted to create temp directory: " .. temp_dir)
             else
-                 mp.msg.warn("[parakeet_mpv] Failed to create temp directory. Exit Code: " .. to_str_safe(err_code))
+                mp.msg.warn("[parakeet_mpv] Failed to create temp directory. Exit Code: " .. to_str_safe(err_code))
             end
         end
     else -- Linux/macOS
@@ -85,10 +120,14 @@ if not utils.file_info(temp_dir) then
 end
 
 --- Internal logging function for the script.
--- Prefixes messages with "[parakeet_mpv]" and sends them to MPV's console.
--- Also displays OSD messages for different log levels.
+-- Prefixes messages with "[parakeet_mpv]" and sends them to MPV's console
+-- using the appropriate `mp.msg` level.
+-- Additionally, it displays On-Screen Display (OSD) messages for "info", "warn",
+-- and "error" levels to provide immediate user feedback.
 -- @param level string The log level (e.g., "info", "warn", "error", "debug").
--- @param ... any Variadic arguments forming the log message.
+-- @param ... any Variadic arguments forming the log message. These are converted to strings and concatenated.
+-- @usage log("info", "Script initialized successfully.")
+-- @usage log("error", "Failed to process file:", file_path, "Reason:", err_msg)
 local function log(level, ...)
     local args = {...}
     local msg_parts = {}
@@ -107,9 +146,11 @@ local function log(level, ...)
 end
 
 --- Safely removes a file from the filesystem.
--- Logs the action (success or failure).
--- @param filepath string The path to the file to be removed.
--- @param description string (optional) A description of the file for logging purposes.
+-- Checks if the file exists before attempting removal. Logs the action (success or failure)
+-- using the `log` function at "debug" or "warn" level.
+-- @param filepath string The path to the file to be removed. If `nil`, the function returns immediately.
+-- @param description string (optional) A description of the file for logging purposes (e.g., "raw audio", "filtered audio"). Defaults to "unspecified".
+-- @usage safe_remove("/path/to/temp.wav", "temporary audio")
 local function safe_remove(filepath, description)
     if not filepath then return end
     if utils.file_info(filepath) then
@@ -125,19 +166,29 @@ local function safe_remove(filepath, description)
 end
 
 --- Retrieves audio stream information using ffprobe.
--- Specifically looks for the start time of the audio stream and its absolute index.
--- Prioritizes a target language if specified.
--- @param media_path string The full path to the media file.
--- @param target_language_code string (optional) The ISO 639-1/2 language code (e.g., "eng", "jpn") to prioritize.
--- @return number The start time of the selected audio stream in seconds (defaults to 0.0 if not found or error).
--- @return string|nil The absolute index of the selected audio stream as a string (e.g., "1", "2"), or nil if not found.
+-- This function executes `ffprobe` to analyze a media file. It aims to find the
+-- start time and the absolute index of a suitable audio stream.
+-- It prioritizes an audio stream matching `target_language_code` if provided.
+-- If no `target_language_code` is given or if a matching stream isn't found,
+-- it defaults to the first audio stream listed by `ffprobe`.
+-- @param media_path string The full path to the media file to be analyzed.
+-- @param target_language_code string (optional) The ISO 639-1 (2-letter) or 639-2 (3-letter)
+-- language code (e.g., "en", "eng", "ja", "jpn") to prioritize. Case-insensitive.
+-- If `nil`, the first audio stream found will be used.
+-- @return number The start time of the selected audio stream in seconds. Defaults to `0.0` if
+-- not found, if an error occurs during `ffprobe` execution, or if JSON parsing fails.
+-- @return string|nil The absolute index of the selected audio stream as a string (e.g., "0", "1", "2").
+-- This index is suitable for use with FFmpeg's `-map 0:index` option. Returns `nil` if no suitable
+-- stream is found or in case of an error.
+-- @usage local start_time, stream_idx = get_audio_stream_info("/path/to/video.mkv", "eng")
+-- @usage local start_time_any, stream_idx_any = get_audio_stream_info("/path/to/audio.mp3")
 local function get_audio_stream_info(media_path, target_language_code)
     local ffprobe_cmd_args = {
         ffprobe_path,
-        "-v", "quiet",              -- Suppress verbose output from ffprobe
-        "-print_format", "json",    -- Output in JSON format
-        "-show_streams",            -- Get information about all streams
-        "-select_streams", "a",     -- Select only audio streams
+        "-v", "quiet",           -- Suppress verbose output from ffprobe
+        "-print_format", "json", -- Output in JSON format
+        "-show_streams",         -- Get information about all streams
+        "-select_streams", "a",  -- Select only audio streams
         media_path
     }
     log("debug", "Running ffprobe to find audio streams: ", table.concat(ffprobe_cmd_args, " "))
@@ -162,7 +213,7 @@ local function get_audio_stream_info(media_path, target_language_code)
     if target_language_code then
         for _, stream in ipairs(data.streams) do
             if stream.codec_type == "audio" and stream.tags and stream.tags.language and
-               stream.tags.language:lower():match(target_language_code:lower()) then
+               stream.tags.language:lower():match("^"..target_language_code:lower()) then -- Match prefix for codes like "eng" vs "en"
                 selected_stream_absolute_index = tostring(stream.index) -- ffprobe stream index
                 selected_stream_start_time = tonumber(stream.start_time) or 0.0
                 log("info", "Found target language audio stream '", target_language_code, "' (absolute index ", selected_stream_absolute_index, ", start_time ", selected_stream_start_time, "s)")
@@ -188,9 +239,26 @@ local function get_audio_stream_info(media_path, target_language_code)
 end
 
 --- Core function to perform audio extraction, optional pre-processing, and transcription.
--- This function orchestrates the calls to ffprobe, ffmpeg, and the Python transcription script.
--- @param force_python_float32_flag boolean If true, passes "--force_float32" to the Python script.
--- @param apply_ffmpeg_filters_flag boolean If true, applies FFmpeg audio filters before transcription.
+-- This function orchestrates the entire transcription process:
+-- 1. Validates necessary executables and directories.
+-- 2. Retrieves the current media path and derives output/temporary file names.
+-- 3. Uses `get_audio_stream_info` to determine the audio stream and its start offset, prioritizing English.
+-- 4. Extracts the selected audio track to a temporary WAV file using FFmpeg. Includes fallback logic if the initial stream selection fails.
+-- 5. If `apply_ffmpeg_filters_flag` is true, applies the configured `ffmpeg_audio_filters` to the extracted WAV file, creating another temporary WAV.
+-- 6. Invokes the `parakeet_transcribe.py` script with the appropriate temporary audio file and parameters (including start offset and float32 flag).
+-- 7. Attempts to load the generated SRT subtitle file into MPV using `sub-add` with the `select` flag to make it active.
+-- 8. Logs progress and errors, displaying OSD messages for user feedback.
+-- Temporary audio files created during this process are added to `files_to_cleanup_on_shutdown`.
+--
+-- @param force_python_float32_flag boolean If `true`, the "--force_float32" argument is passed to
+-- the `parakeet_transcribe.py` script, potentially changing its processing precision.
+-- @param apply_ffmpeg_filters_flag boolean If `true`, the audio extracted by FFmpeg is further
+-- processed using the filter chain defined in the `ffmpeg_audio_filters` configuration variable
+-- before being passed to the Python script.
+-- @effects Creates temporary audio files in `temp_dir`.
+-- @effects Creates an SRT subtitle file in the same directory as the media file.
+-- @effects Loads the generated SRT file into MPV.
+-- @usage Called by wrapper functions associated with keybindings (e.g., `transcribe_default_wrapper`).
 local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_filters_flag)
     -- Step 0: Validations
     if not utils.file_info(python_exe) then log("error", "Python executable not found: ", python_exe) return end
@@ -241,7 +309,9 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     mp.osd_message("Parakeet (" .. mode_description .. "): Analyzing audio streams...", 3)
     log("info", "Step 0.1: Analyzing audio streams with FFprobe for transcription (" .. mode_description .. ")...")
 
-    local audio_stream_offset_seconds, specific_audio_absolute_idx = get_audio_stream_info(current_media_path, "eng") -- Prioritize English
+    -- Prioritize English audio streams for transcription.
+    -- The "eng" code will try to match common English language tags (e.g., "eng", "en").
+    local audio_stream_offset_seconds, specific_audio_absolute_idx = get_audio_stream_info(current_media_path, "eng")
     log("info", "Determined audio stream start offset: ", audio_stream_offset_seconds, "s. Specific stream absolute index for FFmpeg: ", to_str_safe(specific_audio_absolute_idx))
 
     -- Step 1: Extract audio track with FFmpeg
@@ -259,14 +329,16 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         log("info", "Using specific stream map for FFmpeg extraction: ", ffmpeg_map_value_for_log)
         ffmpeg_args_extract = {ffmpeg_path, "-i", current_media_path, "-map", ffmpeg_map_value_for_log}
     else
-        log("warn", "No specific stream index from ffprobe (or target language not found). Attempting FFmpeg default English mapping first for extraction.")
+        -- If ffprobe didn't return a specific index (e.g., no 'eng' stream, or no audio streams at all),
+        -- first try to let FFmpeg pick an English audio stream by metadata.
+        log("warn", "No specific stream index from ffprobe (or target language 'eng' not found). Attempting FFmpeg default English mapping first for extraction.")
         ffmpeg_map_value_for_log = "0:a:m:language:eng" -- Try to map by metadata: first audio stream with English language
         ffmpeg_args_extract = {ffmpeg_path, "-i", current_media_path, "-map", ffmpeg_map_value_for_log}
     end
-    
+
     for _, v in ipairs(ffmpeg_common_args) do table.insert(ffmpeg_args_extract, v) end
     table.insert(ffmpeg_args_extract, temp_audio_raw_path) -- Output file
-    
+
     log("debug", "Running FFmpeg extraction with map '", ffmpeg_map_value_for_log, "': ", table.concat(ffmpeg_args_extract, " "))
     local ffmpeg_res_extract = utils.subprocess({ args = ffmpeg_args_extract, cancellable = false, capture_stdout = true, capture_stderr = true })
 
@@ -275,14 +347,15 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         log("warn", "FFmpeg (map '", ffmpeg_map_value_for_log ,"') extraction failed. Trying fallback map...")
         if ffmpeg_res_extract.stderr and string.len(ffmpeg_res_extract.stderr) > 0 then log("warn", "FFmpeg Stderr (attempt 1 with map '", ffmpeg_map_value_for_log, "'): ", ffmpeg_res_extract.stderr) end
         mp.osd_message("Parakeet: Specific/English audio map failed, trying fallback map...", 3)
-        
+
         -- Re-run ffprobe for the generic first audio stream if the targeted one (e.g. 'eng') failed
+        -- This also updates the audio_stream_offset_seconds if the fallback stream has a different start time.
         local fallback_offset_for_fb, fallback_idx_for_fb = get_audio_stream_info(current_media_path, nil) -- nil for any audio
         if fallback_offset_for_fb ~= audio_stream_offset_seconds then
             log("info", "Updating audio offset for fallback to: ", fallback_offset_for_fb, "s.")
             audio_stream_offset_seconds = fallback_offset_for_fb
         end
-        
+
         if fallback_idx_for_fb then
             ffmpeg_map_value_for_log = "0:" .. fallback_idx_for_fb -- Use the absolute index of the first audio stream
             log("info", "Using specific index for fallback map: ", ffmpeg_map_value_for_log)
@@ -290,25 +363,26 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
             ffmpeg_map_value_for_log = "0:a:0?" -- Fallback to FFmpeg's first available audio stream (optional stream specifier)
             log("warn", "FFprobe found no audio streams for fallback index. Using generic '0:a:0?' for FFmpeg.")
         end
-        
+
         ffmpeg_args_extract = {ffmpeg_path, "-i", current_media_path, "-map", ffmpeg_map_value_for_log}
         for _, v in ipairs(ffmpeg_common_args) do table.insert(ffmpeg_args_extract, v) end
         table.insert(ffmpeg_args_extract, temp_audio_raw_path)
 
         log("debug", "Running FFmpeg extraction (fallback map '", ffmpeg_map_value_for_log, "'): ", table.concat(ffmpeg_args_extract, " "))
-        ffmpeg_res_extract = utils.subprocess({ args = ffmpeg_args_extract, cancellable = false, capture_stdout = true, capture_stderr = true }) 
+        ffmpeg_res_extract = utils.subprocess({ args = ffmpeg_args_extract, cancellable = false, capture_stdout = true, capture_stderr = true })
 
         if ffmpeg_res_extract.error or ffmpeg_res_extract.status ~= 0 then
             log("error", "FFmpeg fallback audio extraction ('", ffmpeg_map_value_for_log ,"') also failed. Stderr: ", to_str_safe(ffmpeg_res_extract.stderr))
             mp.osd_message("Parakeet: Failed to extract audio with FFmpeg even with fallback.", 7)
             return
         end
-    elseif ffmpeg_res_extract.error or ffmpeg_res_extract.status ~= 0 then 
+    elseif ffmpeg_res_extract.error or ffmpeg_res_extract.status ~= 0 then
+        -- This case handles failure of the initial attempt when specific_audio_absolute_idx was initially valid.
         log("error", "FFmpeg extraction with specific map '", ffmpeg_map_value_for_log, "' failed. Stderr: ", to_str_safe(ffmpeg_res_extract.stderr))
         mp.osd_message("Parakeet: Failed to extract audio with FFmpeg (specific map).", 7)
         return
     end
-    
+
     if not utils.file_info(temp_audio_raw_path) or utils.file_info(temp_audio_raw_path).size == 0 then
         log("error", "FFmpeg ran but raw temporary audio file '", temp_audio_raw_path, "' was not created or is empty.")
         mp.osd_message("Parakeet: FFmpeg failed to produce raw audio file.", 7)
@@ -318,18 +392,18 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
 
     if apply_ffmpeg_filters_flag then
         temp_audio_for_python = utils.join_path(temp_dir, sanitized_base_name .. "_audio_filtered.wav")
-        if temp_audio_raw_path ~= temp_audio_for_python then 
-             table.insert(files_to_cleanup_on_shutdown, temp_audio_for_python) 
+        if temp_audio_raw_path ~= temp_audio_for_python then
+             table.insert(files_to_cleanup_on_shutdown, temp_audio_for_python)
         end
         log("info", "Step 1.5: Applying FFmpeg audio filters: ", ffmpeg_audio_filters)
         mp.osd_message("Parakeet: Applying FFmpeg audio filters...", 5)
         local ffmpeg_args_filter = {
             ffmpeg_path,
-            "-i", temp_audio_raw_path,    
-            "-af", ffmpeg_audio_filters, 
-            "-ar", "16000",               
-            "-y",                         
-            temp_audio_for_python         
+            "-i", temp_audio_raw_path,
+            "-af", ffmpeg_audio_filters,
+            "-ar", "16000", -- Ensure sample rate is maintained for the ASR model
+            "-y",           -- Overwrite output file if it exists
+            temp_audio_for_python
         }
         log("debug", "Running FFmpeg filter pass: ", table.concat(ffmpeg_args_filter, " "))
         local ffmpeg_res_filter = utils.subprocess({ args = ffmpeg_args_filter, cancellable = false, capture_stdout = true, capture_stderr = true })
@@ -354,9 +428,9 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     local python_command_args = {
         python_exe,
         parakeet_script_path,
-        temp_audio_for_python, 
-        srt_output_path,       
-        "--audio_start_offset", tostring(audio_stream_offset_seconds) 
+        temp_audio_for_python, -- Input WAV file
+        srt_output_path,       -- Output SRT file path
+        "--audio_start_offset", tostring(audio_stream_offset_seconds) -- Pass the determined start offset
     }
     if force_python_float32_flag then
         table.insert(python_command_args, "--force_float32")
@@ -365,7 +439,7 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     log("debug", "Running Python script: ", table.concat(python_command_args, " "))
     local python_res = utils.subprocess({ args = python_command_args, cancellable = false, capture_stdout = true, capture_stderr = true })
 
-    if python_res.error then 
+    if python_res.error then
         log("error", "Failed to launch Parakeet Python script: ", (python_res.error or "Unknown error"))
         if python_res.stderr and string.len(python_res.stderr) > 0 then
              log("error", "Stderr from Python launch failure: ", python_res.stderr)
@@ -385,10 +459,10 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         if utils.file_info(srt_output_path) and utils.file_info(srt_output_path).size > 0 then
             mp.commandv("sub-add", srt_output_path, "select") -- Use "select" to force MPV to switch to this subtitle
             mp.osd_message("Parakeet: Loaded " .. (srt_output_path:match("([^/\\]+)$") or srt_output_path), 3)
-        elseif utils.file_info(srt_output_path) then 
+        elseif utils.file_info(srt_output_path) then
             log("warn", "SRT file found but is empty: ", srt_output_path, ". This might indicate a transcription problem or an error SRT with no content.")
             mp.osd_message("Parakeet: SRT file empty. Check console.", 5)
-        else 
+        else
             log("warn", "SRT file not found after Python script execution: ", srt_output_path, ". Transcription may have failed.")
             mp.osd_message("Parakeet: SRT not found. Check Python logs.", 7)
         end
@@ -396,28 +470,44 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     log("info", "Transcription process complete. Temporary audio files (if any) will be cleaned on MPV shutdown.")
 end
 
+--- Wrapper function to call `do_transcription_core` with default settings.
+-- This function is bound to the `key_binding_default` hotkey.
+-- It invokes transcription without forcing Python float32 precision and without FFmpeg pre-processing.
 local function transcribe_default_wrapper()
-    do_transcription_core(false, false) 
+    do_transcription_core(false, false)
 end
 
+--- Wrapper function to call `do_transcription_core` with Python float32 precision.
+-- This function is bound to the `key_binding_py_float32` hotkey.
+-- It invokes transcription forcing Python float32 precision and without FFmpeg pre-processing.
 local function transcribe_py_float32_wrapper()
-    do_transcription_core(true, false) 
+    do_transcription_core(true, false)
 end
 
+--- Wrapper function to call `do_transcription_core` with FFmpeg pre-processing.
+-- This function is bound to the `key_binding_ffmpeg_preprocess` hotkey.
+-- It invokes transcription without forcing Python float32 precision but with FFmpeg pre-processing
+-- using the filters defined in `ffmpeg_audio_filters`.
 local function transcribe_ffmpeg_preprocess_wrapper()
-    do_transcription_core(false, true) 
+    do_transcription_core(false, true)
 end
 
+--- Wrapper function to call `do_transcription_core` with both FFmpeg pre-processing and Python float32 precision.
+-- This function is bound to the `key_binding_ffmpeg_py_float32` hotkey.
+-- It invokes transcription forcing Python float32 precision and with FFmpeg pre-processing
+-- using the filters defined in `ffmpeg_audio_filters`.
 local function transcribe_ffmpeg_py_float32_wrapper()
-    do_transcription_core(true, true) 
+    do_transcription_core(true, true)
 end
 
+-- Register key bindings for the different transcription modes.
+-- Each binding maps a key combination to its respective wrapper function.
 mp.add_key_binding(key_binding_default, "parakeet-transcribe-default", transcribe_default_wrapper)
 mp.add_key_binding(key_binding_py_float32, "parakeet-transcribe-py-float32", transcribe_py_float32_wrapper)
 mp.add_key_binding(key_binding_ffmpeg_preprocess, "parakeet-transcribe-ffmpeg-preprocess", transcribe_ffmpeg_preprocess_wrapper)
 mp.add_key_binding(key_binding_ffmpeg_py_float32, "parakeet-transcribe-ffmpeg-py-float32", transcribe_ffmpeg_py_float32_wrapper)
 
-log("info", "Parakeet (Multi-Mode, v11i - Use 'select' for sub-add) script loaded.")
+log("info", "Parakeet (Multi-Mode) script loaded.")
 log("info", "SRT will be loaded immediately after transcription and selected.")
 log("info", "Temporary files will be cleaned up on MPV shutdown.")
 log("info", "Press '", key_binding_default, "' for Standard Transcription.")
@@ -431,13 +521,18 @@ log("info", "Parakeet script: ", parakeet_script_path)
 log("info", "Temporary file directory: ", temp_dir)
 log("info", "FFmpeg pre-processing filters: ", ffmpeg_audio_filters)
 
+--- Event handler for MPV's "shutdown" event.
+-- This function is called when MPV is closing. It iterates through the
+-- `files_to_cleanup_on_shutdown` table and attempts to remove each file
+-- listed, using `safe_remove` to handle errors and logging.
+-- After attempting cleanup, the `files_to_cleanup_on_shutdown` table is cleared.
 mp.register_event("shutdown", function()
     log("info", "MPV shutdown event. Cleaning up temporary Parakeet files...")
     if #files_to_cleanup_on_shutdown > 0 then
         for _, filepath in ipairs(files_to_cleanup_on_shutdown) do
             safe_remove(filepath, "Shutdown cleanup")
         end
-        files_to_cleanup_on_shutdown = {} 
+        files_to_cleanup_on_shutdown = {} -- Clear the table after attempting cleanup
     else
         log("info", "No temporary files registered for cleanup.")
     end
