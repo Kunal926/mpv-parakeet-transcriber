@@ -204,4 +204,4 @@ It accepts the following command-line arguments:
 ## License
 
 The use of the NVIDIA Parakeet model is governed by the CC-BY-4.0 license.
-This project (the Lua and Python scripts) is licensed under the CC-BY-4.0 License. You can find more details in the `LICENSE` file if one is included with the project.
+This project (the Lua and Python scripts) is licensed under the CC-BY-4.0 License. You can find more details in the `LICENSE` file.
