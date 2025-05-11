@@ -24,25 +24,28 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
 
 1.  **MPV Media Player:** The script is an MPV Lua script.
 2.  **Python Environment:**
-    * Python 3.8+ (Python 3.12 was used in development, as per `python_exe` path in the Lua script).
+    * Python 3.8+ (Python 3.12 was used in development, as per `python_exe` path in the Lua script. However, see Troubleshooting for version considerations).
     * A dedicated virtual environment is highly recommended.
     * **Required Python Packages:**
         * `nemo_toolkit[asr]` (which includes PyTorch with CUDA support if available, `torch`, `torchaudio`)
         * `soundfile`
         * `librosa`
-        * (Potentially others depending on your NeMo installation - refer to NeMo documentation)
+        * (Potentially others depending on your NeMo installation - refer to NeMo documentation, and see Troubleshooting for specific dependency notes like `sentencepiece` and `texterrors`).
 3.  **NVIDIA GPU (Recommended for Performance):**
     * The Parakeet model is computationally intensive. A CUDA-enabled NVIDIA GPU is strongly recommended for reasonable transcription speeds.
     * Ensure you have the appropriate NVIDIA drivers and CUDA toolkit version compatible with your PyTorch and NeMo installation.
 4.  **FFmpeg & FFprobe:**
     * These command-line tools must be installed and accessible in your system's PATH, or you need to provide the full path in the Lua script configuration. They are used for audio extraction, pre-processing, and stream analysis.
+5.  **Build Tools (Potentially for specific dependencies):**
+    * **CMake:** May be needed for building packages like `sentencepiece`. See Troubleshooting for version recommendations.
+    * **C++ Compiler:** May be needed for building packages like `texterrors` from source (e.g., Visual Studio Build Tools on Windows).
 
 ## Setup
 
 1.  **Clone the Repository (or download the files):**
     If you have a Git repository for this:
     ```bash
-    git clone https://github.com/Kunal926/mpv-parakeet-transcriber.git
+    git clone [https://github.com/Kunal926/mpv-parakeet-transcriber.git](https://github.com/Kunal926/mpv-parakeet-transcriber.git)
     cd mpv-parakeet-transcriber
     ```
     Otherwise, ensure you have `parakeet_caption.lua` and `parakeet_transcribe.py`.
@@ -50,20 +53,20 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
 2.  **Python Environment Setup:**
     * Create a Python virtual environment:
         ```bash
-        python -m venv .venv 
+        python -m venv .venv
         ```
     * Activate the virtual environment:
         * Windows: `.venv\Scripts\activate`
         * Linux/macOS: `source .venv/bin/activate`
     * Install required packages (assuming you have a `requirements.txt`):
         ```bash
-        pip install -r requirements.txt 
+        pip install -r requirements.txt
         ```
         If not, install manually:
         ```bash
-        pip install nemo_toolkit[asr] soundfile librosa 
+        pip install nemo_toolkit[asr] soundfile librosa
         ```
-        *Note: Installing NeMo and PyTorch with the correct CUDA version can be complex. Refer to the [NVIDIA NeMo documentation](https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/starthere/installation.html) for detailed instructions.*
+        *Note: Installing NeMo and PyTorch with the correct CUDA version can be complex. Refer to the [NVIDIA NeMo documentation](https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/starthere/installation.html) for detailed instructions. Also, see the **Troubleshooting** section below for notes on specific Python versions and dependencies like `sentencepiece` and `texterrors`.*
 
 3.  **Configure the Lua Script (`parakeet_caption.lua`):**
     * Open `parakeet_caption.lua` (the one with version `v11h` or later).
@@ -78,8 +81,8 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
 
         -- Keybindings (Alt combinations are generally safer from conflicts)
         local key_binding_default = "Alt+4"
-        local key_binding_py_float32 = "Alt+5"        
-        local key_binding_ffmpeg_preprocess = "Alt+6"  
+        local key_binding_py_float32 = "Alt+5"
+        local key_binding_ffmpeg_preprocess = "Alt+6"
         local key_binding_ffmpeg_py_float32 = "Alt+7"
 
         -- FFmpeg audio filter chain for pre-processing modes (Alt+6, Alt+7)
@@ -89,7 +92,7 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
         -- Example: Gentle compression
         -- local ffmpeg_audio_filters = "acompressor=threshold=0.1:ratio=2:attack=20:release=250"
         -- Example: Denoising (can be slow, parameters need tuning)
-        -- local ffmpeg_audio_filters = "anlmdn=s=5:p=0.002:r=0.002:m=15" 
+        -- local ffmpeg_audio_filters = "anlmdn=s=5:p=0.002:r=0.002:m=15"
         -- Example: Combination (test individual filters first)
         -- local ffmpeg_audio_filters = "loudnorm=I=-16:LRA=7:TP=-1.5,anlmdn=s=5:p=0.002:r=0.002:m=15"
         -- ###################################
@@ -137,22 +140,47 @@ It accepts the following command-line arguments:
 3.  `--audio_start_offset SECONDS`: (Optional) A float value in seconds to add to all generated timestamps. Used to correct sync issues if the extracted audio doesn't start at time 0 relative to the original video. (Default: 0.0)
 4.  `--force_float32`: (Optional Flag) If present, forces the NeMo model to run in `float32` precision on the GPU, even if lower (faster) precisions like `bfloat16` or `float16` are available. This may slightly improve accuracy in some cases but is slower and uses significantly more VRAM.
 
-## Troubleshooting
+<details>
+<summary><h2>Troubleshooting</h2></summary>
 
 * **"SRT file not found" or "SRT file empty":**
     * Check the MPV console for errors from the Lua script or the Python script.
     * **CUDA OutOfMemoryError:** If transcribing long files (especially with `--force_float32` - `Alt+5` or `Alt+7`), you might run out of GPU VRAM. The Python script should attempt to write an error SRT in this case. Try a shorter file or use a less memory-intensive mode (e.g., standard `Alt+4`).
     * **FFmpeg Filtering Failed:** If using a pre-processing mode (`Alt+6`, `Alt+7`), the FFmpeg filtering step might fail (e.g., if filters are too complex, take too long, or there's an issue with FFmpeg itself). The log should indicate this. Try simplifying `ffmpeg_audio_filters` in the Lua script.
     * **Path Issues:** Double-check all configured paths in `parakeet_caption.lua`.
-    * **Python Environment:** Ensure your Python environment is activated and has all necessary packages correctly installed (especially NeMo and a compatible PyTorch with CUDA).
     * **Permissions:** Ensure the script has permission to write to the `temp_dir` and the directory where the media file is located (for saving the SRT).
+
+* **Python Environment & Dependency Issues:**
+    * Ensure your Python environment is activated and has all necessary packages correctly installed (especially NeMo and a compatible PyTorch with CUDA).
+    * **Python Version Considerations:**
+        * While the script was developed with Python 3.12, using Python versions **greater than 3.12 is currently not recommended**.Since official pre-compiled ONNX Runtime wheels are not immediately available for the very latest Python releases. Always check the [ONNX Runtime documentation](https://onnxruntime.ai/docs/install/) for supported Python versions.
+        * Some users have reported **Python 3.11** to offer good performance and stability with NeMo and its dependencies. This could be a good version to try if you encounter issues with other versions or are looking for potentially better speed.
+        * Ultimately, ensure your chosen Python version is compatible with all critical dependencies, especially `torch`, `torchaudio`, `nemo_toolkit`, and their underlying requirements like CUDA and ONNX.
+    * **`sentencepiece` Installation:**
+        * `sentencepiece` is a common dependency for NeMo. If you encounter errors during its installation (e.g., build failures), it might be due to an issue with newer CMake versions.
+        * If installing `sentencepiece` fails, try using **CMake version < 4.0 (e.g., 3.22.x, 3.25.x, or even older like 3.17.x up to 3.31.7)**. This can sometimes resolve build issues with `sentencepiece`.
+    * **`texterrors` Version:**
+        * NVIDIA NeMo toolkit does not support texterrors version `>1.0`.
+        * If you see errors related to `texterrors` or its API, you may need to install a version <1.0 or build it from source.
+        * To build `texterrors==0.5.1` from source:
+            1.  Uninstall any existing `texterrors`: `pip uninstall texterrors`
+            2.  Clone the repository: `git clone https://github.com/RuABraun/texterrors.git`
+            3.  `cd texterrors`
+            4.  Checkout the specific tag: `git checkout v0.5.1`
+            5.  Install build tools if needed (e.g., `pip install build`).
+            6.  Build and install (If its still failing use "x64 Native Tools Command Prompt for VS" on Windows): `pip install .`
+    * Refer to the NeMo documentation for the most up-to-date compatibility information.
+
 * **Timestamps are off:**
     * The script automatically detects and applies an offset based on the selected audio stream's `start_time` in the original media. If sync is still off, ensure `ffprobe` is working correctly and providing accurate `start_time` information for your files.
+
 * **Transcription Accuracy Issues (Missed Lines, Incorrect Words):**
     * **Audio Quality:** The cleaner the audio, the better the transcription.
     * **FFmpeg Filters:** Experiment with the `ffmpeg_audio_filters` in the Lua script. `loudnorm` can help with quiet audio. Denoisers (`anlmdn`, `afftdn`) can help with background noise but need careful tuning to avoid degrading speech. Test on short clips first.
     * **Python Precision:** Try the `--force_float32` modes (`Alt+5`, `Alt+7`) on shorter, problematic segments to see if it improves accuracy. Be mindful of VRAM usage.
     * **Model Limitations:** ASR is not perfect. Some complex audio scenarios (heavy overlap, very thick accents, very domain-specific jargon) might always be challenging for the current model.
+
+</details>
 
 ## License
 
