@@ -20,8 +20,7 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
 * **Immediate SRT Loading:** Subtitles are loaded as soon as transcription is complete.
 * **Temporary File Management:** Handles temporary audio files, cleaning them up when MPV is closed.
 
-<details>
-<summary><h2>Prerequisites</h2></summary>
+## Prerequisites
 
 1.  **MPV Media Player:** The script is an MPV Lua script.
 2.  **Python Environment:**
@@ -40,10 +39,8 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
 5.  **Build Tools (Potentially for specific dependencies):**
     * **CMake:** May be needed for building packages like `sentencepiece`. See Troubleshooting for version recommendations.
     * **C++ Compiler:** May be needed for building packages like `texterrors` from source (e.g., Visual Studio Build Tools on Windows).
-</details>
 
-<details>
-<summary><h2>Setup</h2></summary>
+## Setup
 
 1.  **Clone the Repository (or download the files):**
     If you have a Git repository for this:
@@ -108,7 +105,6 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
         * Linux: Typically `~/.config/mpv/scripts/`.
         * macOS: Typically `~/.config/mpv/scripts/`.
     * Place `parakeet_transcribe.py` (e.g., `v17f - Robust Error SRT` or later) in the location you specified in `parakeet_script_path`.
-</details>
 
 ## Usage
 
@@ -135,8 +131,7 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
     * Temporary audio files will be cleaned up from the `temp_dir` when you close MPV.
 5.  Check the MPV console (usually opened with `` ` `` (backtick)) for detailed log messages from the Lua script and the Python script.
 
-<details>
-<summary><h2>Python Script (`parakeet_transcribe.py`)</h2></summary>
+## Python Transcription Script (`parakeet_transcribe.py`)
 
 This script is the backend that performs the actual ASR using NeMo.
 It accepts the following command-line arguments:
@@ -144,7 +139,6 @@ It accepts the following command-line arguments:
 2.  `srt_output_file_path`: (Positional) Path where the generated SRT file should be saved.
 3.  `--audio_start_offset SECONDS`: (Optional) A float value in seconds to add to all generated timestamps. Used to correct sync issues if the extracted audio doesn't start at time 0 relative to the original video. (Default: 0.0)
 4.  `--force_float32`: (Optional Flag) If present, forces the NeMo model to run in `float32` precision on the GPU, even if lower (faster) precisions like `bfloat16` or `float16` are available. This may slightly improve accuracy in some cases but is slower and uses significantly more VRAM.
-</details>
 
 <details>
 <summary><h2>Troubleshooting</h2></summary>
