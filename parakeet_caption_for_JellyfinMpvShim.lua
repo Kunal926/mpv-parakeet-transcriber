@@ -83,6 +83,11 @@ local osd_duration_default = 2
 -- @type table<string>
 local files_to_cleanup_on_shutdown = {}
 
+--- Flag to prevent concurrent transcription runs.
+-- When true, new transcription requests are ignored until the current one finishes.
+-- @type boolean
+local transcription_in_progress = false
+
 --- Safely converts a value to its string representation.
 -- Handles `nil` values by returning the string "nil", preventing errors
 -- that would occur if `tostring(nil)` was called directly in concatenations.
@@ -234,6 +239,11 @@ end
 -- @effects Loads the generated SRT file into MPV.
 -- @effects Displays OSD messages to the user indicating progress and status.
 local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_filters_flag)
+    if transcription_in_progress then
+        mp.osd_message("Parakeet: Transcription already running.", osd_duration_default)
+        return
+    end
+    transcription_in_progress = true
     -- Step 0: Display Mode OSD
     local mode_osd_message = "Parakeet: Unknown Mode"
     if not force_python_float32_flag and not apply_ffmpeg_filters_flag then
@@ -251,6 +261,7 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     local function validation_failed(msg)
         log("error", msg)
         mp.osd_message("Parakeet: Transcription failed. Check MPV logs.", osd_duration_default)
+        transcription_in_progress = false
         return
     end
 
@@ -376,6 +387,7 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         return validation_failed(srt_error_msg)
     end
     log("info", "Transcription process complete.")
+    transcription_in_progress = false
 end
 
 --- Wrapper function to call `do_transcription_core` with default settings (no float32, no FFmpeg preprocessing).
