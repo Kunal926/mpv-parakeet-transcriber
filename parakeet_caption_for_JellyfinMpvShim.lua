@@ -307,8 +307,12 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
             log("info", "Updating audio offset for fallback to: ", fallback_offset, "s.")
             audio_stream_offset_seconds = fallback_offset
         end
-        if fallback_idx then ffmpeg_map_value_for_log = "0:" .. fallback_idx
-        else ffmpeg_map_value_for_log = "0:a:0?" log("warn", "FFprobe found no audio for fallback index. Using '0:a:0?'.") end
+        if fallback_idx then
+            ffmpeg_map_value_for_log = "0:" .. fallback_idx
+        else
+            ffmpeg_map_value_for_log = "0:a:0?"
+            log("warn", "FFprobe found no audio for fallback index. Using '0:a:0?'.")
+        end
 
         ffmpeg_args_extract = {ffmpeg_path, "-i", current_media_path, "-map", ffmpeg_map_value_for_log}
         for _, v in ipairs(ffmpeg_common_args) do table.insert(ffmpeg_args_extract, v) end
