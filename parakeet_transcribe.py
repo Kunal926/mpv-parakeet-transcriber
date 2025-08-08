@@ -25,30 +25,7 @@ import torch
 import gc
 from torch.cuda.amp import autocast
 
-# --- SRT Formatting Function ---
-def format_time_srt(seconds: float) -> str:
-    """
-    Formats a duration in seconds into the SRT (SubRip Text) time format.
-
-    The format is HH:MM:SS,mmm (hours, minutes, seconds, milliseconds).
-    If the input is not a valid number or is negative, it defaults to 0.0 seconds.
-
-    Args:
-        seconds (float): The time in seconds to format.
-
-    Returns:
-        str: The time formatted as an SRT timestamp string (e.g., "00:01:23,456").
-    """
-    if not isinstance(seconds, (int, float)):
-        seconds = 0.0 # Default to 0 if input is not a number
-    if seconds < 0:
-        seconds = 0.0 # Treat negative times as 0
-    total_seconds_int = int(seconds)
-    milliseconds = int(round((seconds - total_seconds_int) * 1000))
-    hours = total_seconds_int // 3600
-    minutes = (total_seconds_int % 3600) // 60
-    secs = total_seconds_int % 60
-    return f"{hours:02}:{minutes:02}:{secs:02},{milliseconds:03}"
+from srt_utils import format_time_srt
 
 def generate_srt_from_processed_timestamps(all_processed_timestamps: list, srt_file_path: str, timestamp_type: str = "segment"):
     """
