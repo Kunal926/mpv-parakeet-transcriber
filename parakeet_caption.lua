@@ -81,6 +81,11 @@ local ffmpeg_audio_filters = "loudnorm=I=-16:LRA=7:TP=-1.5"
 -- @type table<string>
 local files_to_cleanup_on_shutdown = {}
 
+--- Flag to prevent concurrent transcription runs.
+-- When true, additional transcription requests are ignored until completion.
+-- @type boolean
+local transcription_in_progress = false
+
 --- Safely converts a value to its string representation.
 -- Handles `nil` values by returning the string "nil", preventing errors
 -- that would occur if `tostring(nil)` was called directly in concatenations.
@@ -260,19 +265,45 @@ end
 -- @effects Loads the generated SRT file into MPV.
 -- @usage Called by wrapper functions associated with keybindings (e.g., `transcribe_default_wrapper`).
 local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_filters_flag)
+    if transcription_in_progress then
+        mp.osd_message("Parakeet: Transcription already running.", osd_duration_default)
+        return
+    end
+    transcription_in_progress = true
+    local function abort()
+        transcription_in_progress = false
+    end
     -- Step 0: Validations
-    if not utils.file_info(python_exe) then log("error", "Python executable not found: ", python_exe) return end
-    if not utils.file_info(parakeet_script_path) then log("error", "Parakeet Python script not found: '", parakeet_script_path, "'") return end
-    if ffmpeg_path ~= "ffmpeg" and not utils.file_info(ffmpeg_path) then log("error", "FFmpeg executable not found: ", ffmpeg_path) return end
-    if ffprobe_path ~= "ffprobe" and not utils.file_info(ffprobe_path) then log("error", "FFprobe executable not found: ", ffprobe_path) return end
+    if not utils.file_info(python_exe) then
+        log("error", "Python executable not found: ", python_exe)
+        abort()
+        return
+    end
+    if not utils.file_info(parakeet_script_path) then
+        log("error", "Parakeet Python script not found: '", parakeet_script_path, "'")
+        abort()
+        return
+    end
+    if ffmpeg_path ~= "ffmpeg" and not utils.file_info(ffmpeg_path) then
+        log("error", "FFmpeg executable not found: ", ffmpeg_path)
+        abort()
+        return
+    end
+    if ffprobe_path ~= "ffprobe" and not utils.file_info(ffprobe_path) then
+        log("error", "FFprobe executable not found: ", ffprobe_path)
+        abort()
+        return
+    end
     if not utils.file_info(temp_dir) or not utils.file_info(temp_dir).is_dir then
         log("error", "Temporary directory '", temp_dir, "' does not exist or is not a directory.")
+        abort()
         return
     end
 
     local current_media_path = mp.get_property_native("path")
     if not current_media_path or current_media_path == "" then
         log("error", "No media file is currently playing.")
+        abort()
         return
     end
 
@@ -374,18 +405,21 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         if ffmpeg_res_extract.error or ffmpeg_res_extract.status ~= 0 then
             log("error", "FFmpeg fallback audio extraction ('", ffmpeg_map_value_for_log ,"') also failed. Stderr: ", to_str_safe(ffmpeg_res_extract.stderr))
             mp.osd_message("Parakeet: Failed to extract audio with FFmpeg even with fallback.", 7)
+            abort()
             return
         end
     elseif ffmpeg_res_extract.error or ffmpeg_res_extract.status ~= 0 then
         -- This case handles failure of the initial attempt when specific_audio_absolute_idx was initially valid.
         log("error", "FFmpeg extraction with specific map '", ffmpeg_map_value_for_log, "' failed. Stderr: ", to_str_safe(ffmpeg_res_extract.stderr))
         mp.osd_message("Parakeet: Failed to extract audio with FFmpeg (specific map).", 7)
+        abort()
         return
     end
 
     if not utils.file_info(temp_audio_raw_path) or utils.file_info(temp_audio_raw_path).size == 0 then
         log("error", "FFmpeg ran but raw temporary audio file '", temp_audio_raw_path, "' was not created or is empty.")
         mp.osd_message("Parakeet: FFmpeg failed to produce raw audio file.", 7)
+        abort()
         return
     end
     log("info", "FFmpeg raw audio extraction successful: ", temp_audio_raw_path)
@@ -412,11 +446,13 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
             log("error", "FFmpeg audio filtering failed. Error: ", to_str_safe(ffmpeg_res_filter.error), ", Status: ", to_str_safe(ffmpeg_res_filter.status))
             if ffmpeg_res_filter.stderr and string.len(ffmpeg_res_filter.stderr) > 0 then log("error", "FFmpeg Filter Stderr: ", ffmpeg_res_filter.stderr) end
             mp.osd_message("Parakeet: FFmpeg audio filtering failed.", 7)
+            abort()
             return
         end
         if not utils.file_info(temp_audio_for_python) or utils.file_info(temp_audio_for_python).size == 0 then
             log("error", "FFmpeg filtering ran but final audio file '", temp_audio_for_python, "' is missing or empty.")
             mp.osd_message("Parakeet: FFmpeg filtering produced no audio.", 7)
+            abort()
             return
         end
         log("info", "FFmpeg audio filtering successful. Final audio for transcription: ", temp_audio_for_python)
@@ -468,6 +504,7 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         end
     end
     log("info", "Transcription process complete. Temporary audio files (if any) will be cleaned on MPV shutdown.")
+    abort()
 end
 
 --- Wrapper function to call `do_transcription_core` with default settings.
