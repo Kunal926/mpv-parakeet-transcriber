@@ -1,10 +1,14 @@
-def format_time_srt(seconds: float) -> str:
-    """Convert seconds to SRT timestamp format HH:MM:SS,mmm.
+import math
 
-    Values outside valid ranges are clamped to zero. Rounding that pushes
-    milliseconds to 1000 correctly carries over to the seconds component.
+
+def format_time_srt(seconds: float) -> str:
+    """Convert seconds to SRT timestamp format ``HH:MM:SS,mmm``.
+
+    Any non-numeric, negative, or non-finite (``NaN``/``inf``) values are
+    clamped to zero. Rounding that pushes milliseconds to 1000 correctly
+    carries over to the seconds component.
     """
-    if not isinstance(seconds, (int, float)):
+    if not isinstance(seconds, (int, float)) or not math.isfinite(seconds):
         seconds = 0.0
     if seconds < 0:
         seconds = 0.0
