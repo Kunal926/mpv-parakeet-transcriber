@@ -158,7 +158,7 @@ Download the YAML + CKPT from the pcunwa Hugging Face repositories:
 [Mel-Band Inst](https://huggingface.co/pcunwa).
 
 Switch models by editing `roformer_preset` in `parakeet_caption.lua` or by passing
-`--preset` to `python -m separation.bsr_separate`.
+`--preset` to `python separation/bsr_separate.py`.
 
 Notes:
 

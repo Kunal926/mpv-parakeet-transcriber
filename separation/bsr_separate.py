@@ -20,13 +20,14 @@ import yaml
 # Allow execution without manipulating the environment. When launched
 # directly (e.g., via `python separation/bsr_separate.py`), ensure the
 # repository root is on ``sys.path`` so relative imports succeed.
+REPO_ROOT = Path(__file__).resolve().parent.parent
 if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    sys.path.insert(0, str(REPO_ROOT))
     from separation.roformer_loader import load_separator  # type: ignore
 else:
     from .roformer_loader import load_separator
 
-PRESET_FILE = Path("weights/roformer/presets.yaml")
+PRESET_FILE = REPO_ROOT / "weights" / "roformer" / "presets.yaml"
 
 
 def resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, str]:
@@ -41,8 +42,8 @@ def resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, str]:
     if preset_name not in models:
         raise ValueError(f"Unknown preset '{preset_name}'")
     info = models[preset_name]
-    cfg = Path(info["cfg"])
-    ckpt = Path(info["ckpt"])
+    cfg = REPO_ROOT / info["cfg"]
+    ckpt = REPO_ROOT / info["ckpt"]
     target = info.get("target", "vocals")
     return cfg, ckpt, target
 

@@ -607,8 +607,14 @@ local function isolate_and_transcribe_wrapper()
     mp.osd_message("Separating vocals (" .. roformer_preset .. ")...", 5)
     log("info", "Step B: Separating vocals using preset ", roformer_preset)
     local script_dir = utils.split_path(parakeet_script_path)
+    local sep_script
+    if script_dir ~= "" then
+        sep_script = utils.join_path(script_dir, "separation", "bsr_separate.py")
+    else
+        sep_script = "separation/bsr_separate.py"
+    end
     local sep_cmd = {
-        python_exe, "-m", "separation.bsr_separate",
+        python_exe, sep_script,
         "--in_wav", temp_stereo,
         "--out_wav", temp_vocals,
         "--preset", roformer_preset,
