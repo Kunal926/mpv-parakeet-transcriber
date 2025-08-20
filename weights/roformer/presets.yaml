@@ -1,0 +1,12 @@
+default: revive2
+engine: builtin     # future: "lucidrains" optional
+models:
+  revive2:       { name: "BS-Revive-2",    cfg: "weights/roformer/revive2/config.yaml",           ckpt: "weights/roformer/revive2/model.ckpt",           target: vocals }
+  revive3e:      { name: "BS-Revive-3e",   cfg: "weights/roformer/revive3e/config.yaml",          ckpt: "weights/roformer/revive3e/model.ckpt",          target: vocals }
+  resurrection:  { name: "BS-Resurrection",cfg: "weights/roformer/resurrection/config.yaml",      ckpt: "weights/roformer/resurrection/model.ckpt",      target: vocals }
+  big_beta5e:    { name: "MBR-big_beta5e", cfg: "weights/roformer/melband_big/big_beta5e.yaml",   ckpt: "weights/roformer/melband_big/big_beta5e.ckpt", target: vocals }
+  big_beta6:     { name: "MBR-big_beta6",  cfg: "weights/roformer/melband_big/big_beta6.yaml",    ckpt: "weights/roformer/melband_big/big_beta6.ckpt",  target: vocals }
+  big_beta6x:    { name: "MBR-big_beta6x", cfg: "weights/roformer/melband_big/big_beta6x.yaml",   ckpt: "weights/roformer/melband_big/big_beta6x.ckpt", target: vocals }
+  inst_v2:       { name: "MBR-Inst v2",    cfg: "weights/roformer/inst/config_inst_v2.yaml",      ckpt: "weights/roformer/inst/inst_v2.ckpt",           target: instrumental }
+  inst_v1e_plus: { name: "MBR-Inst v1e+",  cfg: "weights/roformer/inst/config_inst.yaml",         ckpt: "weights/roformer/inst/inst_v1e_plus.ckpt",     target: instrumental }
+  inst_v1_plus:  { name: "MBR-Inst v1+T",  cfg: "weights/roformer/inst/config_inst.yaml",         ckpt: "weights/roformer/inst/inst_v1_plus_test.ckpt", target: instrumental }
