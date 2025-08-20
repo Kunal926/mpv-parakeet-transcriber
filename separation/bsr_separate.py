@@ -17,7 +17,14 @@ import soundfile as sf
 import torch
 import yaml
 
-from .roformer_loader import load_separator
+# Allow execution without manipulating the environment. When launched
+# directly (e.g., via `python separation/bsr_separate.py`), ensure the
+# repository root is on ``sys.path`` so relative imports succeed.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from separation.roformer_loader import load_separator  # type: ignore
+else:
+    from .roformer_loader import load_separator
 
 PRESET_FILE = Path("weights/roformer/presets.yaml")
 

@@ -23,7 +23,17 @@ import argparse
 import numpy as np
 import torch
 import gc
+from pathlib import Path
 from torch.cuda.amp import autocast
+
+# Ensure repository modules are importable when launched without a
+# preconfigured PYTHONPATH. Python adds the script directory to
+# ``sys.path`` by default when executing a file directly, but inserting it
+# explicitly guards against edge cases and mirrors the behavior of the
+# separation script.
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from srt_utils import format_time_srt
 
