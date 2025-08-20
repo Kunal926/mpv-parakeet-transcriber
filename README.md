@@ -140,6 +140,38 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
     * Temporary audio files will be cleaned up from the `temp_dir` when you close MPV.
 5.  Check the MPV console (usually opened with `` ` `` (backtick)) for detailed log messages from the Lua script and the Python script.
 
+## Vocal Isolation (Alt+8)
+
+Press **Alt+8** to run a pre-ASR vocal separation step.
+
+### How it works
+
+1. FFmpeg extracts a stereo 44.1 kHz track from the current media.
+2. A RoFormer model (configured via YAML + checkpoint) isolates the vocals.
+3. The vocals are resampled to 16 kHz mono and fed to Parakeet for transcription.
+4. The resulting subtitles are written as an SRT file and loaded into MPV.
+
+Place model files under `weights/roformer/` following `weights/roformer/presets.yaml`.
+Download the YAML + CKPT from the pcunwa Hugging Face repositories:
+[`Revive`/`Resurrection`](https://huggingface.co/pcunwa),
+[Mel-Band big](https://huggingface.co/pcunwa),
+[Mel-Band Inst](https://huggingface.co/pcunwa).
+
+Switch models by editing `roformer_preset` in `parakeet_caption.lua` or by passing
+`--preset` to `python -m separation.bsr_separate`.
+
+Notes:
+
+* **Revive-2:** maximum de-bleed (often best for ASR).
+* **Revive-3e:** fuller vocals (may carry more background).
+* **Resurrection:** latest BS-RoFormer line.
+* **Mel-Band big (beta5e/6/6x):** strong alternatives.
+* **Inst variants:** predict instrumentals; vocals are derived as `mix − inst`.
+
+Troubleshooting:
+
+* CUDA OOM → increase chunk size, reduce overlap, or disable `--fp16`.
+
 ## Python Transcription Script (`parakeet_transcribe.py`)
 
 This script is the backend that performs the actual ASR using NeMo.
