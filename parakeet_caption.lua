@@ -606,7 +606,7 @@ local function isolate_and_transcribe_wrapper()
 
     mp.osd_message("Separating vocals (" .. roformer_preset .. ")...", 5)
     log("info", "Step B: Separating vocals using preset ", roformer_preset)
-    local script_dir = parakeet_script_path:match("^(.*[/\\])") or ""
+    local script_dir = utils.split_path(parakeet_script_path)
     local sep_cmd = {
         python_exe, "-m", "separation.bsr_separate",
         "--in_wav", temp_stereo,
@@ -614,7 +614,9 @@ local function isolate_and_transcribe_wrapper()
         "--preset", roformer_preset,
         "--fp16"
     }
-    local sep_res = utils.subprocess({ args = sep_cmd, cancellable = false, capture_stdout = true, capture_stderr = true, cwd = script_dir })
+    local sep_opts = { args = sep_cmd, cancellable = false, capture_stdout = true, capture_stderr = true }
+    if script_dir and script_dir ~= "" then sep_opts.cwd = script_dir end
+    local sep_res = utils.subprocess(sep_opts)
     if sep_res.error or sep_res.status ~= 0 then
         log("error", "Separation failed: ", to_str_safe(sep_res.stderr))
         mp.osd_message("Parakeet: Separation failed.", 7)
@@ -638,7 +640,9 @@ local function isolate_and_transcribe_wrapper()
         "--audio_start_offset", tostring(audio_offset_seconds),
         "--segmenter", "word", "--max_words", "12", "--max_duration", "6.0", "--pause", "0.6"
     }
-    local python_res = utils.subprocess({ args = python_command_args, cancellable = false, capture_stdout = true, capture_stderr = true, cwd = script_dir })
+    local python_opts = { args = python_command_args, cancellable = false, capture_stdout = true, capture_stderr = true }
+    if script_dir and script_dir ~= "" then python_opts.cwd = script_dir end
+    local python_res = utils.subprocess(python_opts)
     if python_res.error then
         log("error", "Failed to launch Parakeet Python script: ", to_str_safe(python_res.error))
         mp.osd_message("Parakeet: Failed to launch Python.", 7)
