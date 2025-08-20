@@ -16,6 +16,19 @@ import yaml
 import librosa
 
 
+class _SafeTupleLoader(yaml.SafeLoader):
+    """YAML loader that safely constructs ``!!python/tuple`` nodes."""
+
+
+def _construct_python_tuple(loader: yaml.SafeLoader, node: yaml.Node):
+    return tuple(loader.construct_sequence(node))
+
+
+_SafeTupleLoader.add_constructor(
+    "tag:yaml.org,2002:python/tuple", _construct_python_tuple
+)
+
+
 @dataclass
 class Separator:
     """Wrapper object performing chunked forward passes."""
@@ -120,7 +133,7 @@ def load_separator(
     ckpt_path = str(ckpt_path)
 
     with open(cfg_path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+        cfg = yaml.load(f, Loader=_SafeTupleLoader)
 
     sample_rate = int(cfg.get("sample_rate", 44100))
     chunk_size = int(cfg.get("chunk_size", 262144))
