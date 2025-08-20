@@ -609,9 +609,10 @@ local function isolate_and_transcribe_wrapper()
     local script_dir = utils.split_path(parakeet_script_path)
     local sep_script
     if script_dir ~= "" then
-        sep_script = utils.join_path(script_dir, "separation", "bsr_separate.py")
+        sep_script = utils.join_path(script_dir, "separation")
+        sep_script = utils.join_path(sep_script, "bsr_separate.py")
     else
-        sep_script = "separation/bsr_separate.py"
+        sep_script = utils.join_path("separation", "bsr_separate.py")
     end
     local sep_cmd = {
         python_exe, sep_script,
