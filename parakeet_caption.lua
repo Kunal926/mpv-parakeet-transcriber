@@ -615,7 +615,7 @@ local function isolate_and_transcribe_wrapper()
         "--fp16"
     }
     local sep_opts = { args = sep_cmd, cancellable = false, capture_stdout = true, capture_stderr = true }
-    if script_dir and script_dir ~= "" then sep_opts.env = { PYTHONPATH = script_dir } end
+    if script_dir and script_dir ~= "" then sep_opts.env = { "PYTHONPATH=" .. script_dir } end
     local sep_res = utils.subprocess(sep_opts)
     if sep_res.error or sep_res.status ~= 0 then
         log("error", "Separation failed: ", to_str_safe(sep_res.stderr))
@@ -641,7 +641,7 @@ local function isolate_and_transcribe_wrapper()
         "--segmenter", "word", "--max_words", "12", "--max_duration", "6.0", "--pause", "0.6"
     }
     local python_opts = { args = python_command_args, cancellable = false, capture_stdout = true, capture_stderr = true }
-    if script_dir and script_dir ~= "" then python_opts.env = { PYTHONPATH = script_dir } end
+    if script_dir and script_dir ~= "" then python_opts.env = { "PYTHONPATH=" .. script_dir } end
     local python_res = utils.subprocess(python_opts)
     if python_res.error then
         log("error", "Failed to launch Parakeet Python script: ", to_str_safe(python_res.error))
