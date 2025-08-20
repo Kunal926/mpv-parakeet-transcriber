@@ -571,20 +571,27 @@ local function isolate_and_transcribe_wrapper()
     table.insert(files_to_cleanup_on_shutdown, temp_stereo)
     table.insert(files_to_cleanup_on_shutdown, temp_vocals)
 
-    local audio_offset_seconds = 0.0
-    local offset_val, _ = get_audio_stream_info(current_media_path, "eng")
-    if offset_val then audio_offset_seconds = offset_val end
+    local audio_offset_seconds, audio_stream_idx = get_audio_stream_info(current_media_path, "eng")
+    if not audio_offset_seconds then audio_offset_seconds = 0.0 end
 
     mp.osd_message("Extracting audio...", 3)
     log("info", "Step A: Extracting audio to ", temp_stereo)
-    local ffmpeg_args = {ffmpeg_path, "-y", "-i", current_media_path, "-map", "0:a:m:language:eng?", "-ac", "2", "-ar", "44100", "-vn", temp_stereo}
+
+    local map_arg
+    if audio_stream_idx then
+        map_arg = "0:" .. audio_stream_idx .. "?"
+    else
+        map_arg = "0:a:0?"
+    end
+
+    local ffmpeg_args = {ffmpeg_path, "-y", "-i", current_media_path, "-map", map_arg, "-ac", "2", "-ar", "44100", "-vn", temp_stereo}
     local ffmpeg_res = utils.subprocess({ args = ffmpeg_args, cancellable = false, capture_stdout = true, capture_stderr = true })
     if ffmpeg_res.error or ffmpeg_res.status ~= 0 then
-        log("warn", "FFmpeg extraction (eng track) failed: ", to_str_safe(ffmpeg_res.stderr))
+        log("warn", "FFmpeg extraction (" .. to_str_safe(map_arg) .. ") failed: ", to_str_safe(ffmpeg_res.stderr))
         ffmpeg_args = {ffmpeg_path, "-y", "-i", current_media_path, "-map", "0:a:0?", "-ac", "2", "-ar", "44100", "-vn", temp_stereo}
         ffmpeg_res = utils.subprocess({ args = ffmpeg_args, cancellable = false, capture_stdout = true, capture_stderr = true })
         if ffmpeg_res.error or ffmpeg_res.status ~= 0 then
-            log("error", "FFmpeg extraction failed: ", to_str_safe(ffmpeg_res.stderr))
+            log("error", "FFmpeg extraction failed: " , to_str_safe(ffmpeg_res.stderr))
             mp.osd_message("Parakeet: FFmpeg extraction failed.", 7)
             abort()
             return
