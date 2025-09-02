@@ -13,11 +13,11 @@ import time
 import subprocess
 from pathlib import Path
 
-import librosa
 import numpy as np
 import soundfile as sf
 import torch
 import yaml
+import tempfile
 
 # Allow execution without manipulating the environment. When launched
 # directly (e.g., via `python separation/bsr_separate.py`), ensure the
@@ -81,36 +81,27 @@ def main() -> int:
         audio, sr = sf.read(args.in_wav, dtype="float32")
         if audio.ndim == 1:
             audio = np.stack([audio, audio], axis=-1)
-        if sr != sep.sample_rate:
-            audio = librosa.resample(audio.T, orig_sr=sr, target_sr=sep.sample_rate, axis=1).T
-            sr = sep.sample_rate
+        # Expect 44.1k from Lua extraction; if not, let the model handle minor mismatch or
+        # do a single high-quality hop *outside* Python to avoid multiple resamplings.
 
         out = sep.separate(audio, sr, target)
 
-        tmp_path = Path(args.out_wav).with_suffix(".tmp.wav")
-        sf.write(tmp_path, out.astype(np.float32), sr, subtype="FLOAT")
-
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(tmp_path),
-        ]
+        # Write native-SR vocals to a temp WAV, then soxr→16k mono with FFmpeg (precision=28)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as t:
+            tmp_wav = t.name
+        sf.write(tmp_wav, out.astype(np.float32), sr, subtype="FLOAT")
+        ff = ["ffmpeg", "-y", "-i", tmp_wav]
         if args.mono:
-            ffmpeg_cmd += ["-ac", "1"]
-        ffmpeg_cmd += [
-            "-af",
-            "aresample=resampler=soxr:precision=28",
-            "-ar",
-            str(args.final_sr),
-            "-c:a",
-            "pcm_f32le",
-            args.out_wav,
+            ff += ["-ac", "1"]
+        ff += [
+            "-af", "aresample=resampler=soxr:precision=28",
+            "-ar", str(args.final_sr),
+            "-c:a", "pcm_f32le", args.out_wav,
         ]
-        proc = subprocess.run(ffmpeg_cmd, capture_output=True)
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr.decode("utf-8", "ignore"))
-        tmp_path.unlink(missing_ok=True)
+        rc = subprocess.call(ff)
+        Path(tmp_wav).unlink(missing_ok=True)
+        if rc != 0:
+            raise RuntimeError(f"ffmpeg soxr→{args.final_sr} failed with code {rc}")
     except Exception as e:
         print(f"Separation failed: {e}", file=sys.stderr)
         return 1
