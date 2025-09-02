@@ -63,14 +63,22 @@ local key_binding_ffmpeg_py_float32 = "Alt+7" -- FFmpeg Preprocessing + Python F
 local key_binding_isolate_asr_fast = "Alt+8"   -- Vocal isolation + ASR (fast)
 local key_binding_isolate_asr_slow = "Alt+9"   -- Vocal isolation + ASR (high quality)
 
--- === Separation models you selected in A/B ===
-local sep_fast = { cfg = "weights/roformer/voc_fv4/voc_gabox.yaml",
-                   ckpt = "weights/roformer/voc_fv4/voc_fv4.ckpt",
-                   target = "vocals" }
+-- Root directory containing separation model weights.
+-- Provide the full path so Python can locate the YAML and checkpoint files reliably.
+local weights_dir = "C:/Parakeet_Caption/weights"
 
-local sep_slow = { cfg = "weights/roformer/karaoke_viperx/config_mel_band_roformer_karaoke.yaml",
-                   ckpt = "weights/roformer/karaoke_viperx/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
-                   target = "vocals" }
+-- === Separation models you selected in A/B ===
+local sep_fast = {
+    cfg   = weights_dir .. "/roformer/voc_fv4/voc_gabox.yaml",
+    ckpt  = weights_dir .. "/roformer/voc_fv4/voc_fv4.ckpt",
+    target = "vocals"
+}
+
+local sep_slow = {
+    cfg   = weights_dir .. "/roformer/karaoke_viperx/config_mel_band_roformer_karaoke.yaml",
+    ckpt  = weights_dir .. "/roformer/karaoke_viperx/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+    target = "vocals"
+}
 
 -- Word segmenter knobs (what you used in batch)
 local seg_args = { "--segmenter","word","--max_words","12","--max_duration","6.0","--pause","0.6","--force_float32" }
