@@ -1,14 +1,16 @@
 """Command line interface for RoFormer-based vocal separation.
 
 This utility loads a preset configuration and checkpoint to
-isolate vocals from a stereo mixture. Output is always a 16 kHz mono
-WAV suitable for Parakeet ASR.
+isolate vocals from a stereo mixture. Output is a float32 WAV resampled
+with FFmpeg's high-quality ``soxr`` backend (16 kHz mono by default)
+ suitable for Parakeet ASR.
 """
 from __future__ import annotations
 
 import argparse
 import sys
 import time
+import subprocess
 from pathlib import Path
 
 import librosa
@@ -50,14 +52,18 @@ def resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="RoFormer vocal isolation")
-    parser.add_argument("--in_wav", required=True, help="Input stereo WAV (44.1kHz)")
-    parser.add_argument("--out_wav", required=True, help="Output vocals WAV (16kHz mono)")
+    parser.add_argument("--in_wav", required=True, help="Input stereo WAV")
+    parser.add_argument("--out_wav", required=True, help="Output vocals WAV")
     parser.add_argument("--preset", default=None, help="Model preset name")
     parser.add_argument("--cfg", default=None, help="Path to model YAML")
     parser.add_argument("--ckpt", default=None, help="Path to model checkpoint")
     parser.add_argument("--engine", default="builtin")
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--target", default=None, help="Override target stem")
+    parser.add_argument("--final_sr", type=int, default=16000, help="Final output sample rate")
+    parser.add_argument("--mono", dest="mono", action="store_true")
+    parser.add_argument("--no-mono", dest="mono", action="store_false")
+    parser.set_defaults(mono=True)
     args = parser.parse_args()
 
     try:
@@ -81,10 +87,30 @@ def main() -> int:
 
         out = sep.separate(audio, sr, target)
 
-        # Downmix to mono and resample to 16 kHz
-        mono = out.mean(axis=1)
-        mono16 = librosa.resample(mono, orig_sr=sr, target_sr=16000)
-        sf.write(args.out_wav, mono16.astype(np.float32), 16000, subtype="FLOAT")
+        tmp_path = Path(args.out_wav).with_suffix(".tmp.wav")
+        sf.write(tmp_path, out.astype(np.float32), sr, subtype="FLOAT")
+
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(tmp_path),
+        ]
+        if args.mono:
+            ffmpeg_cmd += ["-ac", "1"]
+        ffmpeg_cmd += [
+            "-af",
+            "aresample=resampler=soxr:precision=28",
+            "-ar",
+            str(args.final_sr),
+            "-c:a",
+            "pcm_f32le",
+            args.out_wav,
+        ]
+        proc = subprocess.run(ffmpeg_cmd, capture_output=True)
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.decode("utf-8", "ignore"))
+        tmp_path.unlink(missing_ok=True)
     except Exception as e:
         print(f"Separation failed: {e}", file=sys.stderr)
         return 1

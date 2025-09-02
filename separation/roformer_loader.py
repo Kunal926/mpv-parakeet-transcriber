@@ -113,7 +113,7 @@ def load_separator(
     cfg_path: str,
     ckpt_path: str,
     device: str = "cuda",
-    fp16: bool = True,
+    fp16: bool = False,
 ) -> Separator:
     """Instantiate a :class:`Separator` from YAML and checkpoint.
 

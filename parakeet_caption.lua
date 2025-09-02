@@ -65,6 +65,7 @@ local key_binding_isolate_asr_slow = "Alt+9"   -- Vocal isolation + ASR (high qu
 
 local roformer_preset_fast = "voc_fv4"  -- Fast model
 local roformer_preset_slow = "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956" -- High-quality model
+local separator_use_fp16 = false  -- Set true to enable --fp16 for separation
 
 --- FFmpeg audio filter chain for pre-processing mode.
 -- This string defines the audio filters FFmpeg will apply when the
@@ -568,7 +569,8 @@ local function isolate_and_transcribe_wrapper(preset)
     local srt_output_path = utils.join_path(media_dir, base_name .. ".srt")
     local sanitized_base_name = base_name:gsub("[^%w%-_%.]", "_")
 
-    local temp_stereo = utils.join_path(temp_dir, sanitized_base_name .. "_stereo_44k.wav")
+    -- temp_stereo retains source sample rate (no pre-resample)
+    local temp_stereo = utils.join_path(temp_dir, sanitized_base_name .. "_stereo.wav")
     local temp_vocals = utils.join_path(temp_dir, sanitized_base_name .. "_vocals_16k_mono.wav")
     table.insert(files_to_cleanup_on_shutdown, temp_stereo)
     table.insert(files_to_cleanup_on_shutdown, temp_vocals)
@@ -586,11 +588,12 @@ local function isolate_and_transcribe_wrapper(preset)
         map_arg = "0:a:0?"
     end
 
-    local ffmpeg_args = {ffmpeg_path, "-y", "-i", current_media_path, "-map", map_arg, "-ac", "2", "-ar", "44100", "-vn", temp_stereo}
+    -- Extract stereo PCM without altering the original sample rate
+    local ffmpeg_args = {ffmpeg_path, "-y", "-i", current_media_path, "-map", map_arg, "-ac", "2", "-c:a", "pcm_s16le", "-vn", temp_stereo}
     local ffmpeg_res = utils.subprocess({ args = ffmpeg_args, cancellable = false, capture_stdout = true, capture_stderr = true })
     if ffmpeg_res.error or ffmpeg_res.status ~= 0 then
         log("warn", "FFmpeg extraction (" .. to_str_safe(map_arg) .. ") failed: ", to_str_safe(ffmpeg_res.stderr))
-        ffmpeg_args = {ffmpeg_path, "-y", "-i", current_media_path, "-map", "0:a:0?", "-ac", "2", "-ar", "44100", "-vn", temp_stereo}
+        ffmpeg_args = {ffmpeg_path, "-y", "-i", current_media_path, "-map", "0:a:0?", "-ac", "2", "-c:a", "pcm_s16le", "-vn", temp_stereo}
         ffmpeg_res = utils.subprocess({ args = ffmpeg_args, cancellable = false, capture_stdout = true, capture_stderr = true })
         if ffmpeg_res.error or ffmpeg_res.status ~= 0 then
             log("error", "FFmpeg extraction failed: " , to_str_safe(ffmpeg_res.stderr))
@@ -620,9 +623,9 @@ local function isolate_and_transcribe_wrapper(preset)
         python_exe, sep_script,
         "--in_wav", temp_stereo,
         "--out_wav", temp_vocals,
-        "--preset", preset,
-        "--fp16"
+        "--preset", preset
     }
+    if separator_use_fp16 then table.insert(sep_cmd, "--fp16") end
     local sep_opts = { args = sep_cmd, cancellable = false, capture_stdout = true, capture_stderr = true }
     local sep_res = utils.subprocess(sep_opts)
     if sep_res.error or sep_res.status ~= 0 then
