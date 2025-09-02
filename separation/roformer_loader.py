@@ -19,30 +19,30 @@ _SafeTupleLoader.add_constructor("tag:yaml.org,2002:python/tuple", _construct_py
 # We try both common class names to be resilient to upstream naming.
 def _import_melband_class():
     try:
-        from separation.band_split_roformer.mel_band_roformer import MelBandRoformer
+        from separation.roformer_models.mel_band_roformer import MelBandRoformer
         return MelBandRoformer
     except Exception:
         try:
-            from separation.band_split_roformer.mel_band_roformer import MelBand_Roformer as MelBandRoformer
+            from separation.roformer_models.mel_band_roformer import MelBand_Roformer as MelBandRoformer
             return MelBandRoformer
         except Exception as e:
             raise ImportError(
                 "Could not import MelBand RoFormer class. "
-                "Ensure separation/band_split_roformer/mel_band_roformer.py is present."
+                "Ensure separation/roformer_models/mel_band_roformer.py is present."
             ) from e
 
 def _import_bs_class():
     try:
-        from separation.band_split_roformer.bs_roformer import BSRoformer
+        from separation.roformer_models.bs_roformer import BSRoformer
         return BSRoformer
     except Exception:
         try:
-            from separation.band_split_roformer.bs_roformer import BS_Roformer as BSRoformer
+            from separation.roformer_models.bs_roformer import BS_Roformer as BSRoformer
             return BSRoformer
         except Exception as e:
             raise ImportError(
                 "Could not import BS-RoFormer class. "
-                "Ensure separation/band_split_roformer/bs_roformer.py is present."
+                "Ensure separation/roformer_models/bs_roformer.py is present."
             ) from e
 
 @dataclass
