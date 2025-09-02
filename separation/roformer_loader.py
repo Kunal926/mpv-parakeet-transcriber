@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import yaml
 import librosa
+import sys
 
 
 class _SafeTupleLoader(yaml.SafeLoader):
@@ -98,12 +99,7 @@ class Separator:
 
 
 class _IdentityModel(torch.nn.Module):
-    """Fallback model when real checkpoints are unavailable.
-
-    It simply returns the input mixture, allowing the rest of the
-    pipeline to function even without weights. Users are expected to
-    provide real YAML+CKPT files for proper separation.
-    """
+    # Keep for defensive coding, but we will not use it silently anymore.
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         return x
@@ -138,20 +134,25 @@ def load_separator(
     sample_rate = int(cfg.get("sample_rate", 44100))
     chunk_size = int(cfg.get("chunk_size", 262144))
     overlap = int(cfg.get("num_overlap", 0))
+    print(f"[SEP] cfg sr={sample_rate} chunk={chunk_size} overlap={overlap}", file=sys.stderr)
+    print(f"[SEP] ckpt={ckpt_path}", file=sys.stderr)
 
     dev = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
 
+    ckpt = Path(ckpt_path)
+    if not ckpt.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
+
+    try:
+        state = torch.load(str(ckpt), map_location="cpu")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load checkpoint: {ckpt} ({e})")
+
     model = _IdentityModel()
-    if Path(ckpt_path).is_file():
-        try:
-            state = torch.load(ckpt_path, map_location="cpu")
-            if isinstance(state, dict) and "state_dict" in state:
-                model.load_state_dict(state["state_dict"], strict=False)
-            else:
-                model.load_state_dict(state, strict=False)
-        except Exception:
-            # Fall back to identity if checkpoint cannot be loaded
-            pass
+    if isinstance(state, dict) and "state_dict" in state:
+        model.load_state_dict(state["state_dict"], strict=True)
+    else:
+        model.load_state_dict(state, strict=True)
 
     model.eval()
     model.to(dev)

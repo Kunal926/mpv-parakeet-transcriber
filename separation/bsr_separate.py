@@ -54,6 +54,8 @@ def main() -> int:
     start = time.time()
     try:
         audio, sr = sf.read(args.in_wav, dtype="float32")
+        dur = len(audio) / float(sr)
+        print(f"[SEP] input dur ~{dur:.1f}s @ {sr}Hz", file=sys.stderr)
         if audio.ndim == 1:
             audio = np.stack([audio, audio], axis=-1)
         total_samples = audio.shape[0]
