@@ -62,8 +62,7 @@ local key_binding_ffmpeg_preprocess = "Alt+6"   -- FFmpeg Preprocessing (default
 local key_binding_ffmpeg_py_float32 = "Alt+7" -- FFmpeg Preprocessing + Python Float32 Precision
 local key_binding_isolate_asr = "Alt+8"       -- Vocal isolation + ASR
 
--- Default RoFormer preset for vocal isolation. Users can change this.
-local roformer_preset = "revive2"  -- Options: big_beta6x, resurrection, inst_v2, etc.
+local roformer_preset = "voc_fv4"  -- Options: mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956
 
 --- FFmpeg audio filter chain for pre-processing mode.
 -- This string defines the audio filters FFmpeg will apply when the

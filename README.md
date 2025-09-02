@@ -152,21 +152,17 @@ Press **Alt+8** to run a pre-ASR vocal separation step.
 4. The resulting subtitles are written as an SRT file and loaded into MPV.
 
 Place model files under `weights/roformer/` following `weights/roformer/presets.yaml`.
-Download the YAML + CKPT from the pcunwa Hugging Face repositories:
-[`Revive`/`Resurrection`](https://huggingface.co/pcunwa),
-[Mel-Band big](https://huggingface.co/pcunwa),
-[Mel-Band Inst](https://huggingface.co/pcunwa).
+Download the YAML + CKPT from the pcunwa Hugging Face repositories, for example:
+* [voc_fv4](https://huggingface.co/pcunwa/voc-fv4)
+* [mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956](https://huggingface.co/pcunwa/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956)
 
 Switch models by editing `roformer_preset` in `parakeet_caption.lua` or by passing
 `--preset` to `python separation/bsr_separate.py`.
 
 Notes:
 
-* **Revive-2:** maximum de-bleed (often best for ASR).
-* **Revive-3e:** fuller vocals (may carry more background).
-* **Resurrection:** latest BS-RoFormer line.
-* **Mel-Band big (beta5e/6/6x):** strong alternatives.
-* **Inst variants:** predict instrumentals; vocals are derived as `mix − inst`.
+* **voc_fv4:** fast separation with lighter resource use.
+* **mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956:** slower but higher quality isolation.
 
 Troubleshooting:
 
