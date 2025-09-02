@@ -63,9 +63,25 @@ local key_binding_ffmpeg_py_float32 = "Alt+7" -- FFmpeg Preprocessing + Python F
 local key_binding_isolate_asr_fast = "Alt+8"   -- Vocal isolation + ASR (fast)
 local key_binding_isolate_asr_slow = "Alt+9"   -- Vocal isolation + ASR (high quality)
 
-local roformer_preset_fast = "voc_fv4"  -- Fast model
-local roformer_preset_slow = "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956" -- High-quality model
-local separator_use_fp16 = false  -- Set true to enable --fp16 for separation
+-- Root directory containing separation model weights.
+-- Provide the full path so Python can locate the YAML and checkpoint files reliably.
+local weights_dir = "C:/Parakeet_Caption/weights"
+
+-- === Separation models you selected in A/B ===
+local sep_fast = {
+    cfg   = weights_dir .. "/roformer/voc_fv4/voc_gabox.yaml",
+    ckpt  = weights_dir .. "/roformer/voc_fv4/voc_fv4.ckpt",
+    target = "vocals"
+}
+
+local sep_slow = {
+    cfg   = weights_dir .. "/roformer/karaoke_viperx/config_mel_band_roformer_karaoke.yaml",
+    ckpt  = weights_dir .. "/roformer/karaoke_viperx/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+    target = "vocals"
+}
+
+-- Word segmenter knobs (what you used in batch)
+local seg_args = { "--segmenter","word","--max_words","12","--max_duration","6.0","--pause","0.6","--force_float32" }
 
 --- FFmpeg audio filter chain for pre-processing mode.
 -- This string defines the audio filters FFmpeg will apply when the
@@ -514,8 +530,8 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
 end
 
 -- Perform FFmpeg extraction -> RoFormer separation -> Parakeet ASR
-local function isolate_and_transcribe_wrapper(preset)
-    preset = preset or roformer_preset_fast
+local function run_isolate_then_asr(model)
+    model = model or sep_fast
     if transcription_in_progress then
         mp.osd_message("Parakeet: Transcription already running.", osd_duration_default)
         return
@@ -588,12 +604,14 @@ local function isolate_and_transcribe_wrapper(preset)
         map_arg = "0:a:0?"
     end
 
-    -- Extract stereo PCM without altering the original sample rate
-    local ffmpeg_args = {ffmpeg_path, "-y", "-i", current_media_path, "-map", map_arg, "-ac", "2", "-c:a", "pcm_s16le", "-vn", temp_stereo}
+    -- Extract stereo 44.1 kHz float32 to match ZFTurbo models exactly
+    local ffmpeg_args = {ffmpeg_path, "-y", "-i", current_media_path, "-map", map_arg,
+        "-ac", "2", "-ar", "44100", "-c:a", "pcm_f32le", "-vn", temp_stereo} -- stereo_44k float32
     local ffmpeg_res = utils.subprocess({ args = ffmpeg_args, cancellable = false, capture_stdout = true, capture_stderr = true })
     if ffmpeg_res.error or ffmpeg_res.status ~= 0 then
         log("warn", "FFmpeg extraction (" .. to_str_safe(map_arg) .. ") failed: ", to_str_safe(ffmpeg_res.stderr))
-        ffmpeg_args = {ffmpeg_path, "-y", "-i", current_media_path, "-map", "0:a:0?", "-ac", "2", "-c:a", "pcm_s16le", "-vn", temp_stereo}
+        ffmpeg_args = {ffmpeg_path, "-y", "-i", current_media_path, "-map", "0:a:0?",
+            "-ac", "2", "-ar", "44100", "-c:a", "pcm_f32le", "-vn", temp_stereo}
         ffmpeg_res = utils.subprocess({ args = ffmpeg_args, cancellable = false, capture_stdout = true, capture_stderr = true })
         if ffmpeg_res.error or ffmpeg_res.status ~= 0 then
             log("error", "FFmpeg extraction failed: " , to_str_safe(ffmpeg_res.stderr))
@@ -609,8 +627,8 @@ local function isolate_and_transcribe_wrapper(preset)
         return
     end
 
-    mp.osd_message("Separating vocals (" .. preset .. ")...", 5)
-    log("info", "Step B: Separating vocals using preset ", preset)
+    mp.osd_message("Separating vocals...", 5)
+    log("info", "Step B: Separating vocals using model cfg ", model.cfg)
     local script_dir = utils.split_path(parakeet_script_path)
     local sep_script
     if script_dir ~= "" then
@@ -620,12 +638,9 @@ local function isolate_and_transcribe_wrapper(preset)
         sep_script = utils.join_path("separation", "bsr_separate.py")
     end
     local sep_cmd = {
-        python_exe, sep_script,
-        "--in_wav", temp_stereo,
-        "--out_wav", temp_vocals,
-        "--preset", preset
+        python_exe, sep_script, "--in_wav", temp_stereo, "--out_wav", temp_vocals,
+        "--cfg", model.cfg, "--ckpt", model.ckpt, "--target", model.target
     }
-    if separator_use_fp16 then table.insert(sep_cmd, "--fp16") end
     local sep_opts = { args = sep_cmd, cancellable = false, capture_stdout = true, capture_stderr = true }
     local sep_res = utils.subprocess(sep_opts)
     if sep_res.error or sep_res.status ~= 0 then
@@ -643,15 +658,12 @@ local function isolate_and_transcribe_wrapper(preset)
 
     mp.osd_message("Transcribing...", 5)
     log("info", "Step C: Running Parakeet transcription on separated vocals")
-    local python_command_args = {
-        python_exe,
-        parakeet_script_path,
-        temp_vocals,
-        srt_output_path,
-        "--audio_start_offset", tostring(audio_offset_seconds),
-        "--segmenter", "word", "--max_words", "12", "--max_duration", "6.0", "--pause", "0.6"
+    local parakeet_args = {
+        python_exe, parakeet_script_path, temp_vocals, srt_output_path,
+        "--audio_start_offset", tostring(audio_offset_seconds)
     }
-    local python_opts = { args = python_command_args, cancellable = false, capture_stdout = true, capture_stderr = true }
+    for _,v in ipairs(seg_args) do table.insert(parakeet_args, v) end
+    local python_opts = { args = parakeet_args, cancellable = false, capture_stdout = true, capture_stderr = true }
     local python_res = utils.subprocess(python_opts)
     if python_res.error then
         log("error", "Failed to launch Parakeet Python script: ", to_str_safe(python_res.error))
@@ -708,8 +720,10 @@ mp.add_key_binding(key_binding_default, "parakeet-transcribe-default", transcrib
 mp.add_key_binding(key_binding_py_float32, "parakeet-transcribe-py-float32", transcribe_py_float32_wrapper)
 mp.add_key_binding(key_binding_ffmpeg_preprocess, "parakeet-transcribe-ffmpeg-preprocess", transcribe_ffmpeg_preprocess_wrapper)
 mp.add_key_binding(key_binding_ffmpeg_py_float32, "parakeet-transcribe-ffmpeg-py-float32", transcribe_ffmpeg_py_float32_wrapper)
-mp.add_key_binding(key_binding_isolate_asr_fast, "parakeet-isolate-asr-fast", function() isolate_and_transcribe_wrapper(roformer_preset_fast) end)
-mp.add_key_binding(key_binding_isolate_asr_slow, "parakeet-isolate-asr-slow", function() isolate_and_transcribe_wrapper(roformer_preset_slow) end)
+-- Alt+8 fast = fv4
+mp.add_forced_key_binding(key_binding_isolate_asr_fast, "parakeet_fast", function() run_isolate_then_asr(sep_fast) end)
+-- Alt+9 slow = mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956
+mp.add_forced_key_binding(key_binding_isolate_asr_slow, "parakeet_slow", function() run_isolate_then_asr(sep_slow) end)
 
 log("info", "Parakeet (Multi-Mode) script loaded.")
 log("info", "SRT will be loaded immediately after transcription and selected.")
