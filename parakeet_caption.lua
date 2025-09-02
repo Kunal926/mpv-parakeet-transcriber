@@ -60,9 +60,11 @@ local key_binding_default = "Alt+4"             -- Standard transcription (no FF
 local key_binding_py_float32 = "Alt+5"          -- Python Float32 precision (no FFmpeg preprocessing)
 local key_binding_ffmpeg_preprocess = "Alt+6"   -- FFmpeg Preprocessing (default Python precision)
 local key_binding_ffmpeg_py_float32 = "Alt+7" -- FFmpeg Preprocessing + Python Float32 Precision
-local key_binding_isolate_asr = "Alt+8"       -- Vocal isolation + ASR
+local key_binding_isolate_asr_fast = "Alt+8"   -- Vocal isolation + ASR (fast)
+local key_binding_isolate_asr_slow = "Alt+9"   -- Vocal isolation + ASR (high quality)
 
-local roformer_preset = "voc_fv4"  -- Options: mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956
+local roformer_preset_fast = "voc_fv4"  -- Fast model
+local roformer_preset_slow = "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956" -- High-quality model
 
 --- FFmpeg audio filter chain for pre-processing mode.
 -- This string defines the audio filters FFmpeg will apply when the
@@ -511,7 +513,8 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
 end
 
 -- Perform FFmpeg extraction -> RoFormer separation -> Parakeet ASR
-local function isolate_and_transcribe_wrapper()
+local function isolate_and_transcribe_wrapper(preset)
+    preset = preset or roformer_preset_fast
     if transcription_in_progress then
         mp.osd_message("Parakeet: Transcription already running.", osd_duration_default)
         return
@@ -603,8 +606,8 @@ local function isolate_and_transcribe_wrapper()
         return
     end
 
-    mp.osd_message("Separating vocals (" .. roformer_preset .. ")...", 5)
-    log("info", "Step B: Separating vocals using preset ", roformer_preset)
+    mp.osd_message("Separating vocals (" .. preset .. ")...", 5)
+    log("info", "Step B: Separating vocals using preset ", preset)
     local script_dir = utils.split_path(parakeet_script_path)
     local sep_script
     if script_dir ~= "" then
@@ -617,7 +620,7 @@ local function isolate_and_transcribe_wrapper()
         python_exe, sep_script,
         "--in_wav", temp_stereo,
         "--out_wav", temp_vocals,
-        "--preset", roformer_preset,
+        "--preset", preset,
         "--fp16"
     }
     local sep_opts = { args = sep_cmd, cancellable = false, capture_stdout = true, capture_stderr = true }
@@ -702,7 +705,8 @@ mp.add_key_binding(key_binding_default, "parakeet-transcribe-default", transcrib
 mp.add_key_binding(key_binding_py_float32, "parakeet-transcribe-py-float32", transcribe_py_float32_wrapper)
 mp.add_key_binding(key_binding_ffmpeg_preprocess, "parakeet-transcribe-ffmpeg-preprocess", transcribe_ffmpeg_preprocess_wrapper)
 mp.add_key_binding(key_binding_ffmpeg_py_float32, "parakeet-transcribe-ffmpeg-py-float32", transcribe_ffmpeg_py_float32_wrapper)
-mp.add_key_binding(key_binding_isolate_asr, "parakeet-isolate-asr", isolate_and_transcribe_wrapper)
+mp.add_key_binding(key_binding_isolate_asr_fast, "parakeet-isolate-asr-fast", function() isolate_and_transcribe_wrapper(roformer_preset_fast) end)
+mp.add_key_binding(key_binding_isolate_asr_slow, "parakeet-isolate-asr-slow", function() isolate_and_transcribe_wrapper(roformer_preset_slow) end)
 
 log("info", "Parakeet (Multi-Mode) script loaded.")
 log("info", "SRT will be loaded immediately after transcription and selected.")
@@ -711,7 +715,8 @@ log("info", "Press '", key_binding_default, "' for Standard Transcription.")
 log("info", "Press '", key_binding_py_float32, "' for Python Float32 Precision.")
 log("info", "Press '", key_binding_ffmpeg_preprocess, "' for FFmpeg Preprocessing (Default Python Precision).")
 log("info", "Press '", key_binding_ffmpeg_py_float32, "' for FFmpeg Preprocessing + Python Float32 Precision.")
-log("info", "Press '", key_binding_isolate_asr, "' for Vocal Isolation + ASR.")
+log("info", "Press '", key_binding_isolate_asr_fast, "' for Vocal Isolation + ASR (fast).")
+log("info", "Press '", key_binding_isolate_asr_slow, "' for Vocal Isolation + ASR (high quality).")
 log("info", "Using Python from: ", python_exe)
 log("info", "Using FFmpeg from: ", ffmpeg_path)
 log("info", "Using FFprobe from: ", ffprobe_path)

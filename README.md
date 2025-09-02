@@ -140,9 +140,9 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
     * Temporary audio files will be cleaned up from the `temp_dir` when you close MPV.
 5.  Check the MPV console (usually opened with `` ` `` (backtick)) for detailed log messages from the Lua script and the Python script.
 
-## Vocal Isolation (Alt+8)
+## Vocal Isolation (Alt+8 / Alt+9)
 
-Press **Alt+8** to run a pre-ASR vocal separation step.
+Press **Alt+8** for the fast `voc_fv4` model or **Alt+9** for the higher-quality Viper model before transcription.
 
 ### How it works
 
@@ -156,13 +156,13 @@ Download the YAML + CKPT from the pcunwa Hugging Face repositories, for example:
 * [voc_fv4](https://huggingface.co/pcunwa/voc-fv4)
 * [mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956](https://huggingface.co/pcunwa/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956)
 
-Switch models by editing `roformer_preset` in `parakeet_caption.lua` or by passing
-`--preset` to `python separation/bsr_separate.py`.
+Change presets by editing `roformer_preset_fast` or `roformer_preset_slow` in `parakeet_caption.lua`,
+or by passing `--preset` to `python separation/bsr_separate.py`.
 
 Notes:
 
-* **voc_fv4:** fast separation with lighter resource use.
-* **mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956:** slower but higher quality isolation.
+* **voc_fv4:** fast separation with lighter resource use (Alt+8).
+* **mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956:** slower but higher quality isolation (Alt+9).
 
 Troubleshooting:
 
