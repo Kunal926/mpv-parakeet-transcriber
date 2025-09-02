@@ -140,6 +140,41 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
     * Temporary audio files will be cleaned up from the `temp_dir` when you close MPV.
 5.  Check the MPV console (usually opened with `` ` `` (backtick)) for detailed log messages from the Lua script and the Python script.
 
+## Vocal Isolation (Alt+8 / Alt+9)
+
+Press **Alt+8** for the fast `voc_fv4` model or **Alt+9** for the higher-quality Viper model before transcription.
+
+### How it works
+
+1. FFmpeg extracts a stereo track from the current media without changing its sample rate.
+2. A RoFormer model (configured via YAML + checkpoint) isolates the vocals.
+3. FFmpeg converts the separated vocals to 16 kHz mono using `soxr` with precision 28 and feeds them to Parakeet.
+4. The resulting subtitles are written as an SRT file and loaded into MPV.
+
+Place model files under `weights/roformer/` following `weights/roformer/presets.yaml`.
+Download the YAML + CKPT from the pcunwa Hugging Face repositories, for example:
+* [voc_fv4](https://huggingface.co/pcunwa/voc-fv4)
+* [mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956](https://huggingface.co/pcunwa/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956)
+
+Change presets by editing `roformer_preset_fast` or `roformer_preset_slow` in `parakeet_caption.lua`,
+or by passing `--preset` to `python separation/bsr_separate.py`.
+
+FP16 for separation is now opt-in. Toggle `separator_use_fp16` in the Lua script or pass `--fp16` to `bsr_separate.py` if you
+need the extra speed or lower VRAM usage.
+
+Notes:
+
+* **voc_fv4:** fast separation with lighter resource use (Alt+8).
+* **mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956:** slower but higher quality isolation (Alt+9).
+
+Quality notes:
+
+* Fewer resampling hops plus FFmpeg's high-quality `soxr` resampler preserve consonants and reduce word-error rate.
+
+Troubleshooting:
+
+* CUDA OOM → increase chunk size, reduce overlap, or enable `--fp16` to save VRAM.
+
 ## Python Transcription Script (`parakeet_transcribe.py`)
 
 This script is the backend that performs the actual ASR using NeMo.

@@ -60,6 +60,12 @@ local key_binding_default = "Alt+4"             -- Standard transcription (no FF
 local key_binding_py_float32 = "Alt+5"          -- Python Float32 precision (no FFmpeg preprocessing)
 local key_binding_ffmpeg_preprocess = "Alt+6"   -- FFmpeg Preprocessing (default Python precision)
 local key_binding_ffmpeg_py_float32 = "Alt+7" -- FFmpeg Preprocessing + Python Float32 Precision
+local key_binding_isolate_asr_fast = "Alt+8"   -- Vocal isolation + ASR (fast)
+local key_binding_isolate_asr_slow = "Alt+9"   -- Vocal isolation + ASR (high quality)
+
+local roformer_preset_fast = "voc_fv4"  -- Fast model
+local roformer_preset_slow = "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956" -- High-quality model
+local separator_use_fp16 = false  -- Set true to enable --fp16 for separation
 
 --- FFmpeg audio filter chain for pre-processing mode.
 -- This string defines the audio filters FFmpeg will apply when the
@@ -507,6 +513,165 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     abort()
 end
 
+-- Perform FFmpeg extraction -> RoFormer separation -> Parakeet ASR
+local function isolate_and_transcribe_wrapper(preset)
+    preset = preset or roformer_preset_fast
+    if transcription_in_progress then
+        mp.osd_message("Parakeet: Transcription already running.", osd_duration_default)
+        return
+    end
+    transcription_in_progress = true
+    local function abort()
+        transcription_in_progress = false
+    end
+
+    if not utils.file_info(python_exe) then
+        log("error", "Python executable not found: ", python_exe)
+        abort()
+        return
+    end
+    if not utils.file_info(parakeet_script_path) then
+        log("error", "Parakeet Python script not found: '", parakeet_script_path, "'")
+        abort()
+        return
+    end
+    if ffmpeg_path ~= "ffmpeg" and not utils.file_info(ffmpeg_path) then
+        log("error", "FFmpeg executable not found: ", ffmpeg_path)
+        abort()
+        return
+    end
+    if not utils.file_info(temp_dir) or not utils.file_info(temp_dir).is_dir then
+        log("error", "Temporary directory '", temp_dir, "' does not exist or is not a directory.")
+        abort()
+        return
+    end
+
+    local current_media_path = mp.get_property_native("path")
+    if not current_media_path or current_media_path == "" then
+        log("error", "No media file is currently playing.")
+        abort()
+        return
+    end
+
+    local file_name_with_ext = current_media_path:match("([^/\\]+)$") or "unknown_file"
+    local base_name = file_name_with_ext:match("(.+)%.[^%.]+$") or file_name_with_ext
+    local media_dir = ""
+    local path_sep_pos = current_media_path:match("^.*[/\\]()")
+    if path_sep_pos then
+        media_dir = current_media_path:sub(1, path_sep_pos -1)
+    else
+        local cwd = utils.getcwd()
+        if cwd then media_dir = cwd end
+    end
+    if media_dir ~= "" and not media_dir:match("[/\\]$") then
+        media_dir = media_dir .. package.config:sub(1,1)
+    end
+    local srt_output_path = utils.join_path(media_dir, base_name .. ".srt")
+    local sanitized_base_name = base_name:gsub("[^%w%-_%.]", "_")
+
+    -- temp_stereo retains source sample rate (no pre-resample)
+    local temp_stereo = utils.join_path(temp_dir, sanitized_base_name .. "_stereo.wav")
+    local temp_vocals = utils.join_path(temp_dir, sanitized_base_name .. "_vocals_16k_mono.wav")
+    table.insert(files_to_cleanup_on_shutdown, temp_stereo)
+    table.insert(files_to_cleanup_on_shutdown, temp_vocals)
+
+    local audio_offset_seconds, audio_stream_idx = get_audio_stream_info(current_media_path, "eng")
+    if not audio_offset_seconds then audio_offset_seconds = 0.0 end
+
+    mp.osd_message("Extracting audio...", 3)
+    log("info", "Step A: Extracting audio to ", temp_stereo)
+
+    local map_arg
+    if audio_stream_idx then
+        map_arg = "0:" .. audio_stream_idx .. "?"
+    else
+        map_arg = "0:a:0?"
+    end
+
+    -- Extract stereo PCM without altering the original sample rate
+    local ffmpeg_args = {ffmpeg_path, "-y", "-i", current_media_path, "-map", map_arg, "-ac", "2", "-c:a", "pcm_s16le", "-vn", temp_stereo}
+    local ffmpeg_res = utils.subprocess({ args = ffmpeg_args, cancellable = false, capture_stdout = true, capture_stderr = true })
+    if ffmpeg_res.error or ffmpeg_res.status ~= 0 then
+        log("warn", "FFmpeg extraction (" .. to_str_safe(map_arg) .. ") failed: ", to_str_safe(ffmpeg_res.stderr))
+        ffmpeg_args = {ffmpeg_path, "-y", "-i", current_media_path, "-map", "0:a:0?", "-ac", "2", "-c:a", "pcm_s16le", "-vn", temp_stereo}
+        ffmpeg_res = utils.subprocess({ args = ffmpeg_args, cancellable = false, capture_stdout = true, capture_stderr = true })
+        if ffmpeg_res.error or ffmpeg_res.status ~= 0 then
+            log("error", "FFmpeg extraction failed: " , to_str_safe(ffmpeg_res.stderr))
+            mp.osd_message("Parakeet: FFmpeg extraction failed.", 7)
+            abort()
+            return
+        end
+    end
+    if not utils.file_info(temp_stereo) or utils.file_info(temp_stereo).size == 0 then
+        log("error", "FFmpeg produced no audio.")
+        mp.osd_message("Parakeet: FFmpeg produced no audio.", 7)
+        abort()
+        return
+    end
+
+    mp.osd_message("Separating vocals (" .. preset .. ")...", 5)
+    log("info", "Step B: Separating vocals using preset ", preset)
+    local script_dir = utils.split_path(parakeet_script_path)
+    local sep_script
+    if script_dir ~= "" then
+        sep_script = utils.join_path(script_dir, "separation")
+        sep_script = utils.join_path(sep_script, "bsr_separate.py")
+    else
+        sep_script = utils.join_path("separation", "bsr_separate.py")
+    end
+    local sep_cmd = {
+        python_exe, sep_script,
+        "--in_wav", temp_stereo,
+        "--out_wav", temp_vocals,
+        "--preset", preset
+    }
+    if separator_use_fp16 then table.insert(sep_cmd, "--fp16") end
+    local sep_opts = { args = sep_cmd, cancellable = false, capture_stdout = true, capture_stderr = true }
+    local sep_res = utils.subprocess(sep_opts)
+    if sep_res.error or sep_res.status ~= 0 then
+        log("error", "Separation failed: ", to_str_safe(sep_res.stderr))
+        mp.osd_message("Parakeet: Separation failed.", 7)
+        abort()
+        return
+    end
+    if not utils.file_info(temp_vocals) or utils.file_info(temp_vocals).size == 0 then
+        log("error", "Separator produced no output")
+        mp.osd_message("Parakeet: Separation produced no audio.", 7)
+        abort()
+        return
+    end
+
+    mp.osd_message("Transcribing...", 5)
+    log("info", "Step C: Running Parakeet transcription on separated vocals")
+    local python_command_args = {
+        python_exe,
+        parakeet_script_path,
+        temp_vocals,
+        srt_output_path,
+        "--audio_start_offset", tostring(audio_offset_seconds),
+        "--segmenter", "word", "--max_words", "12", "--max_duration", "6.0", "--pause", "0.6"
+    }
+    local python_opts = { args = python_command_args, cancellable = false, capture_stdout = true, capture_stderr = true }
+    local python_res = utils.subprocess(python_opts)
+    if python_res.error then
+        log("error", "Failed to launch Parakeet Python script: ", to_str_safe(python_res.error))
+        mp.osd_message("Parakeet: Failed to launch Python.", 7)
+    else
+        if python_res.stderr and string.len(python_res.stderr) > 0 then log("debug", "Python stderr: ", python_res.stderr) end
+        if python_res.status ~= nil and python_res.status ~= 0 then
+            mp.osd_message("Parakeet: Python script error.", 7)
+        end
+        if utils.file_info(srt_output_path) and utils.file_info(srt_output_path).size > 0 then
+            mp.commandv("sub-add", srt_output_path, "select")
+            mp.osd_message("Parakeet: Loaded SRT", 3)
+        else
+            mp.osd_message("Parakeet: SRT not found.", 7)
+        end
+    end
+
+    abort()
+end
+
 --- Wrapper function to call `do_transcription_core` with default settings.
 -- This function is bound to the `key_binding_default` hotkey.
 -- It invokes transcription without forcing Python float32 precision and without FFmpeg pre-processing.
@@ -543,6 +708,8 @@ mp.add_key_binding(key_binding_default, "parakeet-transcribe-default", transcrib
 mp.add_key_binding(key_binding_py_float32, "parakeet-transcribe-py-float32", transcribe_py_float32_wrapper)
 mp.add_key_binding(key_binding_ffmpeg_preprocess, "parakeet-transcribe-ffmpeg-preprocess", transcribe_ffmpeg_preprocess_wrapper)
 mp.add_key_binding(key_binding_ffmpeg_py_float32, "parakeet-transcribe-ffmpeg-py-float32", transcribe_ffmpeg_py_float32_wrapper)
+mp.add_key_binding(key_binding_isolate_asr_fast, "parakeet-isolate-asr-fast", function() isolate_and_transcribe_wrapper(roformer_preset_fast) end)
+mp.add_key_binding(key_binding_isolate_asr_slow, "parakeet-isolate-asr-slow", function() isolate_and_transcribe_wrapper(roformer_preset_slow) end)
 
 log("info", "Parakeet (Multi-Mode) script loaded.")
 log("info", "SRT will be loaded immediately after transcription and selected.")
@@ -551,6 +718,8 @@ log("info", "Press '", key_binding_default, "' for Standard Transcription.")
 log("info", "Press '", key_binding_py_float32, "' for Python Float32 Precision.")
 log("info", "Press '", key_binding_ffmpeg_preprocess, "' for FFmpeg Preprocessing (Default Python Precision).")
 log("info", "Press '", key_binding_ffmpeg_py_float32, "' for FFmpeg Preprocessing + Python Float32 Precision.")
+log("info", "Press '", key_binding_isolate_asr_fast, "' for Vocal Isolation + ASR (fast).")
+log("info", "Press '", key_binding_isolate_asr_slow, "' for Vocal Isolation + ASR (high quality).")
 log("info", "Using Python from: ", python_exe)
 log("info", "Using FFmpeg from: ", ffmpeg_path)
 log("info", "Using FFprobe from: ", ffprobe_path)

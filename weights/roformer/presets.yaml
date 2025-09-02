@@ -1,0 +1,5 @@
+default: voc_fv4
+engine: builtin     # future: "lucidrains" optional
+models:
+  voc_fv4: { name: "Voc-FV4", cfg: "weights/roformer/voc_fv4/config.yaml", ckpt: "weights/roformer/voc_fv4/voc_fv4.ckpt", target: vocals }
+  mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956: { name: "Mel-Band Karaoke ViperX", cfg: "weights/roformer/karaoke_viperx/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.yaml", ckpt: "weights/roformer/karaoke_viperx/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt", target: vocals }
