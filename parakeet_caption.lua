@@ -637,12 +637,20 @@ local function run_isolate_then_asr(model)
     else
         sep_script = utils.join_path("separation", "bsr_separate.py")
     end
+    local t0 = mp.get_time()
     local sep_cmd = {
-        python_exe, sep_script, "--in_wav", temp_stereo, "--out_wav", temp_vocals,
-        "--cfg", model.cfg, "--ckpt", model.ckpt, "--target", model.target
+        python_exe, sep_script,
+        "--in_wav", temp_stereo, "--out_wav", temp_vocals,
+        "--cfg", model.cfg, "--ckpt", model.ckpt, "--target", model.target,
+        "--device", "cuda"
     }
-    local sep_opts = { args = sep_cmd, cancellable = false, capture_stdout = true, capture_stderr = true }
-    local sep_res = utils.subprocess(sep_opts)
+    log("info", "SEP CMD: " .. table.concat(sep_cmd, " "))
+    local sep_res = utils.subprocess({ args = sep_cmd, cancellable = false, capture_stdout = true, capture_stderr = true })
+    local dt = mp.get_time() - t0
+    log("info", ("SEP DONE in %.1fs, rc=%s"):format(dt, tostring(sep_res.status)))
+    if dt < 10 then
+        log("warn", "Separator finished suspiciously fast — model likely didn’t run. See command above.")
+    end
     if sep_res.error or sep_res.status ~= 0 then
         log("error", "Separation failed: ", to_str_safe(sep_res.stderr))
         mp.osd_message("Parakeet: Separation failed.", 7)
