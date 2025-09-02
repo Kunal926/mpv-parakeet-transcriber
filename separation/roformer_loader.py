@@ -1,77 +1,73 @@
-"""Lightweight loader for RoFormer-based vocal separation models.
-
-This module focuses solely on inference. It reads a YAML
-configuration and checkpoint to build a separator that exposes a
-simple ``separate`` method.
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Any, Dict
 
 import numpy as np
 import torch
 import yaml
 import librosa
-import sys
 
-
-class _SafeTupleLoader(yaml.SafeLoader):
-    """YAML loader that safely constructs ``!!python/tuple`` nodes."""
-
-
+# --- tiny YAML helper for !!python/tuple ---
+class _SafeTupleLoader(yaml.SafeLoader): ...
 def _construct_python_tuple(loader: yaml.SafeLoader, node: yaml.Node):
     return tuple(loader.construct_sequence(node))
+_SafeTupleLoader.add_constructor("tag:yaml.org,2002:python/tuple", _construct_python_tuple)
 
+# ---- import the vendored ZFTurbo model code ----
+# We try both common class names to be resilient to upstream naming.
+def _import_melband_class():
+    try:
+        from separation.models_zfturbo.bs_roformer.mel_band_roformer import MelBandRoformer
+        return MelBandRoformer
+    except Exception:
+        try:
+            from separation.models_zfturbo.bs_roformer.mel_band_roformer import MelBand_Roformer as MelBandRoformer
+            return MelBandRoformer
+        except Exception as e:
+            raise ImportError(
+                "Could not import MelBand RoFormer class. "
+                "Ensure separation/models_zfturbo/bs_roformer/mel_band_roformer.py is present."
+            ) from e
 
-_SafeTupleLoader.add_constructor(
-    "tag:yaml.org,2002:python/tuple", _construct_python_tuple
-)
-
+def _import_bs_class():
+    try:
+        from separation.models_zfturbo.bs_roformer.bs_roformer import BSRoformer
+        return BSRoformer
+    except Exception:
+        try:
+            from separation.models_zfturbo.bs_roformer.bs_roformer import BS_Roformer as BSRoformer
+            return BSRoformer
+        except Exception as e:
+            raise ImportError(
+                "Could not import BS-RoFormer class. "
+                "Ensure separation/models_zfturbo/bs_roformer/bs_roformer.py is present."
+            ) from e
 
 @dataclass
 class Separator:
-    """Wrapper object performing chunked forward passes."""
-
     model: torch.nn.Module
     sample_rate: int
     chunk_size: int
     overlap: int
     device: torch.device
 
+    @torch.inference_mode()
     def _forward(self, audio: torch.Tensor) -> torch.Tensor:
-        """Run the model on audio [2, N] and return separated stem."""
-        with torch.inference_mode():
-            return self.model(audio.unsqueeze(0)).squeeze(0)
+        # audio shape: [2, T]
+        # ZFTurbo models accept stereo batch: [B, 2, T]
+        out = self.model(audio.unsqueeze(0))
+        return out.squeeze(0)
 
-    def separate(
-        self,
-        audio: np.ndarray,
-        sr: int,
-        target: Literal["vocals", "instrumental"],
-    ) -> np.ndarray:
-        """Separate target from a stereo mixture.
-
-        Parameters
-        ----------
-        audio: np.ndarray [num_samples, 2]
-            Stereo mixture in ``float32``.
-        sr: int
-            Sample rate of ``audio``.
-        target: Literal["vocals", "instrumental"]
-            Which stem the underlying model predicts.
-        """
+    def separate(self, audio: np.ndarray, sr: int, target: Literal["vocals", "instrumental"]) -> np.ndarray:
         if audio.ndim != 2 or audio.shape[1] != 2:
             raise ValueError("expected stereo audio [num_samples, 2]")
-
         if sr != self.sample_rate:
             audio = librosa.resample(audio.T, orig_sr=sr, target_sr=self.sample_rate, axis=1).T
             sr = self.sample_rate
 
-        # Convert to torch
-        mix = torch.from_numpy(audio.T).to(self.device)
-
+        mix = torch.from_numpy(audio.T).to(self.device)  # [2, T]
         step = self.chunk_size - self.overlap
         total = mix.shape[-1]
         output = torch.zeros_like(mix)
@@ -83,81 +79,91 @@ class Separator:
             if chunk.shape[-1] < self.chunk_size:
                 pad = self.chunk_size - chunk.shape[-1]
                 chunk = torch.nn.functional.pad(chunk, (0, pad))
-            out = self._forward(chunk)
-            out = out[:, : end - start]
-            output[:, start:end] += out
+            pred = self._forward(chunk)[:, : end - start]
+            output[:, start:end] += pred
             weight[:, start:end] += 1
 
         output /= weight.clamp(min=1e-6)
         result = output.T.cpu().numpy()
 
         if target == "instrumental":
-            # Instrumental models predict accompaniment, derive vocals as mix - inst
             result = mix.T.cpu().numpy() - result
-
         return np.clip(result, -1.0, 1.0)
 
+def _build_melband(cfg_model: Dict[str, Any]) -> torch.nn.Module:
+    MelBand = _import_melband_class()
+    # Map common mel-band config keys from YAML (like your karaoke YAML)
+    # Unknown args are omitted to stay compatible across forks.
+    kwargs = {
+        "dim":               int(cfg_model.get("dim", 384)),
+        "depth":             int(cfg_model.get("depth", 6)),
+        "num_bands":         int(cfg_model.get("num_bands", 60)),
+        "dim_head":          int(cfg_model.get("dim_head", 64)),
+        "heads":             int(cfg_model.get("heads", 8)),
+        "attn_dropout":      float(cfg_model.get("attn_dropout", 0.0)),
+        "ff_dropout":        float(cfg_model.get("ff_dropout", 0.0)),
+        "num_stems":         int(cfg_model.get("num_stems", 1)),
+        "stereo":            bool(cfg_model.get("stereo", True)),
+        "time_transformer_depth": int(cfg_model.get("time_transformer_depth", 1)),
+        "freq_transformer_depth": int(cfg_model.get("freq_transformer_depth", 1)),
+        "mask_estimator_depth":   int(cfg_model.get("mask_estimator_depth", 2)),
+        "flash_attn":        bool(cfg_model.get("flash_attn", True)),
+        # STFT / Mel params expected by many forks
+        "dim_freqs_in":      int(cfg_model.get("dim_freqs_in", 1025)),
+        "sample_rate":       int(cfg_model.get("sample_rate", 44100)),
+        "stft_n_fft":        int(cfg_model.get("stft_n_fft", 2048)),
+        "stft_hop_length":   int(cfg_model.get("stft_hop_length", 441)),
+        "stft_win_length":   int(cfg_model.get("stft_win_length", 2048)),
+        "stft_normalized":   bool(cfg_model.get("stft_normalized", False)),
+    }
+    # only pass args actually in the constructor
+    import inspect
+    sig = inspect.signature(MelBand.__init__)
+    kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    return MelBand(**kwargs)
 
-class _IdentityModel(torch.nn.Module):
-    # Keep for defensive coding, but we will not use it silently anymore.
+def _build_bs(cfg_model: Dict[str, Any]) -> torch.nn.Module:
+    BS = _import_bs_class()
+    import inspect
+    # keep minimal set that is common across BS‑RoFormer forks
+    kwargs = {k: cfg_model[k] for k in ("dim", "depth") if k in cfg_model}
+    kwargs = {k: v for k, v in kwargs.items() if k in inspect.signature(BS.__init__).parameters}
+    return BS(**kwargs)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        return x
-
-
-def load_separator(
-    cfg_path: str,
-    ckpt_path: str,
-    device: str = "cuda",
-    fp16: bool = False,
-) -> Separator:
-    """Instantiate a :class:`Separator` from YAML and checkpoint.
-
-    Parameters
-    ----------
-    cfg_path: str
-        Path to the YAML configuration file.
-    ckpt_path: str
-        Path to the model checkpoint. If missing, a tiny identity
-        network is used as a placeholder.
-    device: str
-        Torch device string (``"cuda"`` or ``"cpu"``).
-    fp16: bool
-        Whether to cast the model to ``float16`` when CUDA is used.
-    """
-    cfg_path = str(cfg_path)
-    ckpt_path = str(ckpt_path)
-
+def load_separator(cfg_path: str, ckpt_path: str, device: str = "cuda", fp16: bool = True) -> Separator:
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = yaml.load(f, Loader=_SafeTupleLoader)
 
-    sample_rate = int(cfg.get("sample_rate", 44100))
-    chunk_size = int(cfg.get("chunk_size", 262144))
-    overlap = int(cfg.get("num_overlap", 0))
-    print(f"[SEP] cfg sr={sample_rate} chunk={chunk_size} overlap={overlap}", file=sys.stderr)
-    print(f"[SEP] ckpt={ckpt_path}", file=sys.stderr)
+    audio_cfg   = cfg.get("audio", {})
+    model_cfg   = cfg.get("model", {})
+    # Heuristic: mel‑band configs have 'num_bands' and STFT params present (as in your karaoke YAML)
+    is_melband  = "num_bands" in model_cfg or "dim_freqs_in" in model_cfg
 
-    dev = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+    sample_rate = int(audio_cfg.get("sample_rate", model_cfg.get("sample_rate", 44100)))
+    chunk_size  = int(audio_cfg.get("chunk_size", 262144))
+    overlap     = int(cfg.get("inference", {}).get("num_overlap", audio_cfg.get("num_overlap", 0)))
 
-    ckpt = Path(ckpt_path)
-    if not ckpt.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
-
-    try:
-        state = torch.load(str(ckpt), map_location="cpu")
-    except Exception as e:
-        raise RuntimeError(f"Failed to load checkpoint: {ckpt} ({e})")
-
-    model = _IdentityModel()
-    if isinstance(state, dict) and "state_dict" in state:
-        model.load_state_dict(state["state_dict"], strict=True)
+    dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
+    if is_melband:
+        model = _build_melband(model_cfg)
     else:
-        model.load_state_dict(state, strict=True)
+        model = _build_bs(model_cfg)
 
-    model.eval()
-    model.to(dev)
+    model.eval().to(dev)
     if fp16 and dev.type == "cuda":
-        model.half()
+        try:
+            model.half()
+        except Exception:
+            pass
+
+    # Load checkpoint (support both raw state_dict and lightning checkpoints)
+    state = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if unexpected:
+        print(f"[RoFormer] Warning: unexpected keys in state_dict: {len(unexpected)} (model variant mismatch?)", flush=True)
+    if missing:
+        print(f"[RoFormer] Warning: missing keys in state_dict: {len(missing)} (non-critical layers may be re‑initialized).", flush=True)
 
     return Separator(model=model, sample_rate=sample_rate, chunk_size=chunk_size, overlap=overlap, device=dev)
-
