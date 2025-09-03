@@ -108,6 +108,10 @@ local files_to_cleanup_on_shutdown = {}
 -- @type boolean
 local transcription_in_progress = false
 
+--- Default duration (in seconds) for generic OSD messages when no specific
+-- duration is provided.
+local osd_duration_default = 3
+
 --- Safely converts a value to its string representation.
 -- Handles `nil` values by returning the string "nil", preventing errors
 -- that would occur if `tostring(nil)` was called directly in concatenations.
@@ -190,6 +194,16 @@ local function safe_remove(filepath, description)
     else
         log("debug", "Temporary file (" .. (description or "unspecified") .. ") not found for removal, skipping: ", filepath)
     end
+end
+
+--- Determines if a media path points to a remote resource (e.g., HTTP/HTTPS).
+-- This helps differentiate between local file paths and URLs served by
+-- Jellyfin MPV Shim so that output files can be written to a writable
+-- directory when no local media directory exists.
+-- @param path string The path or URL to inspect.
+-- @return boolean `true` if the path begins with a URI scheme, `false` otherwise.
+local function is_remote_path(path)
+    return path ~= nil and path:match("^%a+://") ~= nil
 end
 
 --- Retrieves audio stream information using ffprobe.
@@ -330,22 +344,28 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     end
 
     -- Derive file names and paths
+    local is_remote = is_remote_path(current_media_path)
     local file_name_with_ext = current_media_path:match("([^/\\]+)$") or "unknown_file"
     local base_name = file_name_with_ext:match("(.+)%.[^%.]+$") or file_name_with_ext -- Name without extension
-    local media_dir = ""
-    local path_sep_pos = current_media_path:match("^.*[/\\]()") -- Find last path separator
-    if path_sep_pos then
-        media_dir = current_media_path:sub(1, path_sep_pos -1) -- Directory of the media file
-    else -- If no separator, assume current working directory (less common for mpv paths)
-        local cwd = utils.getcwd()
-        if cwd then media_dir = cwd end
-    end
-    if media_dir ~= "" and not media_dir:match("[/\\]$") then -- Ensure trailing slash for join_path
-        media_dir = media_dir .. package.config:sub(1,1) -- OS-specific path separator
-    end
-
-    local srt_output_path = utils.join_path(media_dir, base_name .. ".srt") -- SRT next to media
     local sanitized_base_name = base_name:gsub("[^%w%-_%.]", "_") -- Sanitize for temp file names
+    local srt_output_path
+    if is_remote then
+        -- For Jellyfin streams we cannot write beside the media; use temp_dir instead
+        srt_output_path = utils.join_path(temp_dir, sanitized_base_name .. ".srt")
+    else
+        local media_dir = ""
+        local path_sep_pos = current_media_path:match("^.*[/\\]()") -- Find last path separator
+        if path_sep_pos then
+            media_dir = current_media_path:sub(1, path_sep_pos -1) -- Directory of the media file
+        else -- If no separator, assume current working directory
+            local cwd = utils.getcwd()
+            if cwd then media_dir = cwd end
+        end
+        if media_dir ~= "" and not media_dir:match("[/\\]$") then -- Ensure trailing slash for join_path
+            media_dir = media_dir .. package.config:sub(1,1) -- OS-specific path separator
+        end
+        srt_output_path = utils.join_path(media_dir, base_name .. ".srt") -- SRT next to media
+    end
 
     local temp_audio_raw_path = utils.join_path(temp_dir, sanitized_base_name .. "_audio_raw.wav")
     local temp_audio_for_python = temp_audio_raw_path -- This will be the input to Python
@@ -533,7 +553,7 @@ end
 local function run_isolate_then_asr(model)
     model = model or sep_fast
     if transcription_in_progress then
-        mp.osd_message("Parakeet: Transcription already running.", osd_duration_default)
+        log("info", "Transcription already running.")
         return
     end
     transcription_in_progress = true
@@ -569,21 +589,27 @@ local function run_isolate_then_asr(model)
         return
     end
 
+    local is_remote = is_remote_path(current_media_path)
     local file_name_with_ext = current_media_path:match("([^/\\]+)$") or "unknown_file"
     local base_name = file_name_with_ext:match("(.+)%.[^%.]+$") or file_name_with_ext
-    local media_dir = ""
-    local path_sep_pos = current_media_path:match("^.*[/\\]()")
-    if path_sep_pos then
-        media_dir = current_media_path:sub(1, path_sep_pos -1)
-    else
-        local cwd = utils.getcwd()
-        if cwd then media_dir = cwd end
-    end
-    if media_dir ~= "" and not media_dir:match("[/\\]$") then
-        media_dir = media_dir .. package.config:sub(1,1)
-    end
-    local srt_output_path = utils.join_path(media_dir, base_name .. ".srt")
     local sanitized_base_name = base_name:gsub("[^%w%-_%.]", "_")
+    local srt_output_path
+    if is_remote then
+        srt_output_path = utils.join_path(temp_dir, sanitized_base_name .. ".srt")
+    else
+        local media_dir = ""
+        local path_sep_pos = current_media_path:match("^.*[/\\]()")
+        if path_sep_pos then
+            media_dir = current_media_path:sub(1, path_sep_pos -1)
+        else
+            local cwd = utils.getcwd()
+            if cwd then media_dir = cwd end
+        end
+        if media_dir ~= "" and not media_dir:match("[/\\]$") then
+            media_dir = media_dir .. package.config:sub(1,1)
+        end
+        srt_output_path = utils.join_path(media_dir, base_name .. ".srt")
+    end
 
     -- temp_stereo retains source sample rate (no pre-resample)
     local temp_stereo = utils.join_path(temp_dir, sanitized_base_name .. "_stereo.wav")
@@ -594,7 +620,6 @@ local function run_isolate_then_asr(model)
     local audio_offset_seconds, audio_stream_idx = get_audio_stream_info(current_media_path, "eng")
     if not audio_offset_seconds then audio_offset_seconds = 0.0 end
 
-    mp.osd_message("Extracting audio...", 3)
     log("info", "Step A: Extracting audio to ", temp_stereo)
 
     local map_arg
@@ -627,7 +652,6 @@ local function run_isolate_then_asr(model)
         return
     end
 
-    mp.osd_message("Separating vocals...", 5)
     log("info", "Step B: Separating vocals using model cfg ", model.cfg)
     local script_dir = utils.split_path(parakeet_script_path)
     local sep_script
@@ -664,7 +688,6 @@ local function run_isolate_then_asr(model)
         return
     end
 
-    mp.osd_message("Transcribing...", 5)
     log("info", "Step C: Running Parakeet transcription on separated vocals")
     local parakeet_args = {
         python_exe, parakeet_script_path, temp_vocals, srt_output_path,
