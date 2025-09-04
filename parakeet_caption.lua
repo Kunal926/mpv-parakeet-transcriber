@@ -586,10 +586,12 @@ local function run_isolate_then_asr(model)
     local sanitized_base_name = base_name:gsub("[^%w%-_%.]", "_")
 
     -- temp_stereo retains source sample rate (no pre-resample)
-    local temp_stereo = utils.join_path(temp_dir, sanitized_base_name .. "_stereo.wav")
-    local temp_vocals = utils.join_path(temp_dir, sanitized_base_name .. "_vocals_16k_mono.wav")
+    local temp_stereo = utils.join_path(temp_dir, sanitized_base_name .. "_stereo_44k.wav")
+    local temp_vocals_44k = utils.join_path(temp_dir, sanitized_base_name .. "_vocals_44k.wav")
+    local temp_vocals_16k = utils.join_path(temp_dir, sanitized_base_name .. "_vocals_16k.wav")
     table.insert(files_to_cleanup_on_shutdown, temp_stereo)
-    table.insert(files_to_cleanup_on_shutdown, temp_vocals)
+    table.insert(files_to_cleanup_on_shutdown, temp_vocals_44k)
+    table.insert(files_to_cleanup_on_shutdown, temp_vocals_16k)
 
     local audio_offset_seconds, audio_stream_idx = get_audio_stream_info(current_media_path, "eng")
     if not audio_offset_seconds then audio_offset_seconds = 0.0 end
@@ -638,11 +640,16 @@ local function run_isolate_then_asr(model)
         sep_script = utils.join_path("separation", "bsr_separate.py")
     end
     local t0 = mp.get_time()
+    -- IMPORTANT: write separation result at 44.1 kHz stereo (match inference.py behavior)
     local sep_cmd = {
         python_exe, sep_script,
-        "--in_wav", temp_stereo, "--out_wav", temp_vocals,
+        "--in_wav", temp_stereo,
+        "--out_wav", temp_vocals_44k,
         "--cfg", model.cfg, "--ckpt", model.ckpt, "--target", model.target,
-        "--device", "cuda"
+        "--device", "cuda",
+        "--fp16",
+        "--save_sr", "44100",
+        "--channels", "2"
     }
     log("info", "SEP CMD: " .. table.concat(sep_cmd, " "))
     local sep_res = utils.subprocess({ args = sep_cmd, cancellable = false, capture_stdout = true, capture_stderr = true })
@@ -657,9 +664,28 @@ local function run_isolate_then_asr(model)
         abort()
         return
     end
-    if not utils.file_info(temp_vocals) or utils.file_info(temp_vocals).size == 0 then
+    if not utils.file_info(temp_vocals_44k) or utils.file_info(temp_vocals_44k).size == 0 then
         log("error", "Separator produced no output")
         mp.osd_message("Parakeet: Separation produced no audio.", 7)
+        abort()
+        return
+    end
+
+    -- Downsample to 16 kHz mono float32 (soxr), exactly like batch_parakeet_srt.py
+    mp.osd_message("Preparing 16 kHz mono for ASR...", 3)
+    local ds_cmd = {
+        ffmpeg_path, "-y",
+        "-i", temp_vocals_44k,
+        "-ac", "1",
+        "-af", "aresample=resampler=soxr:precision=28",
+        "-ar", "16000",
+        "-c:a", "pcm_f32le",
+        temp_vocals_16k
+    }
+    local ds_res = utils.subprocess({ args = ds_cmd, cancellable = false, capture_stdout = true, capture_stderr = true })
+    if ds_res.error or ds_res.status ~= 0 or (not utils.file_info(temp_vocals_16k)) or (utils.file_info(temp_vocals_16k).size == 0) then
+        log("error", "Downsample step failed. Stderr: ", to_str_safe(ds_res.stderr))
+        mp.osd_message("Parakeet: 16 kHz prep failed.", 7)
         abort()
         return
     end
@@ -667,7 +693,7 @@ local function run_isolate_then_asr(model)
     mp.osd_message("Transcribing...", 5)
     log("info", "Step C: Running Parakeet transcription on separated vocals")
     local parakeet_args = {
-        python_exe, parakeet_script_path, temp_vocals, srt_output_path,
+        python_exe, parakeet_script_path, temp_vocals_16k, srt_output_path,
         "--audio_start_offset", tostring(audio_offset_seconds)
     }
     for _,v in ipairs(seg_args) do table.insert(parakeet_args, v) end
