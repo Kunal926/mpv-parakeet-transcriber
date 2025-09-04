@@ -10,13 +10,13 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-import subprocess
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 import torch
-import tempfile
+import librosa
+torch.backends.cudnn.benchmark = True
 
 # Allow execution without manipulating the environment. When launched
 # directly (e.g., via `python separation/bsr_separate.py`), ensure the
@@ -37,10 +37,8 @@ def main() -> int:
     parser.add_argument("--target", default="vocals", help="Target stem to extract")
     parser.add_argument("--device", default="cuda", help="Device to run on (cuda/cpu)")
     parser.add_argument("--fp16", action="store_true")
-    parser.add_argument("--final_sr", type=int, default=16000, help="Final output sample rate")
-    parser.add_argument("--mono", dest="mono", action="store_true")
-    parser.add_argument("--no-mono", dest="mono", action="store_false")
-    parser.set_defaults(mono=True)
+    parser.add_argument("--save_sr", type=int, help="Optional output sample rate (default: mixture SR)")
+    parser.add_argument("--channels", type=int, choices=[1, 2], help="Optional output channels (default: mixture channels)")
     args = parser.parse_args()
 
     print(f"[SEP] loading cfg={args.cfg}")
@@ -50,35 +48,33 @@ def main() -> int:
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available")
     sep = load_separator(str(args.cfg), str(args.ckpt), device=device, fp16=args.fp16)
+    sep.model.to(device)
+    sep.model.eval()
 
-    start = time.time()
     try:
         audio, sr = sf.read(args.in_wav, dtype="float32")
         dur = len(audio) / float(sr)
         print(f"[SEP] input dur ~{dur:.1f}s @ {sr}Hz", file=sys.stderr)
         if audio.ndim == 1:
             audio = np.stack([audio, audio], axis=-1)
-        total_samples = audio.shape[0]
 
         t0 = time.time()
         out = sep.separate(audio, sr, args.target)
-        dur_s = total_samples / sr
-        elapsed = time.time() - t0
-        print(f"[SEP] processed ~{dur_s:.1f}s audio in {elapsed:.1f}s")
-        if elapsed < 10:
+        sep_secs = time.time() - t0
+        print(f"[SEP] pure separation time: {sep_secs:.1f}s")
+        if sep_secs < 10:
             raise RuntimeError("Separator finished too fast — likely fallback/no model.")
 
-        # Write native-SR vocals to a temp WAV, then soxr→16k mono with FFmpeg (precision=28)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as t:
-            tmp_native = t.name
-        sf.write(tmp_native, out.astype(np.float32), sr, subtype="FLOAT")
-        cmd = [
-            "ffmpeg", "-y", "-i", tmp_native, "-ac", "1",
-            "-af", "aresample=resampler=soxr:precision=28", "-ar", str(args.final_sr),
-            "-c:a", "pcm_f32le", args.out_wav,
-        ]
-        subprocess.run(cmd, check=True)
-        Path(tmp_native).unlink(missing_ok=True)
+        out_sr = args.save_sr if args.save_sr else sr
+        if out_sr != sr:
+            out = librosa.resample(out.T, orig_sr=sr, target_sr=out_sr, axis=1).T
+            sr = out_sr
+        if args.channels is not None:
+            if args.channels == 1 and out.ndim == 2:
+                out = out.mean(axis=1, keepdims=True)
+            elif args.channels == 2 and out.ndim == 1:
+                out = np.repeat(out[:, None], 2, axis=1)
+        sf.write(args.out_wav, out.astype(np.float32), sr, subtype="FLOAT")
     except Exception as e:
         print(f"Separation failed: {e}", file=sys.stderr)
         return 1
