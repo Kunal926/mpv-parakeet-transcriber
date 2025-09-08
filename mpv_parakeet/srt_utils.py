@@ -1,12 +1,16 @@
+"""SRT helper utilities."""
+from __future__ import annotations
+
 import math
 
+__all__ = ["format_time_srt"]
 
 def format_time_srt(seconds: float) -> str:
-    """Convert seconds to SRT timestamp format ``HH:MM:SS,mmm``.
+    """Convert seconds to ``HH:MM:SS,mmm`` SRT timestamp.
 
-    Any non-numeric, negative, or non-finite (``NaN``/``inf``) values are
-    clamped to zero. Rounding that pushes milliseconds to 1000 correctly
-    carries over to the seconds component.
+    Values are clamped to zero and non-finite numbers are coerced to ``0.0``.
+    Rounding that pushes milliseconds above ``999`` correctly carries to the
+    seconds field.
     """
     if not isinstance(seconds, (int, float)) or not math.isfinite(seconds):
         seconds = 0.0

@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mpv-parakeet"
+version = "0.1.0"
+description = "MPV Parakeet transcriber"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+authors = [{name = "Kunal", email = "maintainer@example.com"}]
+dependencies = [
+  "torch>=2.1,<2.3",
+  "torchaudio>=2.1,<2.3",
+  "nemo_toolkit==1.23.0",
+  "soundfile>=0.12,<0.14",
+  "librosa>=0.10,<0.11",
+]
+
+[project.optional-dependencies]
+separation = [
+  "onnxruntime>=1.16,<2.0",
+  "numpy",
+  "soundfile",
+]
+
+[project.scripts]
+parakeet-transcribe = "mpv_parakeet.cli:main"
+parakeet-separate = "mpv_parakeet.separation:main"
+
+[tool.setuptools]
+packages = ["mpv_parakeet", "separation"]
+
+[tool.mypy]
+packages = ["mpv_parakeet"]
+ignore_missing_imports = true
+
+[tool.black]
+target-version = ['py310']
+
+[tool.ruff]
+line-length = 100
+
