@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import yaml
 import librosa
+from torch.cuda.amp import autocast
 
 # --- tiny YAML helper for !!python/tuple ---
 class _SafeTupleLoader(yaml.SafeLoader): ...
@@ -52,12 +53,14 @@ class Separator:
     chunk_size: int
     overlap: int
     device: torch.device
+    fp16: bool
 
     @torch.inference_mode()
     def _forward(self, audio: torch.Tensor) -> torch.Tensor:
         # audio shape: [2, T]
         # ZFTurbo models accept stereo batch: [B, 2, T]
-        out = self.model(audio.unsqueeze(0))
+        with autocast(enabled=self.fp16 and self.device.type == "cuda"):
+            out = self.model(audio.unsqueeze(0))
         return out.squeeze(0)
 
     def separate(self, audio: np.ndarray, sr: int, target: Literal["vocals", "instrumental"]) -> np.ndarray:
@@ -166,4 +169,4 @@ def load_separator(cfg_path: str, ckpt_path: str, device: str = "cuda", fp16: bo
     if missing:
         print(f"[RoFormer] Warning: missing keys in state_dict: {len(missing)} (non-critical layers may be re‑initialized).", flush=True)
 
-    return Separator(model=model, sample_rate=sample_rate, chunk_size=chunk_size, overlap=overlap, device=dev)
+    return Separator(model=model, sample_rate=sample_rate, chunk_size=chunk_size, overlap=overlap, device=dev, fp16=fp16)
