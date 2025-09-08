@@ -1,8 +1,7 @@
-nemo_toolkit[asr]>=1.21.0 # Or your specific working version
-soundfile
-librosa
-# Add torch, torchaudio if not covered by nemo_toolkit[asr] for your setup
-einops
-pyyaml
-# Optional: if you implement a lucidrains backend later
-# BS-RoFormer
+# Use pyproject.toml for dependencies. This file is retained for convenience.
+
+nemo_toolkit==1.23.0
+soundfile>=0.12,<0.14
+librosa>=0.10,<0.11
+torch>=2.1,<2.3
+torchaudio>=2.1,<2.3
