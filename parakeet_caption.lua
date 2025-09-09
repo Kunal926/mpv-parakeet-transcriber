@@ -666,7 +666,6 @@ local function run_isolate_then_asr(model)
         "--out_wav", temp_vocals_44k,
         "--cfg", model.cfg, "--ckpt", model.ckpt, "--target", model.target,
         "--device", "cuda",
-        "--fp16",
         "--save_sr", "44100",
         "--channels", "2"
     }

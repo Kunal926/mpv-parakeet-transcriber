@@ -17,6 +17,7 @@ import soundfile as sf
 import torch
 import librosa
 torch.backends.cudnn.benchmark = True
+torch.set_default_dtype(torch.float32)
 
 # Allow execution without manipulating the environment. When launched
 # directly (e.g., via `python separation/bsr_separate.py`), ensure the
@@ -36,7 +37,6 @@ def main() -> int:
     parser.add_argument("--ckpt", required=True, help="Path to model checkpoint")
     parser.add_argument("--target", default="vocals", help="Target stem to extract")
     parser.add_argument("--device", default="cuda", help="Device to run on (cuda/cpu)")
-    parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--save_sr", type=int, help="Optional output sample rate (default: mixture SR)")
     parser.add_argument("--channels", type=int, choices=[1, 2], help="Optional output channels (default: mixture channels)")
     args = parser.parse_args()
@@ -47,7 +47,7 @@ def main() -> int:
     device = args.device
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but not available")
-    sep = load_separator(str(args.cfg), str(args.ckpt), device=device, fp16=args.fp16)
+    sep = load_separator(str(args.cfg), str(args.ckpt), device=device)
     sep.model.to(device)
     sep.model.eval()
 

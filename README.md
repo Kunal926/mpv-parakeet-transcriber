@@ -160,8 +160,7 @@ Download the YAML + CKPT from the pcunwa Hugging Face repositories, for example:
 Change presets by editing `roformer_preset_fast` or `roformer_preset_slow` in `parakeet_caption.lua`,
 or by passing `--preset` to `python separation/bsr_separate.py`.
 
-FP16 for separation is now opt-in. Toggle `separator_use_fp16` in the Lua script or pass `--fp16` to `bsr_separate.py` if you
-need the extra speed or lower VRAM usage.
+Separation runs in float32 for best quality. Model weights remain in fp32 and autocast is disabled.
 
 Notes:
 
@@ -174,7 +173,7 @@ Quality notes:
 
 Troubleshooting:
 
-* CUDA OOM → increase chunk size, reduce overlap, or enable `--fp16` to save VRAM.
+* CUDA OOM → increase chunk size or reduce overlap to save VRAM.
 
 ## Python Transcription Script (`parakeet_transcribe.py`)
 
