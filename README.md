@@ -24,6 +24,7 @@ Automatically generate subtitles for media playing in MPV using NVIDIA's Parakee
     * **FFmpeg Pre-processing Mode (`Alt+6`):** Applies FFmpeg audio filters (e.g., for normalization/denoising) to the extracted audio before transcription with default Python precision.
     * **FFmpeg Pre-processing + Python Float32 Mode (`Alt+7`):** Combines FFmpeg audio filtering with float32 precision in Python.
 * **Customizable:** Configure paths, keybindings, and FFmpeg filters.
+* **High-quality audio extraction:** Uses FFmpeg's `soxr` resampler with float32 output for 16 kHz mono, reducing resample hops and avoiding extra quantization.
 * **Immediate SRT Loading:** Subtitles are loaded as soon as transcription is complete.
 * **Temporary File Management:** Handles temporary audio files, cleaning them up when MPV is closed.
 
@@ -169,7 +170,7 @@ Notes:
 
 Quality notes:
 
-* Fewer resampling hops plus FFmpeg's high-quality `soxr` resampler preserve consonants and reduce word-error rate.
+* A single high-quality resample with FFmpeg's `soxr` resampler and float32 output preserves consonants and reduces word-error rate.
 
 Troubleshooting:
 
