@@ -372,8 +372,14 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     log("info", "Step 1.1: Extracting audio track with FFmpeg...")
     log("info", "Outputting raw temporary audio to: ", temp_audio_raw_path)
 
-    -- Common FFmpeg args: no video, PCM 16-bit little-endian audio, 16kHz sample rate, 1 channel (mono), overwrite output
-    local ffmpeg_common_args = {"-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y"}
+    -- Common FFmpeg args: no video, 16 kHz mono via soxr resampler, float32 output, overwrite file
+    local ffmpeg_common_args = {
+        "-vn",
+        "-ac", "1",
+        "-af", "aresample=16000:resampler=soxr:precision=28",
+        "-c:a", "pcm_f32le",
+        "-y"
+    }
     local ffmpeg_args_extract
     local ffmpeg_map_value_for_log -- For logging which -map option was used
 
@@ -453,12 +459,19 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         end
         log("info", "Step 1.5: Applying FFmpeg audio filters: ", ffmpeg_audio_filters)
         mp.osd_message("Parakeet: Applying FFmpeg audio filters...", 5)
+        local filter_chain = ffmpeg_audio_filters
+        if filter_chain ~= "" then
+            filter_chain = filter_chain .. ",aresample=16000:resampler=soxr:precision=28"
+        else
+            filter_chain = "aresample=16000:resampler=soxr:precision=28"
+        end
         local ffmpeg_args_filter = {
             ffmpeg_path,
             "-i", temp_audio_raw_path,
-            "-af", ffmpeg_audio_filters,
-            "-ar", "16000", -- Ensure sample rate is maintained for the ASR model
-            "-y",           -- Overwrite output file if it exists
+            "-af", filter_chain,
+            "-ac", "1",
+            "-c:a", "pcm_f32le",
+            "-y",
             temp_audio_for_python
         }
         log("debug", "Running FFmpeg filter pass: ", table.concat(ffmpeg_args_filter, " "))
@@ -493,6 +506,8 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     if force_python_float32_flag then
         table.insert(python_command_args, "--force_float32")
     end
+
+    for _, v in ipairs(seg_args) do table.insert(python_command_args, v) end
 
     log("debug", "Running Python script: ", table.concat(python_command_args, " "))
     local python_res = utils.subprocess({ args = python_command_args, cancellable = false, capture_stdout = true, capture_stderr = true })
