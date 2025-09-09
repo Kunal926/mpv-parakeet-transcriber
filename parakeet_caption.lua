@@ -608,12 +608,16 @@ local function run_isolate_then_asr(model)
 
     -- Extract stereo 44.1 kHz float32 to match ZFTurbo models exactly
     local ffmpeg_args = {ffmpeg_path, "-y", "-i", current_media_path, "-map", map_arg,
-        "-ac", "2", "-ar", "44100", "-c:a", "pcm_f32le", "-vn", temp_stereo} -- stereo_44k float32
+        "-ac", "2",
+        "-af", "aresample=44100:resampler=soxr:precision=28",
+        "-c:a", "pcm_f32le", "-vn", temp_stereo} -- stereo_44k float32
     local ffmpeg_res = utils.subprocess({ args = ffmpeg_args, cancellable = false, capture_stdout = true, capture_stderr = true })
     if ffmpeg_res.error or ffmpeg_res.status ~= 0 then
         log("warn", "FFmpeg extraction (" .. to_str_safe(map_arg) .. ") failed: ", to_str_safe(ffmpeg_res.stderr))
         ffmpeg_args = {ffmpeg_path, "-y", "-i", current_media_path, "-map", "0:a:0?",
-            "-ac", "2", "-ar", "44100", "-c:a", "pcm_f32le", "-vn", temp_stereo}
+            "-ac", "2",
+            "-af", "aresample=44100:resampler=soxr:precision=28",
+            "-c:a", "pcm_f32le", "-vn", temp_stereo}
         ffmpeg_res = utils.subprocess({ args = ffmpeg_args, cancellable = false, capture_stdout = true, capture_stderr = true })
         if ffmpeg_res.error or ffmpeg_res.status ~= 0 then
             log("error", "FFmpeg extraction failed: " , to_str_safe(ffmpeg_res.stderr))
