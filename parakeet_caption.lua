@@ -9,6 +9,10 @@
 local mp = require 'mp'
 local utils = require 'mp.utils'
 
+-- Force bottom-center subtitle alignment for all tracks
+mp.set_property('sub-ass-override', 'force')
+mp.set_property('sub-ass-force-style', 'Alignment=2,MarginV=45')
+
 -- ########## Configuration ##########
 -- These paths should be configured by the user.
 
