@@ -9,6 +9,9 @@
 local mp = require 'mp'
 local utils = require 'mp.utils'
 
+-- Subtitle alignment and styling are configured via mpv.conf;
+-- this script intentionally avoids forcing ASS overrides.
+
 -- ########## Configuration ##########
 -- These paths should be configured by the user.
 
