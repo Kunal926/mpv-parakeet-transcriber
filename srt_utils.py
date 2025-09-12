@@ -1,8 +1,8 @@
 from __future__ import annotations
 import math
 import re
-from typing import List, Dict, Any
-from segmenter import segment_by_pause_and_phrase
+from typing import List, Dict, Any, Tuple
+from segmenter import segment_by_pause_and_phrase, shape_words_into_two_lines_balanced
 
 # Helpers for enforcing minimum readable duration
 PUNCT = (".", "!", "?", "…", ",", ":", ";", "-", "—")
@@ -15,7 +15,91 @@ __all__ = [
     "format_time_srt",
     "srt_ts",
     "normalize_text",
+    "pack_into_two_line_blocks",
 ]
+
+
+def pack_into_two_line_blocks(
+    events: List[Dict[str, Any]],
+    max_chars_per_line: int = 40,
+    cps_target: float = 20.0,
+    coalesce_gap_ms: int = 300,
+    two_line_threshold: float = 0.60,
+) -> List[Dict[str, Any]]:
+    """Greedily merge consecutive events into a single 2-line block when:
+      - the inter-event gap ≤ coalesce_gap_ms
+      - shaped text fits in 2 lines (no overflow)
+      - chars-per-second stays within cps_target
+    Preserves word timings; zero text loss."""
+    out: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(events):
+        blk_words = events[i].get("words") or []
+        if not blk_words:
+            out.append(events[i])
+            i += 1
+            continue
+        start = float(blk_words[0]["start"])
+        end = float(events[i]["end"])
+        j = i
+
+        while j + 1 < len(events):
+            gap_ms = int(round((events[j + 1]["start"] - events[j]["end"]) * 1000))
+            if gap_ms > coalesce_gap_ms:
+                break
+
+            nxt_words = events[j + 1].get("words") or []
+            cand_words = blk_words + nxt_words
+            lines, used_words, overflow = shape_words_into_two_lines_balanced(
+                cand_words,
+                max_chars_per_line,
+                prefer_two_lines=True,
+                two_line_threshold=two_line_threshold,
+            )
+            if overflow:
+                break
+
+            cand_text = " ".join(w.get("word", "").strip() for w in cand_words)
+            cand_end = float(events[j + 1]["end"])
+            cps = len(cand_text.replace("\n", " ").strip()) / max(0.001, (cand_end - start))
+            if cps > cps_target:
+                break
+
+            blk_words = cand_words
+            end = cand_end
+            j += 1
+
+        lines, used_words, overflow = shape_words_into_two_lines_balanced(
+            blk_words,
+            max_chars_per_line,
+            prefer_two_lines=True,
+            two_line_threshold=two_line_threshold,
+        )
+        block = {
+            "start": float(blk_words[0]["start"]),
+            "end": float(end),
+            "text": "\n".join(lines[:2]),
+            "words": blk_words,
+        }
+        out.append(block)
+
+        while overflow:
+            more_lines, used2, overflow = shape_words_into_two_lines_balanced(
+                overflow,
+                max_chars_per_line,
+                prefer_two_lines=True,
+                two_line_threshold=two_line_threshold,
+            )
+            block2 = {
+                "start": float(more_lines and overflow and overflow[0].get("start", end) or end),
+                "end": float(end),
+                "text": "\n".join(more_lines[:2]),
+                "words": [],
+            }
+            out.append(block2)
+
+        i = j + 1
+    return out
 
 
 def format_time_srt(t: float) -> str:
@@ -116,6 +200,8 @@ def postprocess_segments(
     snap_fps: float | None = None,
     use_spacy: bool = True,
     min_readable: float = 0.9,
+    coalesce_gap_ms: int = 300,
+    two_line_threshold: float = 0.60,
 ) -> List[Dict[str, Any]]:
     """Segment words by pauses and phrases, shape lines, and quantize to frames."""
     # flatten word list (Parakeet provides accurate word timestamps)
@@ -137,6 +223,14 @@ def postprocess_segments(
         pause_ms=pause_ms,
         cps_target=cps_target,
         use_spacy=use_spacy,
+    )
+
+    events = pack_into_two_line_blocks(
+        events,
+        max_chars_per_line=max_chars_per_line,
+        cps_target=cps_target,
+        coalesce_gap_ms=coalesce_gap_ms,
+        two_line_threshold=two_line_threshold,
     )
 
     events = enforce_min_readable(

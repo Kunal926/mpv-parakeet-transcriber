@@ -198,6 +198,10 @@ def main():
     parser.add_argument("--pause_ms", type=int, default=220, help="Minimum inter-word silence to open a split candidate")
     parser.add_argument("--cps", type=float, default=20.0, help="Target characters-per-second reading speed")
     parser.add_argument("--no_spacy", action="store_true", help="Disable spaCy hints even if available")
+    parser.add_argument("--coalesce_gap_ms", type=int, default=300,
+                        help="Merge consecutive events if gap ≤ this and 2-line fit/cps ok")
+    parser.add_argument("--two_line_threshold", type=float, default=0.60,
+                        help="Prefer 2 lines once block length ≥ this fraction of a line")
     parser.add_argument(
         "--min_readable_ms",
         type=int,
@@ -220,6 +224,8 @@ def main():
     cps = args.cps
     use_spacy = not args.no_spacy
     min_readable = args.min_readable_ms / 1000.0
+    coalesce_gap_ms = args.coalesce_gap_ms
+    two_line_threshold = args.two_line_threshold
 
     # Define a helper function to write error SRTs immediately
     def write_error_srt(message: str):
@@ -420,6 +426,8 @@ def main():
             snap_fps=fps,
             use_spacy=use_spacy,
             min_readable=min_readable,
+            coalesce_gap_ms=coalesce_gap_ms,
+            two_line_threshold=two_line_threshold,
         )
         _audit(segments, processed)
         write_srt(processed, srt_path)
