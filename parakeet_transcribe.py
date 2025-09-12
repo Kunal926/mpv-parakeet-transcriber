@@ -35,7 +35,17 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from srt_utils import format_time_srt
+from srt_utils import format_time_srt, postprocess_segments, write_srt, normalize_text
+
+
+def _audit(events_in, events_out):
+    tin = normalize_text(" ".join(e["text"] for e in events_in))
+    tout = normalize_text(" ".join(e["text"] for e in events_out))
+    if len(tout) < len(tin) * 0.98:
+        print(
+            "[WARN] Postprocess lost text:",
+            f"in={len(tin)} out={len(tout)} Δ={len(tin) - len(tout)}",
+        )
 
 def generate_srt_from_processed_timestamps(
     all_processed_timestamps: list,
@@ -183,6 +193,17 @@ def main():
     parser.add_argument("--max_words", type=int, default=12, help="Maximum words per subtitle when using word segmentation")
     parser.add_argument("--max_duration", type=float, default=6.0, help="Maximum subtitle duration in seconds for word segmentation")
     parser.add_argument("--pause", type=float, default=0.6, help="Inter-word pause (s) that triggers a new subtitle when using word segmentation")
+    parser.add_argument("--fps", type=float, default=24.0, help="Video FPS for frame snapping")
+    parser.add_argument("--max_chars_per_line", type=int, default=46)
+    parser.add_argument("--pause_ms", type=int, default=220, help="Minimum inter-word silence to open a split candidate")
+    parser.add_argument("--cps", type=float, default=20.0, help="Target characters-per-second reading speed")
+    parser.add_argument("--no_spacy", action="store_true", help="Disable spaCy hints even if available")
+    parser.add_argument(
+        "--min_readable_ms",
+        type=int,
+        default=900,
+        help="Soft minimum on-screen time per cue; short cues extend/merge",
+    )
     args = parser.parse_args()
 
     audio_path = args.audio_file_path
@@ -193,6 +214,12 @@ def main():
     max_words = args.max_words
     max_duration = args.max_duration
     pause_threshold = args.pause
+    fps = args.fps
+    max_chars_per_line = args.max_chars_per_line
+    pause_ms = args.pause_ms
+    cps = args.cps
+    use_spacy = not args.no_spacy
+    min_readable = args.min_readable_ms / 1000.0
 
     # Define a helper function to write error SRTs immediately
     def write_error_srt(message: str):
@@ -335,170 +362,68 @@ def main():
             
         print(f"\nFull Transcript:\n{full_transcript}\n", file=sys.stderr)
 
-        final_timestamps_for_srt = []
-        srt_generation_type = "none"  # To track which type of SRT will be generated
-
-        if segmenter == "segment" and segment_timestamps_from_model:
-            srt_generation_type = "segment"
-            print(
-                f"Found {len(segment_timestamps_from_model)} segment timestamps. Using 'start' and 'end' keys (expected in seconds).",
-                file=sys.stderr,
-            )
-            for idx, ts_item in enumerate(segment_timestamps_from_model):
-                text_val = ts_item.get("segment")
-                start_s_seconds_raw = ts_item.get("start")
-                end_s_seconds_raw = ts_item.get("end")
-
-                if (
-                    start_s_seconds_raw is not None
-                    and end_s_seconds_raw is not None
-                    and text_val is not None
-                ):
-                    try:
-                        final_timestamps_for_srt.append(
-                            {
-                                "text_from_model": str(text_val),
-                                "start_seconds": float(start_s_seconds_raw),
-                                "end_seconds": float(end_s_seconds_raw),
-                            }
-                        )
-                    except ValueError as e:
-                        print(
-                            f"Debug: Could not convert segment offsets to float: start='{start_s_seconds_raw}', end='{end_s_seconds_raw}'. Error: {e}",
-                            file=sys.stderr,
-                        )
-                        continue
-                else:
-                    print(
-                        f"Debug: Malformed segment timestamp item (missing 'start', 'end', or 'segment' text key): {ts_item}",
-                        file=sys.stderr,
-                    )
-
+        # Build segments for post-processing
+        segments = []
+        if segment_timestamps_from_model:
+            for seg in segment_timestamps_from_model:
+                text_val = seg.get("segment")
+                start_s = seg.get("start")
+                end_s = seg.get("end")
+                if start_s is None or end_s is None or text_val is None:
+                    continue
+                words = []
+                if word_timestamps_from_model:
+                    for w in word_timestamps_from_model:
+                        ws = w.get("start")
+                        we = w.get("end")
+                        word = w.get("word")
+                        if ws is None or we is None or word is None:
+                            continue
+                        if ws >= start_s and we <= end_s:
+                            words.append({"word": str(word), "start": float(ws), "end": float(we)})
+                segments.append({"start": float(start_s), "end": float(end_s), "text": str(text_val), "words": words})
         elif word_timestamps_from_model:
-            srt_generation_type = "word"
-            print(
-                f"Found {len(word_timestamps_from_model)} word timestamps. Using 'start_time', 'end_time', 'word' keys.",
-                file=sys.stderr,
-            )
-            for idx, ts_item in enumerate(word_timestamps_from_model):
-                word_val = ts_item.get("word")
-                start_s_seconds_raw = ts_item.get("start")
-                end_s_seconds_raw = ts_item.get("end")
+            words_list = []
+            for w in word_timestamps_from_model:
+                ws = w.get("start")
+                we = w.get("end")
+                word = w.get("word")
+                if ws is None or we is None or word is None:
+                    continue
+                words_list.append({"word": str(word), "start": float(ws), "end": float(we)})
+            if words_list:
+                text = " ".join(w["word"] for w in words_list)
+                segments.append({"start": words_list[0]["start"], "end": words_list[-1]["end"], "text": text, "words": words_list})
+        elif full_transcript is not None:
+            segments.append({"start": 0.0, "end": audio_duration_seconds, "text": full_transcript})
 
-                if (
-                    start_s_seconds_raw is not None
-                    and end_s_seconds_raw is not None
-                    and word_val is not None
-                ):
-                    try:
-                        final_timestamps_for_srt.append(
-                            {
-                                "word_from_model": str(word_val),
-                                "start_seconds": float(start_s_seconds_raw),
-                                "end_seconds": float(end_s_seconds_raw),
-                            }
-                        )
-                    except ValueError as e:
-                        print(
-                            f"Debug: Could not convert word offsets to float: start='{start_s_seconds_raw}', end='{end_s_seconds_raw}'. Error: {e}",
-                            file=sys.stderr,
-                        )
-                        continue
-                else:
-                    print(
-                        f"Debug: Malformed word timestamp item (missing 'start', 'end', or 'word'): {ts_item}",
-                        file=sys.stderr,
-                    )
+        if not segments:
+            write_error_srt("No transcript text available")
+            return
 
-        elif segment_timestamps_from_model:
-            srt_generation_type = "segment"
-            print(
-                f"Found {len(segment_timestamps_from_model)} segment timestamps. Using 'start' and 'end' keys (expected in seconds).",
-                file=sys.stderr,
-            )
-            for idx, ts_item in enumerate(segment_timestamps_from_model):
-                text_val = ts_item.get("segment")
-                start_s_seconds_raw = ts_item.get("start")
-                end_s_seconds_raw = ts_item.get("end")
-                if (
-                    start_s_seconds_raw is not None
-                    and end_s_seconds_raw is not None
-                    and text_val is not None
-                ):
-                    try:
-                        final_timestamps_for_srt.append(
-                            {
-                                "text_from_model": str(text_val),
-                                "start_seconds": float(start_s_seconds_raw),
-                                "end_seconds": float(end_s_seconds_raw),
-                            }
-                        )
-                    except ValueError as e:
-                        print(
-                            f"Debug: Could not convert segment offsets to float: start='{start_s_seconds_raw}', end='{end_s_seconds_raw}'. Error: {e}",
-                            file=sys.stderr,
-                        )
-                        continue
-                else:
-                    print(
-                        f"Debug: Malformed segment timestamp item (missing 'start', 'end', or 'segment' text key): {ts_item}",
-                        file=sys.stderr,
-                    )
-
-        # Apply global start time offset if specified
-        if global_offset_seconds != 0.0 and final_timestamps_for_srt:
+        if global_offset_seconds != 0.0:
             print(f"Applying global start offset of {global_offset_seconds:.3f} seconds to all timestamps.", file=sys.stderr)
-            for ts_data in final_timestamps_for_srt:
-                ts_data['start_seconds'] += global_offset_seconds
-                ts_data['end_seconds'] += global_offset_seconds
-                # Ensure timestamps are not negative after offset
-                if ts_data['start_seconds'] < 0: ts_data['start_seconds'] = 0.0
-                if ts_data['end_seconds'] < 0: ts_data['end_seconds'] = 0.01 # Ensure end is slightly after start if both become negative
-                # Ensure end time is always after start time
-                if ts_data['end_seconds'] <= ts_data['start_seconds']:
-                    ts_data['end_seconds'] = ts_data['start_seconds'] + 0.1 # Minimal duration
+            for seg in segments:
+                seg["start"] += global_offset_seconds
+                seg["end"] += global_offset_seconds
+                if seg.get("words"):
+                    for w in seg["words"]:
+                        w["start"] += global_offset_seconds
+                        w["end"] += global_offset_seconds
 
-
-        # Generate SRT file based on processed timestamps
-        if final_timestamps_for_srt:
-            if srt_generation_type == "segment":
-                generate_srt_from_processed_timestamps(
-                    final_timestamps_for_srt, srt_path, timestamp_type="segment"
-                )
-            elif srt_generation_type == "word":
-                generate_srt_from_processed_timestamps(
-                    final_timestamps_for_srt,
-                    srt_path,
-                    timestamp_type="word",
-                    max_words=max_words,
-                    max_duration=max_duration,
-                    pause=pause_threshold,
-                )
-        else:
-            # Fallback if no detailed timestamps could be processed, but we have a full transcript
-            err_msg = "No segment or word timestamps processed"
-            print(f"Error: {err_msg}. Cannot generate detailed SRT.", file=sys.stderr)
-            if full_transcript is not None:
-                # Create a single SRT entry spanning the whole audio duration (with offset)
-                print(f"Writing fallback SRT with full transcript and audio duration.", file=sys.stderr)
-                with open(srt_path, 'w', encoding='utf-8') as f:
-                    f.write("1\n")
-                    adjusted_start_time_full = global_offset_seconds
-                    adjusted_end_time_full = audio_duration_seconds + global_offset_seconds
-                    # Sanitize times
-                    if adjusted_start_time_full < 0: adjusted_start_time_full = 0.0
-                    if adjusted_end_time_full < adjusted_start_time_full:
-                        adjusted_end_time_full = adjusted_start_time_full + max(1.0, audio_duration_seconds) # Use audio duration or 1s
-                    if adjusted_end_time_full <= adjusted_start_time_full: adjusted_end_time_full = adjusted_start_time_full + 0.1
-
-                    f.write(f"{format_time_srt(adjusted_start_time_full)} --> {format_time_srt(adjusted_end_time_full)}\n")
-                    f.write(full_transcript.strip() + "\n\n")
-                    f.flush()
-                    os.fsync(f.fileno())
-                print(f"SRT file generated with full transcript at '{srt_path}'. Offset applied if any.", file=sys.stderr)
-            else:
-                 # If even full_transcript is None, write an error SRT
-                write_error_srt("No transcript text available")
+        processed = postprocess_segments(
+            segments,
+            max_chars_per_line=max_chars_per_line,
+            max_lines=2,
+            pause_ms=pause_ms,
+            cps_target=cps,
+            snap_fps=fps,
+            use_spacy=use_spacy,
+            min_readable=min_readable,
+        )
+        _audit(segments, processed)
+        write_srt(processed, srt_path)
+        print(f"SRT file generated at '{srt_path}'", file=sys.stderr)
 
         print(f"SRT file processing completed for '{srt_path}'", file=sys.stderr)
 

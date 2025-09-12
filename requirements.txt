@@ -6,3 +6,4 @@ einops
 pyyaml
 # Optional: if you implement a lucidrains backend later
 # BS-RoFormer
+spacy>=3.7,<4
