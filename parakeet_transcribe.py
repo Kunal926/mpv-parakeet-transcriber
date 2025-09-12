@@ -198,6 +198,12 @@ def main():
     parser.add_argument("--pause_ms", type=int, default=220, help="Minimum inter-word silence to open a split candidate")
     parser.add_argument("--cps", type=float, default=20.0, help="Target characters-per-second reading speed")
     parser.add_argument("--no_spacy", action="store_true", help="Disable spaCy hints even if available")
+    parser.add_argument(
+        "--min_readable_ms",
+        type=int,
+        default=900,
+        help="Soft minimum on-screen time per cue; short cues extend/merge",
+    )
     args = parser.parse_args()
 
     audio_path = args.audio_file_path
@@ -213,6 +219,7 @@ def main():
     pause_ms = args.pause_ms
     cps = args.cps
     use_spacy = not args.no_spacy
+    min_readable = args.min_readable_ms / 1000.0
 
     # Define a helper function to write error SRTs immediately
     def write_error_srt(message: str):
@@ -412,6 +419,7 @@ def main():
             cps_target=cps,
             snap_fps=fps,
             use_spacy=use_spacy,
+            min_readable=min_readable,
         )
         _audit(segments, processed)
         write_srt(processed, srt_path)
