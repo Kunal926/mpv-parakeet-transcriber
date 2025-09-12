@@ -83,23 +83,42 @@ def pack_into_two_line_blocks(
         }
         out.append(block)
 
+        # Practically unreachable because we avoid overflow before packing,
+        # but keep it correct just in case.
         while overflow:
-            more_lines, used2, overflow = shape_words_into_two_lines_balanced(
-                overflow,
+            ow = overflow
+            lines2, used2, overflow = shape_words_into_two_lines_balanced(
+                ow,
                 max_chars_per_line,
                 prefer_two_lines=True,
                 two_line_threshold=two_line_threshold,
             )
-            block2 = {
-                "start": float(more_lines and overflow and overflow[0].get("start", end) or end),
-                "end": float(end),
-                "text": "\n".join(more_lines[:2]),
-                "words": [],
-            }
-            out.append(block2)
+            used_block2 = ow[:used2]
+            out.append(
+                {
+                    "start": float(used_block2[0]["start"]),
+                    "end": float(used_block2[-1]["end"]),
+                    "text": "\n".join(lines2[:2]),
+                    "words": used_block2,
+                }
+            )
 
         i = j + 1
     return out
+
+
+def _audit_monotonic_and_lossless(evts):
+    # monotonic
+    for i in range(1, len(evts)):
+        if evts[i]["start"] < evts[i - 1]["end"]:
+            print(
+                f"[WARN] overlap {i}: {evts[i-1]['end']:.3f} -> {evts[i]['start']:.3f}"
+            )
+    # lossless text (approximate)
+    def flat_text(events):
+        return " ".join(e["text"].replace("\n", " ").strip() for e in events)
+
+    return flat_text(evts)
 
 
 def format_time_srt(t: float) -> str:
@@ -223,6 +242,7 @@ def postprocess_segments(
         pause_ms=pause_ms,
         cps_target=cps_target,
         use_spacy=use_spacy,
+        two_line_threshold=two_line_threshold,
     )
 
     events = pack_into_two_line_blocks(
@@ -240,6 +260,8 @@ def postprocess_segments(
         reflow=True,
         max_chars_per_line=max_chars_per_line,
     )
+
+    _ = _audit_monotonic_and_lossless(events)
 
     # frame-quantize: floor starts, ceil ends (prevents late starts)
     events = frame_quantize(events, snap_fps)

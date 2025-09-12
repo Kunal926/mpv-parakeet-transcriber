@@ -185,6 +185,7 @@ def segment_by_pause_and_phrase(
     cps_target: float = 20.0,
     use_spacy: bool = True,
     spacy_model: str = "en_core_web_sm",
+    two_line_threshold: float = 0.70,
 ) -> List[Dict[str, Any]]:
     """
     Build segments from ASR word-level tokens using pauses as the primary cue.
@@ -270,12 +271,11 @@ def segment_by_pause_and_phrase(
         cps_target=cps_target,
     )
 
-    # two-line shaping (no-loss, balanced)
+    # two-line shaping (no-loss, word-timing preserving)
     shaped = []
     for seg in out:
         cur_words = seg.get("words") or []
         if not cur_words:
-            # fallback: keep text; no overflow splitting
             shaped.append(seg)
             continue
 
@@ -285,18 +285,19 @@ def segment_by_pause_and_phrase(
                 words_list,
                 max_chars_per_line,
                 prefer_two_lines=True,
-                two_line_threshold=0.70,
+                two_line_threshold=two_line_threshold,
             )
 
-            used = words_list[:used_words]
+            used_block = words_list[:used_words]
             new_seg = {
-                "start": float(used[0]["start"]),
-                "end": float(used[-1]["end"]),
+                "start": float(used_block[0]["start"]),
+                "end": float(used_block[-1]["end"]),
                 "text": "\n".join(lines_text[:2]),
-                "words": used,
+                "words": used_block,
             }
             shaped.append(new_seg)
 
+            # Next iteration processes the true overflow words
             words_list = overflow
     return shaped
 
