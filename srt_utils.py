@@ -1,7 +1,7 @@
 from __future__ import annotations
 import math
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 
 # -------------------------
 # public API
@@ -42,12 +42,25 @@ def postprocess_segments(
     # 3) split anything over max_duration using word or char timing
     items = split_overlong(items, max_duration, min_duration)
 
-    # 4) shape text into at most max_lines obeying break heuristics
-    shaped = []
+    # 3b) split items that would overflow the visual space (text too long)
+    items = split_overwide(items, max_chars_per_line, max_lines)
+
+    # 4) shape text into lines; emit continuation events if overflow remains
+    shaped: List[Dict[str, Any]] = []
     for it in items:
-        lines = shape_lines(it["text"], max_chars_per_line, max_lines)
+        lines, overflow = shape_lines_no_loss(it["text"], max_chars_per_line, max_lines)
         it["text"] = "\n".join(lines)
         shaped.append(it)
+        while overflow:
+            nxt = {
+                "start": it["end"],
+                "end": it["end"] + max(min_duration, 0.5),
+                "text": overflow,
+            }
+            lines, overflow = shape_lines_no_loss(nxt["text"], max_chars_per_line, max_lines)
+            nxt["text"] = "\n".join(lines)
+            shaped.append(nxt)
+            it = nxt
 
     # 5) quantize timestamps to fps (optional) and ensure monotonic, gap-safe
     shaped = quantize_and_deoverlap(shaped, snap_fps, min_gap)
@@ -88,7 +101,6 @@ PUNCT_BREAK_AFTER = r"[.!?…:;]"   # break AFTER these
 
 SPACES = re.compile(r"\s+")
 MULTI_DOTS = re.compile(r"\.{3,}")  # normalize ellipses
-NAME_INITIAL = re.compile(r"^[A-Z]\.$")
 
 def normalize_text(t: str) -> str:
     t = t.replace("\u2014", "—").replace("\u2013", "–")
@@ -217,77 +229,113 @@ def choose_char_boundary(text: str, idx: int) -> int:
     ls = text.rfind(" ", 0, idx)
     return ls if ls != -1 else idx
 
-def shape_lines(text: str, max_chars: int, max_lines: int) -> List[str]:
-    text = normalize_text(text)
-    if max_lines <= 1 or len(text) <= max_chars:
-        return [text]
-    # Two lines maximum
-    # Choose the best breakpoint near the middle, following your rules
-    words = text.split(" ")
-    if len(words) < 2:
-        return [text]
-    # Try candidate breakpoints at word boundaries
-    cut = select_break_index(words, max_chars)
-    line1 = " ".join(words[:cut]).strip()
-    line2 = " ".join(words[cut:]).strip()
-    # If still too long per line, soft-wrap second line within limit (no third line)
-    if len(line1) > max_chars and " " in line1:
-        line1 = line1[:max_chars+1].rsplit(" ",1)[0]
-        # push overflow back to line2
-        overflow = text[len(line1):].strip()
-        if overflow:
-            line2 = overflow
-    if len(line2) > max_chars and " " in line2:
-        # We cannot add a 3rd line; prefer to keep later words (recency bias)
-        line2 = line2[-max_chars:].strip()
-    return [line1, line2]
-
-def select_break_index(words: List[str], max_chars: int) -> int:
-    # Heuristics: after punctuation; before conjunctions; before prepositions;
-    # avoid breaking after articles or subject pronouns; keep names like "J. Smith" together.
-    total_len = len(" ".join(words))
-    target = total_len // 2
-
-    # score candidates (word index i is the *start* of line2)
-    best_i, best_score = 1, -1e9
-    for i in range(1, len(words)):
-        left = " ".join(words[:i]); right = " ".join(words[i:])
-        # hard constraints
-        if len(left) > max_chars * 1.25 or len(right) > max_chars * 1.25:
+def split_overwide(items, max_chars_per_line: int, max_lines: int) -> list[dict]:
+    max_block = max_chars_per_line * max_lines
+    out = []
+    for it in items:
+        txt = it["text"]
+        if len(txt) <= max_block:
+            out.append(it)
             continue
-        prev = words[i-1].strip().strip(",.;:!?…").lower()
-        cur  = words[i].strip().strip(",.;:!?…").lower()
 
-        score = 0.0
-        # balance around center
-        score -= abs(len(left) - target) * 0.5
+        words = it.get("words") or []
+        if words and all(("start" in w and "end" in w) for w in words):
+            # chunk by words to keep timestamps accurate
+            chunk, chunk_start = [], None
+            def flush():
+                if not chunk:
+                    return
+                start = chunk[0]["start"] if chunk_start is None else chunk_start
+                end = chunk[-1]["end"]
+                text = " ".join((w.get("word", "") or "").strip() for w in chunk)
+                out.append({
+                    "start": float(start),
+                    "end": float(end),
+                    "text": normalize_text(text),
+                    "words": chunk[:],
+                })
+            for w in words:
+                token = (w.get("word", "") or "").strip()
+                if not chunk:
+                    chunk = [w]
+                    chunk_start = w["start"]
+                    continue
+                trial = " ".join([(x.get("word", "") or "").strip() for x in chunk] + [token])
+                if len(trial) > max_block:
+                    flush()
+                    chunk, chunk_start = [w], w["start"]
+                else:
+                    chunk.append(w)
+            flush()
+        else:
+            # fallback: char-based chunking with nice boundaries
+            s = 0
+            while s < len(txt):
+                e = min(len(txt), s + max_block)
+                e = choose_char_boundary(txt, e)
+                piece = txt[s:e].strip()
+                if not piece:
+                    break
+                span = it["end"] - it["start"]
+                t1 = span * (len(piece) / max(1, len(txt)))
+                start = it["start"] + (s / max(1, len(txt))) * span
+                end = min(it["end"], start + t1)
+                out.append({"start": float(start), "end": float(end), "text": piece})
+                s = e
+    return out
 
-        # prefer AFTER punctuation
-        if re.search(PUNCT_BREAK_AFTER, words[i-1][-1:]):
-            score += 6.0
+def shape_lines_no_loss(text: str, max_chars: int, max_lines: int) -> tuple[list[str], str]:
+    """
+    Returns (lines, overflow). 'lines' has up to max_lines entries; overflow is
+    the leftover text that didn't fit (never dropped).
+    """
+    text = normalize_text(text)
+    if max_lines <= 1:
+        if len(text) <= max_chars:
+            return [text], ""
+        cut = text.rfind(" ", 0, max_chars + 1)
+        cut = cut if cut != -1 else max_chars
+        return [text[:cut].rstrip()], text[cut:].lstrip()
 
-        # prefer BEFORE conjunction or preposition
-        if cur in CONJ:
-            score += 3.5
-        if cur in PREP:
-            score += 2.5
+    words = text.split(" ")
+    lines: list[str] = []
+    cur: list[str] = []
 
-        # avoid separating article/adjective from noun (approx: don't break after articles)
-        if prev in ARTICLES:
-            score -= 6.0
+    def fits(buf: list[str]) -> bool:
+        return len(" ".join(buf)) <= max_chars
 
-        # avoid breaking after subject pronoun (keeps "I am", "We are")
-        if prev in PRON_SUBJ:
-            score -= 3.0
+    i = 0
+    for _ in range(max_lines):
+        cur.clear()
+        best_stop_idx = -1
+        j = i
+        while j < len(words):
+            candidate = words[i:j + 1]
+            if not fits(candidate):
+                break
+            wprev = (words[j - 1] if j > i else "")
+            wcur = words[j]
+            nice = 0
+            if re.search(PUNCT_BREAK_AFTER, wcur[-1:]):
+                nice += 3
+            if wcur.lower() in CONJ:
+                nice += 2
+            if wcur.lower() in PREP:
+                nice += 1
+            if wprev.lower() in ARTICLES or wprev.lower() in PRON_SUBJ:
+                nice -= 2
+            if nice >= 2:
+                best_stop_idx = j
+            j += 1
+        stop = best_stop_idx if best_stop_idx >= i else (j - 1 if j > i else i)
+        line_text = " ".join(words[i:stop + 1]).strip()
+        lines.append(line_text)
+        i = stop + 1
+        if i >= len(words):
+            break
 
-        # keep initials with last names (e.g., "J." "Smith")
-        if NAME_INITIAL.match(words[i-1]):
-            score -= 4.0
-
-        if score > best_score:
-            best_score, best_i = score, i
-
-    return max(1, min(best_i, len(words)-1))
+    overflow = " ".join(words[i:]).strip()
+    return lines, overflow
 
 def needs_space(t: str) -> bool:
     return len(t) > 0 and not t.endswith((" ", "\n", "-", "—"))
