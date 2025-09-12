@@ -7,6 +7,33 @@ from segmenter import segment_by_pause_and_phrase
 # Helpers for enforcing minimum readable duration
 PUNCT = (".", "!", "?", "…", ",", ":", ";", "-", "—")
 
+__all__ = [
+    "enforce_min_readable",
+    "postprocess_segments",
+    "frame_quantize",
+    "write_srt",
+    "format_time_srt",
+    "srt_ts",
+    "normalize_text",
+]
+
+
+def format_time_srt(t: float) -> str:
+    if not math.isfinite(t) or t < 0:
+        t = 0.0
+    total_ms = int(round(t * 1000))
+    ms = total_ms % 1000
+    total_s = total_ms // 1000
+    s = total_s % 60
+    total_m = total_s // 60
+    m = total_m % 60
+    h = total_m // 60
+    return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+
+def srt_ts(t: float) -> str:
+    return format_time_srt(t)
+
 
 def _smart_join(a: str, b: str) -> str:
     """Join two subtitle texts with minimal punctuation artifacts."""
@@ -149,23 +176,6 @@ def write_srt(events: List[Dict[str, Any]], out_path: str) -> None:
             end = format_time_srt(ev["end"])
             text = ev["text"].strip()
             f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
-
-
-def format_time_srt(t: float) -> str:
-    if not math.isfinite(t) or t < 0:
-        t = 0.0
-    total_ms = int(round(t * 1000))
-    ms = total_ms % 1000
-    total_s = total_ms // 1000
-    s = total_s % 60
-    total_m = total_s // 60
-    m = total_m % 60
-    h = total_m // 60
-    return f"{h:02}:{m:02}:{s:02},{ms:03}"
-
-
-def srt_ts(t: float) -> str:
-    return format_time_srt(t)
 
 
 SPACES = re.compile(r"\s+")
