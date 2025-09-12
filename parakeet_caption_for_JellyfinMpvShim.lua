@@ -9,6 +9,9 @@
 local mp = require 'mp'
 local utils = require 'mp.utils'
 
+-- Subtitle alignment and styling are configured via mpv.conf;
+-- this script intentionally avoids forcing ASS overrides.
+
 -- ########## Configuration ##########
 -- These paths should be configured by the user.
 
@@ -529,6 +532,9 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
 
     for _, v in ipairs(seg_args) do table.insert(python_command_args, v) end
 
+    local fps = mp.get_property_native("container-fps") or mp.get_property_native("fps") or 24
+    table.insert(python_command_args, "--fps=" .. string.format("%.3f", fps))
+
     log("debug", "Running Python script: ", table.concat(python_command_args, " "))
     local python_res = utils.subprocess({ args = python_command_args, cancellable = false, capture_stdout = true, capture_stderr = true })
 
@@ -709,6 +715,8 @@ local function run_isolate_then_asr(model)
         "--audio_start_offset", tostring(audio_offset_seconds)
     }
     for _,v in ipairs(seg_args) do table.insert(parakeet_args, v) end
+    local fps = mp.get_property_native("container-fps") or mp.get_property_native("fps") or 24
+    table.insert(parakeet_args, "--fps=" .. string.format("%.3f", fps))
     local python_opts = { args = parakeet_args, cancellable = false, capture_stdout = true, capture_stderr = true }
     local python_res = utils.subprocess(python_opts)
     if python_res.error then
