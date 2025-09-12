@@ -142,6 +142,8 @@ def split_by_words(it: Dict[str, Any], max_dur: float, min_dur: float) -> List[D
     cur = []
     cur_start = words[0]["start"] if words else it["start"]
     for w in words:
+        if cur_start is None:
+            cur_start = w["start"]
         cur.append(w)
         # prefer boundary if punctuation ends the word
         cur_end = w["end"]
