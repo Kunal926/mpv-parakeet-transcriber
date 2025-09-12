@@ -68,8 +68,55 @@ def _spacy_bad_boundary(nlp, text: str, left_text: str, right_text: str) -> bool
     return bool(bad)
 
 
+def _words_text(words):
+    return " ".join((w.get("word") or "").strip() for w in words).strip()
+
+
+def _fits_line(cur_words, new_word_text, max_chars):
+    t = " ".join(cur_words + [new_word_text])
+    return len(t) <= max_chars
+
+
+def shape_words_into_two_lines_no_loss(words, max_chars, max_lines=2):
+    """
+    Input: list[{"word","start","end"}]
+    Returns: (lines_text:list[str], used_words:int, overflow_words:list[dict])
+    - uses linguistic hints (punctuation, conj/prep) to place the break
+    - preserves words => we can set exact start/end times
+    """
+    if not words:
+        return [""], 0, []
+    line1, line2 = [], []
+    used = 0
+
+    # Greedy fill line1
+    for i, w in enumerate(words):
+        wt = (w.get("word") or "").strip()
+        if not _fits_line([x for x in (line1)], wt, max_chars):
+            break
+        line1.append(wt); used = i + 1
+        # prefer break after punctuation if close to limit
+        if wt.endswith((".", "!", "?", "…", ",", ":", ";")) and len(" ".join(line1)) >= max_chars * 0.7:
+            break
+
+    rem = words[used:]
+
+    # If nothing left, single-line
+    if not rem or max_lines == 1:
+        return [" ".join(line1)], used, []
+
+    # Fill line2 up to max_chars (no trimming)
+    for j, w in enumerate(rem):
+        wt = (w.get("word") or "").strip()
+        if not _fits_line([x for x in (line2)], wt, max_chars):
+            overflow_words = rem[j:]
+            return [" ".join(line1), " ".join(line2)], used + j, overflow_words
+        line2.append(wt)
+
+    return [" ".join(line1), " ".join(line2)], len(words), []
+
 def segment_by_pause_and_phrase(words: List[Dict[str,Any]],
-                                max_chars_per_line: int = 40,
+                                max_chars_per_line: int = 46,
                                 max_lines: int = 2,
                                 pause_ms: int = 220,
                                 cps_target: float = 20.0,
@@ -150,19 +197,32 @@ def segment_by_pause_and_phrase(words: List[Dict[str,Any]],
 
     flush()
 
-    # two-line shaping (no-loss)
+    # two-line shaping that PRESERVES word timings
     shaped = []
     for seg in out:
-        lines, overflow = shape_lines_no_loss(seg["text"], max_chars_per_line, max_lines)
-        seg["text"] = "\n".join(lines)
-        shaped.append(seg)
-        while overflow:
-            # continuation segment starting where previous ended
-            cont_words = []  # no need to reattach words; durations will be re-policed later
-            nxt = {"start": seg["end"], "end": seg["end"], "text": overflow, "words": cont_words}
-            lines, overflow = shape_lines_no_loss(nxt["text"], max_chars_per_line, max_lines)
-            nxt["text"] = "\n".join(lines)
-            shaped.append(nxt)
+        cur_words = seg.get("words") or []
+        if not cur_words:
+            # fallback: keep text; no overflow splitting
+            shaped.append(seg)
+            continue
+
+        start_idx = 0
+        words_list = cur_words
+        while words_list:
+            lines_text, used_words, overflow = shape_words_into_two_lines_no_loss(
+                words_list, max_chars_per_line, max_lines
+            )
+
+            used = words_list[:used_words]
+            new_seg = {
+                "start": float(used[0]["start"]),
+                "end":   float(used[-1]["end"]),
+                "text":  "\n".join(lines_text),
+                "words": used,
+            }
+            shaped.append(new_seg)
+
+            words_list = overflow
     return shaped
 
 

@@ -194,7 +194,7 @@ def main():
     parser.add_argument("--max_duration", type=float, default=6.0, help="Maximum subtitle duration in seconds for word segmentation")
     parser.add_argument("--pause", type=float, default=0.6, help="Inter-word pause (s) that triggers a new subtitle when using word segmentation")
     parser.add_argument("--fps", type=float, default=24.0, help="Video FPS for frame snapping")
-    parser.add_argument("--max_chars_per_line", type=int, default=40)
+    parser.add_argument("--max_chars_per_line", type=int, default=46)
     parser.add_argument("--pause_ms", type=int, default=220, help="Minimum inter-word silence to open a split candidate")
     parser.add_argument("--cps", type=float, default=20.0, help="Target characters-per-second reading speed")
     parser.add_argument("--no_spacy", action="store_true", help="Disable spaCy hints even if available")

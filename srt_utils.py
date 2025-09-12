@@ -26,7 +26,7 @@ def enforce_min_readable(
     min_dur: float = 0.90,
     max_dur: float = 7.0,
     reflow: bool = True,
-    max_chars_per_line: int = 40,
+    max_chars_per_line: int = 46,
 ):
     """Extend or merge very short cues so they remain readable."""
     i = 0
@@ -82,7 +82,7 @@ def enforce_min_readable(
 
 def postprocess_segments(
     segments: List[Dict[str, Any]],
-    max_chars_per_line: int = 40,
+    max_chars_per_line: int = 46,
     max_lines: int = 2,
     pause_ms: int = 220,
     cps_target: float = 20.0,
