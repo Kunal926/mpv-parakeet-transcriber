@@ -194,10 +194,10 @@ def main():
     parser.add_argument("--max_duration", type=float, default=6.0, help="Maximum subtitle duration in seconds for word segmentation")
     parser.add_argument("--pause", type=float, default=0.6, help="Inter-word pause (s) that triggers a new subtitle when using word segmentation")
     parser.add_argument("--fps", type=float, default=24.0, help="Video FPS for frame snapping")
-    parser.add_argument("--min_dur", type=float, default=5.0/6.0, help="Minimum subtitle duration")
-    parser.add_argument("--max_dur", type=float, default=7.0, help="Maximum subtitle duration")
-    parser.add_argument("--max_chars_per_line", type=int, default=42, help="Maximum characters per subtitle line")
-    parser.add_argument("--min_gap", type=float, default=0.12, help="Minimum gap between subtitle events")
+    parser.add_argument("--max_chars_per_line", type=int, default=40)
+    parser.add_argument("--pause_ms", type=int, default=220, help="Minimum inter-word silence to open a split candidate")
+    parser.add_argument("--cps", type=float, default=20.0, help="Target characters-per-second reading speed")
+    parser.add_argument("--no_spacy", action="store_true", help="Disable spaCy hints even if available")
     args = parser.parse_args()
 
     audio_path = args.audio_file_path
@@ -209,10 +209,10 @@ def main():
     max_duration = args.max_duration
     pause_threshold = args.pause
     fps = args.fps
-    min_dur = args.min_dur
-    max_dur = args.max_dur
     max_chars_per_line = args.max_chars_per_line
-    min_gap = args.min_gap
+    pause_ms = args.pause_ms
+    cps = args.cps
+    use_spacy = not args.no_spacy
 
     # Define a helper function to write error SRTs immediately
     def write_error_srt(message: str):
@@ -406,12 +406,12 @@ def main():
 
         processed = postprocess_segments(
             segments,
-            min_duration=min_dur,
-            max_duration=max_dur,
             max_chars_per_line=max_chars_per_line,
             max_lines=2,
-            min_gap=min_gap,
+            pause_ms=pause_ms,
+            cps_target=cps,
             snap_fps=fps,
+            use_spacy=use_spacy,
         )
         _audit(segments, processed)
         write_srt(processed, srt_path)
