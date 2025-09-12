@@ -128,6 +128,12 @@ def merge_and_pad_short(items: List[Dict[str, Any]], min_dur: float, gap: float)
             cur["end"] = max(cur["end"], nxt["end"])
             joiner = " " if needs_space(cur["text"]) else ""
             cur["text"] = (cur["text"] + joiner + nxt["text"]).strip()
+            cw, nw = cur.get("words"), nxt.get("words")
+            if nw:
+                if cw:
+                    cur["words"] = cw + nw
+                else:
+                    cur["words"] = nw
             i += 1
         out.append(cur)
         i += 1
@@ -150,33 +156,46 @@ def split_overlong(items: List[Dict[str, Any]], max_dur: float, min_dur: float) 
 
 def split_by_words(it: Dict[str, Any], max_dur: float, min_dur: float) -> List[Dict[str, Any]]:
     words = it["words"]
-    acc = []
-    cur = []
+    words_text = normalize_text(" ".join((w.get("word", "") or "").strip() for w in words))
+    full_text = normalize_text(it["text"])
+
+    if not full_text.startswith(words_text):
+        return split_by_chars(it, max_dur, min_dur)
+
+    acc: List[Dict[str, Any]] = []
+    cur: List[Dict[str, Any]] = []
     cur_start = words[0]["start"] if words else it["start"]
+    last_word_end = cur_start
+
     for w in words:
         if cur_start is None:
             cur_start = w["start"]
         cur.append(w)
-        # prefer boundary if punctuation ends the word
         cur_end = w["end"]
+        last_word_end = cur_end
         dur = cur_end - cur_start
-        ends_punct = re.search(PUNCT_BREAK_AFTER, w.get("word","") or "") is not None
+        ends_punct = re.search(PUNCT_BREAK_AFTER, (w.get("word", "") or "")) is not None
         if (dur >= min_dur and (dur >= max_dur or ends_punct)) or dur >= max_dur:
             acc.append(make_item_from_words(cur, cur_start, cur_end))
             cur, cur_start = [], None
+
     if cur:
         cur_end = cur[-1]["end"]
         if cur_start is None:
             cur_start = it["start"]
         acc.append(make_item_from_words(cur, cur_start, cur_end))
-    # if still too long, fall back to char split
-    final = []
-    for piece in acc:
-        if piece["end"] - piece["start"] > max_dur + 1e-6:
-            final.extend(split_by_chars(piece, max_dur, min_dur))
-        else:
-            final.append(piece)
-    return final
+        last_word_end = cur_end
+
+    leftover = full_text[len(words_text):].strip()
+    if leftover:
+        start = float(last_word_end)
+        end = float(it["end"])
+        if end <= start:
+            end = start + max(min_dur, 0.5)
+        leftover_piece = {"start": start, "end": end, "text": leftover}
+        acc.extend(split_by_chars(leftover_piece, max_dur, min_dur))
+
+    return acc
 
 def make_item_from_words(words, start, end):
     text = " ".join((w.get("word","") or "").strip() for w in words)

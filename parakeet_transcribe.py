@@ -35,7 +35,17 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from srt_utils import format_time_srt, postprocess_segments, write_srt
+from srt_utils import format_time_srt, postprocess_segments, write_srt, normalize_text
+
+
+def _audit(events_in, events_out):
+    tin = normalize_text(" ".join(e["text"] for e in events_in))
+    tout = normalize_text(" ".join(e["text"] for e in events_out))
+    if len(tout) < len(tin) * 0.98:
+        print(
+            "[WARN] Postprocess lost text:",
+            f"in={len(tin)} out={len(tout)} Δ={len(tin) - len(tout)}",
+        )
 
 def generate_srt_from_processed_timestamps(
     all_processed_timestamps: list,
@@ -403,6 +413,7 @@ def main():
             min_gap=min_gap,
             snap_fps=fps,
         )
+        _audit(segments, processed)
         write_srt(processed, srt_path)
         print(f"SRT file generated at '{srt_path}'", file=sys.stderr)
 
