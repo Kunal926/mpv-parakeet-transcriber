@@ -499,9 +499,9 @@ def normalize_timing_netflix(
         orig_end = cur["end"]
         orig_start_nxt = nxt["start"]
         take = min(spare_gap, borrow)
+        # use silent gap without shifting the next cue's start
         cur["end"] += take
-        nxt["start"] += take
-        borrow -= take
+        borrow = max(0.0, borrow - take)
         if borrow > 0:
             cur["end"] += borrow
             nxt["start"] += borrow
@@ -528,9 +528,9 @@ def normalize_timing_netflix(
         orig_start = cur["start"]
         orig_end_prev = prev["end"]
         take = min(spare_gap, borrow)
+        # pull from available gap without moving the previous cue's end
         cur["start"] -= take
-        prev["end"] -= take
-        borrow -= take
+        borrow = max(0.0, borrow - take)
         if borrow > 0:
             cur["start"] -= borrow
             prev["end"] -= borrow
