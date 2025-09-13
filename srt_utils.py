@@ -1,7 +1,33 @@
 from __future__ import annotations
 from typing import List, Dict, Any, Tuple
-import math, re
+import math, sys, os, time, re
 from segmenter import segment_by_pause_and_phrase, shape_words_into_two_lines_balanced
+
+# ---------- tiny helpers ----------
+def _trace(msg: str) -> None:
+    if os.environ.get("PARAKEET_TRACE_TIMING") == "1":
+        sys.stderr.write(f"[srt_utils] {msg}\n"); sys.stderr.flush()
+
+def _with_timeout(timeout_s: float, fn, *args, **kwargs):
+    """Run fn(*args, **kwargs) in a daemon thread; return result or None on timeout."""
+    import threading
+    out, err = {}, []
+    done = threading.Event()
+    def _run():
+        try:
+            out["v"] = fn(*args, **kwargs)
+        except Exception as e:
+            err.append(e)
+        finally:
+            done.set()
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    if not done.wait(timeout_s):
+        _trace(f"{getattr(fn, '__name__', 'func')} timed out after {timeout_s:.1f}s — skipping")
+        return None
+    if err:
+        raise err[0]
+    return out.get("v")
 
 SPACES = re.compile(r"\s+")
 def normalize_text(t: str) -> str:
@@ -81,7 +107,9 @@ def pack_into_two_line_blocks(
         start = float(bw[0]["start"])
         end = float(blk["end"])
         j = i
-        while j+1 < len(events):
+        tries = 0
+        MAX_TRIES = 32  # hard cap per block
+        while j+1 < len(events) and tries < MAX_TRIES:
             gap_ms = int(round((events[j+1]["start"] - events[j]["end"]) * 1000))
             if gap_ms > coalesce_gap_ms: break
             # Do not let the candidate block grow beyond max duration
@@ -89,6 +117,17 @@ def pack_into_two_line_blocks(
             if (cand_end - start) > max_block_duration_s:
                 break
             cw = (events[j+1].get("words") or [])
+            # --- Cheap prefilters before expensive shaping ---
+            if not cw:
+                break
+            # rough char count (no spaces). Allow small slack.
+            naive_chars = sum(len((w.get("word","").strip())) for w in (bw+cw))
+            if naive_chars > (max_chars_per_line*2 + 8):
+                break
+            naive_dur = (events[j+1]["end"] - start) or 1e-3
+            if (naive_chars / naive_dur) > (cps_target * 1.15):
+                break
+            # -------------------------------------------------
             cand = bw + cw
             lines, used, overflow = shaper(
                 cand,
@@ -102,6 +141,7 @@ def pack_into_two_line_blocks(
             cps = len(txt) / max(0.001, (events[j+1]["end"] - start))
             if cps > cps_target: break
             bw = cand; end = float(events[j+1]["end"]); j += 1
+            tries += 1
         lines, used, overflow = shaper(
             bw,
             max_chars=max_chars_per_line,
@@ -217,7 +257,8 @@ def enforce_min_readable_v2(
                     # If overflow exists, emit it as its own event(s)
                     k = i+1
                     cur_over = overflow
-                    while cur_over:
+                    guard = 0
+                    while cur_over and guard < 1000:
                         lines2, used2, over2 = shaper(
                             cur_over,
                             max_chars=max_chars_per_line,
@@ -225,6 +266,11 @@ def enforce_min_readable_v2(
                             two_line_threshold=0.60,
                             min_two_line_chars=min_two_line_chars,
                         )
+                        # Guarantee progress even on pathological tokens (e.g., 60+ char word)
+                        if used2 <= 0:
+                            used2 = 1
+                            lines2 = [normalize_text(cur_over[0].get("word",""))]
+                            over2  = cur_over[1:]
                         used_block2 = cur_over[:used2]
                         events.insert(k, {
                             "start": float(used_block2[0]["start"]),
@@ -234,6 +280,7 @@ def enforce_min_readable_v2(
                         })
                         k += 1
                         cur_over = over2
+                        guard += 1
                     # Remove the original neighbor we merged into
                     del events[k]
                     continue
@@ -258,7 +305,8 @@ def enforce_min_readable_v2(
                     # If overflow exists, emit it as its own event(s)
                     k = i
                     cur_over = overflow
-                    while cur_over:
+                    guard = 0
+                    while cur_over and guard < 1000:
                         lines2, used2, over2 = shaper(
                             cur_over,
                             max_chars=max_chars_per_line,
@@ -266,6 +314,11 @@ def enforce_min_readable_v2(
                             two_line_threshold=0.60,
                             min_two_line_chars=min_two_line_chars,
                         )
+                        # Guarantee progress even on pathological tokens (e.g., 60+ char word)
+                        if used2 <= 0:
+                            used2 = 1
+                            lines2 = [normalize_text(cur_over[0].get("word",""))]
+                            over2  = cur_over[1:]
                         used_block2 = cur_over[:used2]
                         events.insert(k, {
                             "start": float(used_block2[0]["start"]),
@@ -275,6 +328,7 @@ def enforce_min_readable_v2(
                         })
                         k += 1
                         cur_over = over2
+                        guard += 1
                     # Remove the orphan we merged
                     del events[k]
                     i -= 1
@@ -716,41 +770,59 @@ def postprocess_segments(
         two_line_threshold=two_line_threshold,
         min_two_line_chars=min_two_line_chars,
     )
-    # Merge small neighbors into calm 2-line blocks
-    events = pack_into_two_line_blocks(
-        events,
-        max_chars_per_line=max_chars_per_line,
-        cps_target=cps_target,
-        coalesce_gap_ms=coalesce_gap_ms,
-        two_line_threshold=two_line_threshold,
-        min_two_line_chars=min_two_line_chars,
-        max_block_duration_s=max_block_duration_s,
-        shaper=shape_words_into_two_lines_balanced,
-    )
+    # Fast-safe mode to prove where the stall is
+    if os.environ.get("PARAKEET_TIMING_SAFE") == "1":
+        _trace("SAFE mode: skipping packer, min_readable, and netflix normalizer")
+        return events
+
+    # Merge small neighbors into calm 2-line blocks (can be heavy)
+    if os.environ.get("PARAKEET_DISABLE_PACKER") != "1":
+        _trace(f"packer in: {len(events)}")
+        _e = _with_timeout(5.0, pack_into_two_line_blocks,
+                           events,
+                           max_chars_per_line=max_chars_per_line,
+                           cps_target=cps_target,
+                           coalesce_gap_ms=coalesce_gap_ms,
+                           two_line_threshold=two_line_threshold,
+                           min_two_line_chars=min_two_line_chars,
+                           max_block_duration_s=max_block_duration_s,
+                           shaper=shape_words_into_two_lines_balanced)
+        if _e is not None:
+            events = _e
+        _trace(f"packer out: {len(events)}")
+
     # Eliminate quick singles (orphans) and short flashes
-    events = enforce_min_readable_v2(
-        events,
-        min_dur=min_readable,
-        cps_target=cps_target,
-        max_chars_per_line=max_chars_per_line,
-        min_two_line_chars=min_two_line_chars,
-        max_merge_gap_ms=max_merge_gap_ms,
-        shaper=shape_words_into_two_lines_balanced,
-    )
+    if os.environ.get("PARAKEET_DISABLE_MINREADABLE") != "1":
+        _trace(f"min_readable in: {len(events)}")
+        _e = _with_timeout(5.0, enforce_min_readable_v2,
+                           events,
+                           min_dur=min_readable,
+                           cps_target=cps_target,
+                           max_chars_per_line=max_chars_per_line,
+                           min_two_line_chars=min_two_line_chars,
+                           max_merge_gap_ms=max_merge_gap_ms,
+                           shaper=shape_words_into_two_lines_balanced)
+        if _e is not None:
+            events = _e
+        _trace(f"min_readable out: {len(events)}")
+
     # Netflix timing: linger-only-when-safe + chaining + 20f for 1–2 words
-    if snap_fps:
-        events = normalize_timing_netflix(
-            events,
-            fps=snap_fps,
-            linger_after_audio_ms=500,
-            min_gap_frames=2,
-            close_range_frames=(3,11),
-            small_gap_floor_s=0.5,
-            max_chars_per_line=max_chars_per_line,
-            cps_target=cps_target,
-            two_line_threshold=two_line_threshold,
-            min_two_line_chars=min_two_line_chars,
-            shaper=shape_words_into_two_lines_balanced,
-            max_block_duration_s=max_block_duration_s,
-        )
+    if snap_fps and os.environ.get("PARAKEET_DISABLE_NETFLIX") != "1":
+        _trace(f"netflix in: {len(events)}")
+        _e = _with_timeout(5.0, normalize_timing_netflix,
+                           events,
+                           fps=snap_fps,
+                           linger_after_audio_ms=500,
+                           min_gap_frames=2,
+                           close_range_frames=(3,11),
+                           small_gap_floor_s=0.5,
+                           max_chars_per_line=max_chars_per_line,
+                           cps_target=cps_target,
+                           two_line_threshold=two_line_threshold,
+                           min_two_line_chars=min_two_line_chars,
+                           shaper=shape_words_into_two_lines_balanced,
+                           max_block_duration_s=max_block_duration_s)
+        if _e is not None:
+            events = _e
+        _trace(f"netflix out: {len(events)}")
     return events
