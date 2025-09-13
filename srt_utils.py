@@ -363,6 +363,7 @@ def normalize_timing_netflix(
     min_two_line_chars: int = 24,
     shaper=shape_words_into_two_lines_balanced,
     max_block_duration_s: float = 7.0,
+    validate: bool = True,
 ) -> List[Dict[str,Any]]:
     if not events: return events
     spf=_spf(fps)
@@ -746,20 +747,35 @@ def normalize_timing_netflix(
         if ev["end"] <= ev["start"]:
             ev["end"] = ev["start"] + spf
 
+    do_validate = (
+        validate
+        and os.environ.get("PARAKEET_DISABLE_PACKER") != "1"
+        and os.environ.get("PARAKEET_DISABLE_MINREADABLE") != "1"
+    )
+
+    def _enforce(cond: bool, msg: str) -> None:
+        if do_validate:
+            assert cond, msg
+        elif not cond:
+            _trace(msg)
+
     prev_end = None
     for ev in events:
         lines = (ev.get("text") or "").split("\n")
-        assert len(lines) <= 2, "more than 2 lines"
+        _enforce(len(lines) <= 2, "more than 2 lines")
         if lines:
-            assert max(len(line) for line in lines) <= max_chars_per_line, "CPL > limit"
+            _enforce(
+                max(len(line) for line in lines) <= max_chars_per_line,
+                "CPL > limit",
+            )
         dur = ev["end"] - ev["start"]
-        assert dur + tolerance >= min_dur, "duration <20f"
+        _enforce(dur + tolerance >= min_dur, "duration <20f")
         txt = "".join(lines)
         cps = len(txt) / max(0.001, dur)
-        assert cps <= cps_target + 1e-6, "cps > limit"
+        _enforce(cps <= cps_target + 1e-6, "cps > limit")
         if prev_end is not None:
             gap = ev["start"] - prev_end
-            assert gap >= min_gap_frames*spf - 1e-6, "gap <2f"
+            _enforce(gap >= min_gap_frames * spf - 1e-6, "gap <2f")
         prev_end = ev["end"]
     return events
 
@@ -805,6 +821,8 @@ def postprocess_segments(
         _trace("SAFE mode: skipping packer, min_readable, and netflix normalizer")
         return events
 
+    timed_out = False
+
     # Merge small neighbors into calm 2-line blocks (can be heavy)
     if os.environ.get("PARAKEET_DISABLE_PACKER") != "1":
         _trace(f"packer in: {len(events)}")
@@ -819,6 +837,8 @@ def postprocess_segments(
                            shaper=shape_words_into_two_lines_balanced)
         if _e is not None:
             events = _e
+        else:
+            timed_out = True
         _trace(f"packer out: {len(events)}")
 
     # Eliminate quick singles (orphans) and short flashes
@@ -834,6 +854,8 @@ def postprocess_segments(
                            shaper=shape_words_into_two_lines_balanced)
         if _e is not None:
             events = _e
+        else:
+            timed_out = True
         _trace(f"min_readable out: {len(events)}")
 
     # Netflix timing: linger-only-when-safe + chaining + 20f for 1–2 words
@@ -851,7 +873,8 @@ def postprocess_segments(
                            two_line_threshold=two_line_threshold,
                            min_two_line_chars=min_two_line_chars,
                            shaper=shape_words_into_two_lines_balanced,
-                           max_block_duration_s=max_block_duration_s)
+                           max_block_duration_s=max_block_duration_s,
+                           validate=not timed_out)
         if _e is not None:
             events = _e
         _trace(f"netflix out: {len(events)}")
