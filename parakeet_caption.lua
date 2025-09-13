@@ -516,7 +516,12 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     table.insert(python_command_args, "--fps=" .. string.format("%.3f", fps))
 
     log("debug", "Running Python script: ", table.concat(python_command_args, " "))
-    local python_res = utils.subprocess({ args = python_command_args, cancellable = false, capture_stdout = true, capture_stderr = true })
+    local python_res = utils.subprocess({
+        args = python_command_args,
+        cancellable = false,
+        capture_stdout = false,
+        capture_stderr = false
+    })
 
     if python_res.error then
         log("error", "Failed to launch Parakeet Python script: ", (python_res.error or "Unknown error"))
@@ -740,7 +745,12 @@ local function run_isolate_then_asr(model)
     for _,v in ipairs(seg_args) do table.insert(parakeet_args, v) end
     local fps = mp.get_property_native("container-fps") or mp.get_property_native("fps") or 24
     table.insert(parakeet_args, "--fps=" .. string.format("%.3f", fps))
-    local python_opts = { args = parakeet_args, cancellable = false, capture_stdout = true, capture_stderr = true }
+    local python_opts = {
+        args = parakeet_args,
+        cancellable = false,
+        capture_stdout = false,
+        capture_stderr = false
+    }
     local python_res = utils.subprocess(python_opts)
     if python_res.error then
         log("error", "Failed to launch Parakeet Python script: ", to_str_safe(python_res.error))
