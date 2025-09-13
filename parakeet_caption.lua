@@ -523,6 +523,22 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         if python_res.stderr and string.len(python_res.stderr) > 0 then
              log("error", "Stderr from Python launch failure: ", python_res.stderr)
         end
+        -- Attempt to surface the failure inside MPV by writing a tiny SRT file
+        -- containing the error message.  This helps users notice that the
+        -- transcription step never started rather than silently failing.
+        local err_file, io_err = io.open(srt_output_path, "w")
+        if err_file then
+            err_file:write("1\n00:00:00,000 --> 00:00:01,000\n[Transcription failed: " ..
+                           to_str_safe(python_res.error) .. "]\n\n")
+            err_file:close()
+            -- Try to load the error subtitle so it becomes visible immediately
+            if utils.file_info(srt_output_path) then
+                mp.commandv("sub-add", srt_output_path, "select")
+            end
+        else
+            log("warn", "Could not create error SRT: ", to_str_safe(io_err))
+        end
+
         mp.osd_message("Parakeet: Failed to launch Python. Check console.", 7)
     else
         log("info", "Parakeet Python script finished (PID: ", (python_res.pid or "unknown"), "). Status: ", to_str_safe(python_res.status))
