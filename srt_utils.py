@@ -179,7 +179,7 @@ def enforce_min_readable_v2(
                     )
                     used_block = cand_words[:used]
                     e["text"]  = "\n".join(lines[:2])
-                    e["end"]   = used_block[-1]["end"]
+                    e["end"]   = float(used_block[-1]["end"])
                     e["words"] = used_block
                     # If overflow exists, emit it as its own event(s)
                     k = i+1
@@ -220,7 +220,7 @@ def enforce_min_readable_v2(
                     )
                     used_block = cand_words[:used]
                     prev["text"]  = "\n".join(lines[:2])
-                    prev["end"]   = used_block[-1]["end"]
+                    prev["end"]   = float(used_block[-1]["end"])
                     prev["words"] = used_block
                     # If overflow exists, emit it as its own event(s)
                     k = i
@@ -273,6 +273,7 @@ def normalize_timing_netflix(
     two_line_threshold: float = 0.60,
     min_two_line_chars: int = 24,
     shaper=shape_words_into_two_lines_balanced,
+    max_block_duration_s: float = 7.0,
 ) -> List[Dict[str,Any]]:
     if not events: return events
     spf=_spf(fps)
@@ -295,7 +296,7 @@ def normalize_timing_netflix(
         txt = " ".join((w.get("word","") or "").strip() for w in cand)
         dur = b["end"] - a["start"]
         cps = len(txt) / max(0.001, dur)
-        if cps > cps_target:
+        if cps > cps_target or dur > max_block_duration_s:
             return (False, None)
         return (True, (cand, "\n".join(lines[:2])))
     # 1) Start on first audio frame; End on last audio frame (we'll linger later if safe)
@@ -351,10 +352,11 @@ def normalize_timing_netflix(
         a_ws = a.get("words") or []
         a_audio_end = _ceil(a_ws[-1]["end"], fps) if a_ws else a["end"]
         max_linger = a_audio_end + linger_after_audio_ms/1000.0
+        b_ws = b.get("words") or []
+        b_audio_floor = _floor(b_ws[0]["start"], fps) if b_ws else b["start"]
 
-        # If gap < 2f:
         if gap_f < min_gap_frames:
-            # Try borrowing time by merging into a calm 2-line block
+            # Borrow time first (merge) if it yields a valid 2-line block within cps AND cap
             ok, payload = _can_merge_pair(a, b)
             if ok and payload:
                 words, text = payload
@@ -363,41 +365,37 @@ def normalize_timing_netflix(
                 if a.get("words") and b.get("words"):
                     a["words"] = a["words"] + b["words"]
                 del events[i+1]
-                # do not advance i; new a may chain with the next b
                 continue
-
-            # Otherwise, chain only if it does NOT cut into A audio
-            desired = b["start"] - min_gap_frames * spf
+            # Else, resolve without overlap
+            latest_b = b_audio_floor + min_gap_frames*spf
+            if b["start"] < a["end"]:
+                b["start"] = min(max(a["end"], b["start"]), latest_b)
+                gap_s = b["start"] - a["end"]
+                gap_f = int(round(gap_s / spf))
+            desired = b["start"] - min_gap_frames*spf
             desired = min(desired, max_linger)
             if desired >= a_audio_end:
                 a["end"] = desired
             else:
-                # Preserve A audio: accept <2f gap (do NOT delay B in)
                 a["end"] = max(a["end"], a_audio_end)
-
             if a["end"] <= a["start"]:
                 a["end"] = a["start"] + spf
-
         else:
-            # 24ish: close specified range to 2f, but still never cut earlier than audio
             is_24ish = abs(fps - 24.0) < 0.2 or abs(fps - 23.976) < 0.2
             low, high = close_range_frames
             if is_24ish and (low <= gap_f <= high):
-                desired = b["start"] - min_gap_frames * spf
+                desired = b["start"] - min_gap_frames*spf
                 desired = min(desired, max_linger)
                 a["end"] = max(a_audio_end, desired)
             else:
-                # general rule: either 2f or ≥0.5s
                 if gap_s < small_gap_floor_s:
-                    desired = b["start"] - min_gap_frames * spf
+                    desired = b["start"] - min_gap_frames*spf
                     desired = min(desired, max_linger)
                     a["end"] = max(a_audio_end, desired)
-
-        # never invert
         if a["end"] <= a["start"]:
             a["end"] = a["start"] + spf
         i += 1
-    # 5) final snap & monotonic (do NOT make starts late)
+    # 5) final snap & monotonic (do NOT make starts late; also never overlap)
     for i,ev in enumerate(events):
         ev["start"] = _floor(ev["start"], fps)
         ev["end"]   = _ceil (ev["end"], fps)
@@ -405,10 +403,10 @@ def normalize_timing_netflix(
             min_allowed = events[i-1]["end"] + min_gap_frames*spf
             ws = ev.get("words") or []
             audio_start_floor = _floor(ws[0]["start"], fps) if ws else ev["start"]
-            if ev["start"] < min_allowed:
-                if min_allowed <= audio_start_floor:
-                    ev["start"] = min_allowed
-                # else: keep audio-true start; accept <2f gap
+            if ev["start"] < events[i-1]["end"]:
+                ev["start"] = min(max(events[i-1]["end"], ev["start"]), audio_start_floor + min_gap_frames*spf)
+            elif ev["start"] < min_allowed and min_allowed <= audio_start_floor + min_gap_frames*spf:
+                ev["start"] = min_allowed
         if ev["end"] <= ev["start"]:
             ev["end"] = ev["start"] + spf
     return events
@@ -485,5 +483,6 @@ def postprocess_segments(
             two_line_threshold=two_line_threshold,
             min_two_line_chars=min_two_line_chars,
             shaper=shape_words_into_two_lines_balanced,
+            max_block_duration_s=max_block_duration_s,
         )
     return events
