@@ -10,8 +10,10 @@ def _trace(msg: str) -> None:
 
 def _with_timeout(timeout_s: float, fn, *args, **kwargs):
     """Run fn(*args, **kwargs) in a daemon thread; return result or None on timeout."""
-    import threading
+    import threading, copy
     out, err = {}, []
+    if args and isinstance(args[0], list):
+        args = (copy.deepcopy(args[0]),) + args[1:]
     done = threading.Event()
     def _run():
         try:
@@ -559,6 +561,14 @@ def normalize_timing_netflix(
         if borrow > 0:
             cur["end"] += borrow
             nxt["start"] += borrow
+            ws = nxt.get("words") or []
+            if ws:
+                audio_start = _floor(ws[0]["start"], fps)
+                upper = audio_start + min_gap_frames*spf
+                if nxt["start"] > upper:
+                    shift = nxt["start"] - upper
+                    nxt["start"] = upper
+                    cur["end"] -= shift
         dur_nxt = nxt["end"] - nxt["start"]
         txt_nxt = " ".join((w.get("word", "") or "").strip() for w in nxt.get("words") or [])
         cps_nxt = len(txt_nxt) / max(0.001, dur_nxt)
