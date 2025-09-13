@@ -193,9 +193,9 @@ def main():
     parser.add_argument("--max_words", type=int, default=12, help="Maximum words per subtitle when using word segmentation")
     parser.add_argument("--max_duration", type=float, default=6.0, help="Maximum subtitle duration in seconds for word segmentation")
     parser.add_argument("--pause", type=float, default=0.6, help="Inter-word pause (s) that triggers a new subtitle when using word segmentation")
-    parser.add_argument("--fps", type=float, default=24.0, help="Video FPS for frame snapping")
-    parser.add_argument("--max_chars_per_line", type=int, default=40)
-    parser.add_argument("--pause_ms", type=int, default=240, help="Minimum inter-word silence to open a split candidate")
+    parser.add_argument("--fps", type=float, default=24.0, help="Video FPS for frame/frame-edge snapping")
+    parser.add_argument("--max_chars_per_line", type=int, default=42, help="42 CPL per Netflix guidance")
+    parser.add_argument("--pause_ms", type=int, default=240, help="Pause to split phrases (breath-group)")
     parser.add_argument("--punct_pause_ms", type=int, default=160,
                         help="Pause after sentence-ending punctuation to allow a split")
     parser.add_argument("--comma_pause_ms", type=int, default=120,
@@ -204,14 +204,20 @@ def main():
     parser.add_argument("--no_spacy", action="store_true", help="Disable spaCy hints even if available")
     parser.add_argument("--coalesce_gap_ms", type=int, default=360,
                         help="Merge consecutive events if gap ≤ this and 2-line fit/cps ok")
-    parser.add_argument("--two_line_threshold", type=float, default=0.55,
-                        help="Prefer 2 lines once block length ≥ this fraction of a line")
+    parser.add_argument("--two_line_threshold", type=float, default=0.60,
+                        help="Prefer 2 lines once block length ≥60% of a line")
+    parser.add_argument("--min_two_line_chars", type=int, default=24,
+                        help="Don’t split very short text into 2 lines")
     parser.add_argument(
         "--min_readable_ms",
         type=int,
-        default=1100,
+        default=1200,
         help="Soft minimum on-screen time per cue; short cues extend/merge",
     )
+    parser.add_argument("--max_block_duration_s", type=float, default=7.0,
+                        help="Max duration for a packed 2-line block")
+    parser.add_argument("--max_merge_gap_ms", type=int, default=360,
+                        help="Max gap for orphan merges/borrowing")
     args = parser.parse_args()
 
     audio_path = args.audio_file_path
@@ -229,9 +235,12 @@ def main():
     comma_pause_ms = args.comma_pause_ms
     cps = args.cps
     use_spacy = not args.no_spacy
+    min_two_line_chars = args.min_two_line_chars
     min_readable = args.min_readable_ms / 1000.0
     coalesce_gap_ms = args.coalesce_gap_ms
     two_line_threshold = args.two_line_threshold
+    max_block_duration_s = args.max_block_duration_s
+    max_merge_gap_ms = args.max_merge_gap_ms
 
     # Define a helper function to write error SRTs immediately
     def write_error_srt(message: str):
@@ -372,7 +381,9 @@ def main():
             write_error_srt(err_msg)
             sys.exit(1)
             
-        print(f"\nFull Transcript:\n{full_transcript}\n", file=sys.stderr)
+        # Debug: full transcript is enormous; printing can block when stderr is captured.
+        # if os.environ.get("PARAKEET_VERBOSE") == "1":
+        #     print(f"\nFull Transcript:\n{full_transcript}\n", file=sys.stderr)
 
         # Build segments for post-processing
         segments = []
@@ -433,9 +444,12 @@ def main():
             cps_target=cps,
             snap_fps=fps,
             use_spacy=use_spacy,
-            min_readable=min_readable,
             coalesce_gap_ms=coalesce_gap_ms,
             two_line_threshold=two_line_threshold,
+            min_readable=min_readable,
+            min_two_line_chars=min_two_line_chars,
+            max_block_duration_s=max_block_duration_s,
+            max_merge_gap_ms=max_merge_gap_ms,
         )
         _audit(segments, processed)
         write_srt(processed, srt_path)
