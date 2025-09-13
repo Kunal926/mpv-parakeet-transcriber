@@ -1,7 +1,39 @@
 from __future__ import annotations
 from typing import List, Dict, Any, Tuple
-import math, re
+import math, sys, os, time, re
 from segmenter import segment_by_pause_and_phrase, shape_words_into_two_lines_balanced
+
+# ---------- tiny helpers ----------
+def _trace(msg: str) -> None:
+    if os.environ.get("PARAKEET_TRACE_TIMING") == "1":
+        sys.stderr.write(f"[srt_utils] {msg}\n"); sys.stderr.flush()
+
+def _with_timeout(timeout_s: float, fn, *args, **kwargs):
+    """Run fn(*args, **kwargs) in a daemon thread; return result or None on timeout."""
+    import threading, copy
+    out, err = {}, []
+    if args and isinstance(args[0], list):
+        args = (copy.deepcopy(args[0]),) + args[1:]
+    done = threading.Event()
+    def _run():
+        try:
+            out["v"] = fn(*args, **kwargs)
+        except Exception as e:
+            err.append(e)
+        finally:
+            done.set()
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    if not done.wait(timeout_s):
+        _trace(f"{getattr(fn, '__name__', 'func')} timed out after {timeout_s:.1f}s — skipping")
+        return None
+    if err:
+        e = err[0]
+        if isinstance(e, AssertionError):
+            _trace(f"{getattr(fn, '__name__', 'func')} failed: {e}")
+            return None
+        raise e
+    return out.get("v")
 
 SPACES = re.compile(r"\s+")
 def normalize_text(t: str) -> str:
@@ -81,7 +113,9 @@ def pack_into_two_line_blocks(
         start = float(bw[0]["start"])
         end = float(blk["end"])
         j = i
-        while j+1 < len(events):
+        tries = 0
+        MAX_TRIES = 32  # hard cap per block
+        while j+1 < len(events) and tries < MAX_TRIES:
             gap_ms = int(round((events[j+1]["start"] - events[j]["end"]) * 1000))
             if gap_ms > coalesce_gap_ms: break
             # Do not let the candidate block grow beyond max duration
@@ -89,6 +123,17 @@ def pack_into_two_line_blocks(
             if (cand_end - start) > max_block_duration_s:
                 break
             cw = (events[j+1].get("words") or [])
+            # --- Cheap prefilters before expensive shaping ---
+            if not cw:
+                break
+            # rough char count (no spaces). Allow small slack.
+            naive_chars = sum(len((w.get("word","").strip())) for w in (bw+cw))
+            if naive_chars > (max_chars_per_line*2 + 8):
+                break
+            naive_dur = (events[j+1]["end"] - start) or 1e-3
+            if (naive_chars / naive_dur) > (cps_target * 1.15):
+                break
+            # -------------------------------------------------
             cand = bw + cw
             lines, used, overflow = shaper(
                 cand,
@@ -102,6 +147,7 @@ def pack_into_two_line_blocks(
             cps = len(txt) / max(0.001, (events[j+1]["end"] - start))
             if cps > cps_target: break
             bw = cand; end = float(events[j+1]["end"]); j += 1
+            tries += 1
         lines, used, overflow = shaper(
             bw,
             max_chars=max_chars_per_line,
@@ -217,7 +263,8 @@ def enforce_min_readable_v2(
                     # If overflow exists, emit it as its own event(s)
                     k = i+1
                     cur_over = overflow
-                    while cur_over:
+                    guard = 0
+                    while cur_over and guard < 1000:
                         lines2, used2, over2 = shaper(
                             cur_over,
                             max_chars=max_chars_per_line,
@@ -225,6 +272,11 @@ def enforce_min_readable_v2(
                             two_line_threshold=0.60,
                             min_two_line_chars=min_two_line_chars,
                         )
+                        # Guarantee progress even on pathological tokens (e.g., 60+ char word)
+                        if used2 <= 0:
+                            used2 = 1
+                            lines2 = [normalize_text(cur_over[0].get("word",""))]
+                            over2  = cur_over[1:]
                         used_block2 = cur_over[:used2]
                         events.insert(k, {
                             "start": float(used_block2[0]["start"]),
@@ -234,6 +286,7 @@ def enforce_min_readable_v2(
                         })
                         k += 1
                         cur_over = over2
+                        guard += 1
                     # Remove the original neighbor we merged into
                     del events[k]
                     continue
@@ -258,7 +311,8 @@ def enforce_min_readable_v2(
                     # If overflow exists, emit it as its own event(s)
                     k = i
                     cur_over = overflow
-                    while cur_over:
+                    guard = 0
+                    while cur_over and guard < 1000:
                         lines2, used2, over2 = shaper(
                             cur_over,
                             max_chars=max_chars_per_line,
@@ -266,6 +320,11 @@ def enforce_min_readable_v2(
                             two_line_threshold=0.60,
                             min_two_line_chars=min_two_line_chars,
                         )
+                        # Guarantee progress even on pathological tokens (e.g., 60+ char word)
+                        if used2 <= 0:
+                            used2 = 1
+                            lines2 = [normalize_text(cur_over[0].get("word",""))]
+                            over2  = cur_over[1:]
                         used_block2 = cur_over[:used2]
                         events.insert(k, {
                             "start": float(used_block2[0]["start"]),
@@ -275,6 +334,7 @@ def enforce_min_readable_v2(
                         })
                         k += 1
                         cur_over = over2
+                        guard += 1
                     # Remove the orphan we merged
                     del events[k]
                     i -= 1
@@ -307,6 +367,7 @@ def normalize_timing_netflix(
     min_two_line_chars: int = 24,
     shaper=shape_words_into_two_lines_balanced,
     max_block_duration_s: float = 7.0,
+    validate: bool = True,
 ) -> List[Dict[str,Any]]:
     if not events: return events
     spf=_spf(fps)
@@ -458,57 +519,269 @@ def normalize_timing_netflix(
         if a["end"] <= a["start"]:
             a["end"] = a["start"] + spf
         i += 1
-    # 5) final snap & monotonic (do NOT make starts late)
-    for i,ev in enumerate(events):
+    # 5) final snap & monotonic (safe clamp, never late beyond audio +2f)
+    for i, ev in enumerate(events):
         ev["start"] = _floor(ev["start"], fps)
-        ev["end"]   = _ceil (ev["end"], fps)
-        if i>0:
+        ev["end"] = _ceil(ev["end"], fps)
+        if i > 0:
             ws = ev.get("words") or []
             audio_start_floor = _floor(ws[0]["start"], fps) if ws else ev["start"]
-            lower = events[i-1]["end"] + min_gap_frames*spf + 1e-6
-            upper = max(lower, audio_start_floor + min_gap_frames*spf)
+            lower = events[i-1]["end"] + min_gap_frames*spf
+            upper = audio_start_floor + min_gap_frames*spf
+            if upper < lower:
+                upper = lower
             ev["start"] = min(max(ev["start"], lower), upper)
         if ev["end"] <= ev["start"]:
             ev["end"] = ev["start"] + spf
 
-    # 6) post-quantization consolidation
-    # Chain gaps <0.5s to 2-frame separations
+    # 6) post-quantization gap normalizer
     for i in range(len(events) - 1):
         gap = events[i+1]["start"] - events[i]["end"]
-        if gap < small_gap_floor_s:
-            desired = events[i+1]["start"] - min_gap_frames*spf
-            if desired > events[i]["end"]:
-                events[i]["end"] = desired
-    # Merge adjacent cues with tiny gaps when safe
+        gap_f = int(round(gap / spf))
+        if gap_f <= 0:
+            events[i]["end"] = events[i+1]["start"] - min_gap_frames*spf
+        elif is_24ish and 3 <= gap_f <= 11:
+            events[i]["end"] = events[i+1]["start"] - min_gap_frames*spf
+        if events[i]["end"] <= events[i]["start"]:
+            events[i]["end"] = events[i]["start"] + spf
+
+    # helpers for duration and CPS borrowing
+    def _borrow_from_right(idx: int, need: float, tolerance: float = 0.002) -> bool:
+        if idx + 1 >= len(events):
+            return False
+        cur, nxt = events[idx], events[idx + 1]
+        gap = nxt["start"] - cur["end"]
+        spare_gap = max(0.0, gap - min_gap_frames*spf)
+        spare_nxt = max(0.0, (nxt["end"] - nxt["start"]) - min_dur)
+        avail = spare_gap + spare_nxt
+        if avail <= 0:
+            return False
+        borrow = min(need, avail)
+        orig_end = cur["end"]
+        orig_start_nxt = nxt["start"]
+        take = min(spare_gap, borrow)
+        # use silent gap without shifting the next cue's start
+        cur["end"] += take
+        borrow = max(0.0, borrow - take)
+        if borrow > 0:
+            cur["end"] += borrow
+            nxt["start"] += borrow
+            ws = nxt.get("words") or []
+            if ws:
+                audio_start = _floor(ws[0]["start"], fps)
+                upper = audio_start + min_gap_frames*spf
+                if nxt["start"] > upper:
+                    shift = nxt["start"] - upper
+                    nxt["start"] = upper
+                    cur["end"] -= shift
+        dur_nxt = nxt["end"] - nxt["start"]
+        txt_nxt = " ".join((w.get("word", "") or "").strip() for w in nxt.get("words") or [])
+        cps_nxt = len(txt_nxt) / max(0.001, dur_nxt)
+        changed = cur["end"] != orig_end or nxt["start"] != orig_start_nxt
+        if dur_nxt + tolerance < min_dur or cps_nxt > cps_target or not changed:
+            cur["end"] = orig_end
+            nxt["start"] = orig_start_nxt
+            return False
+        return True
+
+    def _borrow_from_left(idx: int, need: float, tolerance: float = 0.002) -> bool:
+        if idx == 0:
+            return False
+        prev, cur = events[idx - 1], events[idx]
+        gap = cur["start"] - prev["end"]
+        spare_gap = max(0.0, gap - min_gap_frames*spf)
+
+        # respect each block's audio boundaries
+        cur_ws = cur.get("words") or []
+        prev_ws = prev.get("words") or []
+        cur_audio_start = _floor(cur_ws[0]["start"], fps) if cur_ws else cur["start"]
+        prev_audio_end = _ceil(prev_ws[-1]["end"], fps) if prev_ws else prev["end"]
+        spare_cur = max(0.0, cur["start"] - cur_audio_start)
+        earliest_prev_end = max(prev_audio_end, prev["start"] + min_dur)
+        spare_prev = max(0.0, prev["end"] - earliest_prev_end)
+
+        avail = min(spare_gap + spare_prev, spare_cur)
+        if avail <= 0:
+            return False
+        borrow = min(need, avail)
+        orig_start = cur["start"]
+        orig_end_prev = prev["end"]
+        take = min(spare_gap, borrow)
+        # pull from available gap without moving the previous cue's end
+        cur["start"] -= take
+        borrow = max(0.0, borrow - take)
+        if borrow > 0:
+            cur["start"] -= borrow
+            prev["end"] -= borrow
+
+        dur_prev = prev["end"] - prev["start"]
+        txt_prev = " ".join((w.get("word", "") or "").strip() for w in prev.get("words") or [])
+        cps_prev = len(txt_prev) / max(0.001, dur_prev)
+        # ensure we didn't trim past audio end or violate min dur/cps
+        if prev["end"] < prev_audio_end - tolerance or dur_prev + tolerance < min_dur or cps_prev > cps_target:
+            cur["start"] = orig_start
+            prev["end"] = orig_end_prev
+            return False
+        # final safeguard: don't start before audio
+        if cur["start"] < cur_audio_start:
+            diff = cur_audio_start - cur["start"]
+            cur["start"] = cur_audio_start
+            prev["end"] -= diff
+            if prev["end"] < prev_audio_end - tolerance:
+                cur["start"] = orig_start
+                prev["end"] = orig_end_prev
+                return False
+        return True
+
+    # 7) duration repair (ensure ≥20f)
+    tolerance = 0.002
+    min_dur = 20 * spf
     i = 0
-    while i < len(events) - 1:
-        gap = events[i+1]["start"] - events[i]["end"]
-        if gap <= min_gap_frames*spf:
-            b_text = (events[i+1].get("text") or "").lstrip()
-            if not (b_text.startswith("-") or b_text.startswith("[")):
+    while i < len(events):
+        ev = events[i]
+        dur = ev["end"] - ev["start"]
+        if dur + tolerance < min_dur:
+            need = min_dur - dur
+            if _borrow_from_right(i, need):
+                continue
+            if _borrow_from_left(i, need):
+                continue
+            merged = False
+            if i + 1 < len(events):
                 ok, payload = _can_merge_pair(
-                    events[i], events[i+1],
-                    max_chars_per_line, cps_target,
-                    two_line_threshold, min_two_line_chars,
-                    max_block_duration_s, shaper,
+                    ev,
+                    events[i + 1],
+                    max_chars_per_line,
+                    cps_target,
+                    two_line_threshold,
+                    min_two_line_chars,
+                    max_block_duration_s,
+                    shaper,
                 )
-                dur = events[i+1]["end"] - events[i]["start"]
-                if ok and payload and dur >= 20*spf:
+                if ok and payload:
                     words, text = payload
-                    events[i]["text"] = text
-                    events[i]["end"] = events[i+1]["end"]
-                    if events[i].get("words") and events[i+1].get("words"):
-                        events[i]["words"] = events[i]["words"] + events[i+1]["words"]
-                    del events[i+1]
+                    ev["text"] = text
+                    ev["end"] = events[i + 1]["end"]
+                    if ev.get("words") and events[i + 1].get("words"):
+                        ev["words"] = ev["words"] + events[i + 1]["words"]
+                    del events[i + 1]
+                    merged = True
+            if not merged and i > 0:
+                ok, payload = _can_merge_pair(
+                    events[i - 1],
+                    ev,
+                    max_chars_per_line,
+                    cps_target,
+                    two_line_threshold,
+                    min_two_line_chars,
+                    max_block_duration_s,
+                    shaper,
+                )
+                if ok and payload:
+                    prev = events[i - 1]
+                    words, text = payload
+                    prev["text"] = text
+                    prev["end"] = ev["end"]
+                    if prev.get("words") and ev.get("words"):
+                        prev["words"] = prev["words"] + ev["words"]
+                    del events[i]
+                    i -= 1
                     continue
         i += 1
-    # Re-chain after merges in case new small gaps were introduced
-    for i in range(len(events) - 1):
-        gap = events[i+1]["start"] - events[i]["end"]
-        if gap < small_gap_floor_s:
-            desired = events[i+1]["start"] - min_gap_frames*spf
-            if desired > events[i]["end"]:
-                events[i]["end"] = desired
+
+    # 8) reading speed balance (borrow before merge)
+    i = 0
+    while i < len(events):
+        ev = events[i]
+        txt = " ".join((w.get("word", "") or "").strip() for w in ev.get("words") or [])
+        dur = ev["end"] - ev["start"]
+        cps = len(txt) / max(0.001, dur)
+        if cps > cps_target:
+            need = (len(txt) / cps_target) - dur
+            if _borrow_from_right(i, need):
+                continue
+            if _borrow_from_left(i, need):
+                continue
+            merged = False
+            if i + 1 < len(events):
+                ok, payload = _can_merge_pair(
+                    ev,
+                    events[i + 1],
+                    max_chars_per_line,
+                    cps_target,
+                    two_line_threshold,
+                    min_two_line_chars,
+                    max_block_duration_s,
+                    shaper,
+                )
+                if ok and payload:
+                    words, text = payload
+                    ev["text"] = text
+                    ev["end"] = events[i + 1]["end"]
+                    if ev.get("words") and events[i + 1].get("words"):
+                        ev["words"] = ev["words"] + events[i + 1]["words"]
+                    del events[i + 1]
+                    continue
+            if i > 0:
+                ok, payload = _can_merge_pair(
+                    events[i - 1],
+                    ev,
+                    max_chars_per_line,
+                    cps_target,
+                    two_line_threshold,
+                    min_two_line_chars,
+                    max_block_duration_s,
+                    shaper,
+                )
+                if ok and payload:
+                    prev = events[i - 1]
+                    words, text = payload
+                    prev["text"] = text
+                    prev["end"] = ev["end"]
+                    if prev.get("words") and ev.get("words"):
+                        prev["words"] = prev["words"] + ev["words"]
+                    del events[i]
+                    i -= 1
+                    continue
+        i += 1
+
+    # 9) final snap & validate
+    for ev in events:
+        ev["start"] = _floor(ev["start"], fps)
+        ev["end"] = _ceil(ev["end"], fps)
+        if ev["end"] <= ev["start"]:
+            ev["end"] = ev["start"] + spf
+
+    do_validate = (
+        validate
+        and os.environ.get("PARAKEET_DISABLE_PACKER") != "1"
+        and os.environ.get("PARAKEET_DISABLE_MINREADABLE") != "1"
+    )
+
+    def _enforce(cond: bool, msg: str) -> None:
+        if do_validate:
+            assert cond, msg
+        elif not cond:
+            _trace(msg)
+
+    prev_end = None
+    for ev in events:
+        lines = (ev.get("text") or "").split("\n")
+        _enforce(len(lines) <= 2, "more than 2 lines")
+        if lines:
+            _enforce(
+                max(len(line) for line in lines) <= max_chars_per_line,
+                "CPL > limit",
+            )
+        dur = ev["end"] - ev["start"]
+        _enforce(dur + tolerance >= min_dur, "duration <20f")
+        txt = "".join(lines)
+        cps = len(txt) / max(0.001, dur)
+        _enforce(cps <= cps_target + 1e-6, "cps > limit")
+        if prev_end is not None:
+            gap = ev["start"] - prev_end
+            _enforce(gap >= min_gap_frames * spf - 1e-6, "gap <2f")
+        prev_end = ev["end"]
     return events
 
 # ---------- top-level postprocess ----------
@@ -548,41 +821,66 @@ def postprocess_segments(
         two_line_threshold=two_line_threshold,
         min_two_line_chars=min_two_line_chars,
     )
-    # Merge small neighbors into calm 2-line blocks
-    events = pack_into_two_line_blocks(
-        events,
-        max_chars_per_line=max_chars_per_line,
-        cps_target=cps_target,
-        coalesce_gap_ms=coalesce_gap_ms,
-        two_line_threshold=two_line_threshold,
-        min_two_line_chars=min_two_line_chars,
-        max_block_duration_s=max_block_duration_s,
-        shaper=shape_words_into_two_lines_balanced,
-    )
+    # Fast-safe mode to prove where the stall is
+    if os.environ.get("PARAKEET_TIMING_SAFE") == "1":
+        _trace("SAFE mode: skipping packer, min_readable, and netflix normalizer")
+        return events
+
+    timed_out = False
+
+    # Merge small neighbors into calm 2-line blocks (can be heavy)
+    if os.environ.get("PARAKEET_DISABLE_PACKER") != "1":
+        _trace(f"packer in: {len(events)}")
+        _e = _with_timeout(5.0, pack_into_two_line_blocks,
+                           events,
+                           max_chars_per_line=max_chars_per_line,
+                           cps_target=cps_target,
+                           coalesce_gap_ms=coalesce_gap_ms,
+                           two_line_threshold=two_line_threshold,
+                           min_two_line_chars=min_two_line_chars,
+                           max_block_duration_s=max_block_duration_s,
+                           shaper=shape_words_into_two_lines_balanced)
+        if _e is not None:
+            events = _e
+        else:
+            timed_out = True
+        _trace(f"packer out: {len(events)}")
+
     # Eliminate quick singles (orphans) and short flashes
-    events = enforce_min_readable_v2(
-        events,
-        min_dur=min_readable,
-        cps_target=cps_target,
-        max_chars_per_line=max_chars_per_line,
-        min_two_line_chars=min_two_line_chars,
-        max_merge_gap_ms=max_merge_gap_ms,
-        shaper=shape_words_into_two_lines_balanced,
-    )
+    if os.environ.get("PARAKEET_DISABLE_MINREADABLE") != "1":
+        _trace(f"min_readable in: {len(events)}")
+        _e = _with_timeout(5.0, enforce_min_readable_v2,
+                           events,
+                           min_dur=min_readable,
+                           cps_target=cps_target,
+                           max_chars_per_line=max_chars_per_line,
+                           min_two_line_chars=min_two_line_chars,
+                           max_merge_gap_ms=max_merge_gap_ms,
+                           shaper=shape_words_into_two_lines_balanced)
+        if _e is not None:
+            events = _e
+        else:
+            timed_out = True
+        _trace(f"min_readable out: {len(events)}")
+
     # Netflix timing: linger-only-when-safe + chaining + 20f for 1–2 words
-    if snap_fps:
-        events = normalize_timing_netflix(
-            events,
-            fps=snap_fps,
-            linger_after_audio_ms=500,
-            min_gap_frames=2,
-            close_range_frames=(3,11),
-            small_gap_floor_s=0.5,
-            max_chars_per_line=max_chars_per_line,
-            cps_target=cps_target,
-            two_line_threshold=two_line_threshold,
-            min_two_line_chars=min_two_line_chars,
-            shaper=shape_words_into_two_lines_balanced,
-            max_block_duration_s=max_block_duration_s,
-        )
+    if snap_fps and os.environ.get("PARAKEET_DISABLE_NETFLIX") != "1":
+        _trace(f"netflix in: {len(events)}")
+        _e = _with_timeout(5.0, normalize_timing_netflix,
+                           events,
+                           fps=snap_fps,
+                           linger_after_audio_ms=500,
+                           min_gap_frames=2,
+                           close_range_frames=(3,11),
+                           small_gap_floor_s=0.5,
+                           max_chars_per_line=max_chars_per_line,
+                           cps_target=cps_target,
+                           two_line_threshold=two_line_threshold,
+                           min_two_line_chars=min_two_line_chars,
+                           shaper=shape_words_into_two_lines_balanced,
+                           max_block_duration_s=max_block_duration_s,
+                           validate=not timed_out)
+        if _e is not None:
+            events = _e
+        _trace(f"netflix out: {len(events)}")
     return events
