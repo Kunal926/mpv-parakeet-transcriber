@@ -787,7 +787,7 @@ def normalize_timing_netflix(
 
 def rebalance_cps_borrow_time(
     events: List[Dict[str, Any]],
-    fps: float = 23.976,
+    fps: float = 25.0,
     cps_target: float = 20.0,
     min_gap_frames: int = 2,
     min_dur_frames: int = 20,
@@ -796,40 +796,55 @@ def rebalance_cps_borrow_time(
     min_gap = min_gap_frames * spf
     min_dur = min_dur_frames * spf
 
-    def text_len(e: Dict[str, Any]) -> int:
-        return len(e.get("text", "").replace("\n", " ").strip())
+    def chars_of(e: Dict[str, Any]) -> int:
+        return len(" ".join((e.get("text") or "").split()))
 
     i = 0
     while i < len(events) - 1:
-        e = events[i]
-        nx = events[i + 1]
+        e, nx = events[i], events[i + 1]
         dur = e["end"] - e["start"]
-        chars = text_len(e)
+        chars = chars_of(e)
         need = max(0.0, chars / cps_target - dur)
-        if need <= 1e-3:
+        need = max(need, max(0.0, min_dur - dur))
+
+        if need <= 1e-6:
             i += 1
             continue
 
-        right_gap = nx["start"] - e["end"]
-        room_gap = max(0.0, right_gap - min_gap)
+        if i > 0 and need > 0:
+            prev = events[i - 1]
+            gap_left = e["start"] - prev["end"]
+            left_slack = max(0.0, gap_left - min_gap)
+            take_left = min(need, left_slack)
+            if take_left > 0:
+                e["start"] -= take_left
+                need -= take_left
 
-        nx_dur = nx["end"] - nx["start"]
-        nx_chars = text_len(nx)
-        nx_min = max(min_dur, nx_chars / cps_target)
-        room_nx = max(0.0, nx_dur - nx_min)
+        if need <= 1e-6:
+            i += 1
+            continue
 
-        give = min(need, room_gap + room_nx)
-        if give > 0:
-            take_gap = min(give, room_gap)
+        gap = nx["start"] - e["end"]
+        gap_slack = max(0.0, gap - min_gap)
+        take_gap = min(need, gap_slack)
+        if take_gap > 0:
             e["end"] += take_gap
-            nx["start"] += take_gap
-            give -= take_gap
+            need -= take_gap
 
+        if need > 0:
+            nx_dur = nx["end"] - nx["start"]
+            nx_chars = chars_of(nx)
+            nx_min = max(min_dur, nx_chars / cps_target)
+            room_nx = max(0.0, nx_dur - nx_min)
+
+            give = min(need, room_nx)
             if give > 0:
                 nx["start"] += give
+                e["end"] = min(e["end"] + give, nx["start"] - min_gap)
+                if nx["start"] < e["end"] + min_gap:
+                    nx["start"] = e["end"] + min_gap - 1e-9
+                need -= give
 
-            nx["start"] = max(nx["start"], e["end"] + min_gap - 1e-9)
-            continue
         i += 1
     return events
 
@@ -952,7 +967,7 @@ def postprocess_segments(
                 min_two_line_chars=min_two_line_chars,
                 shaper=shape_words_into_two_lines_balanced,
                 max_block_duration_s=max_block_duration_s,
-                validate=False,
+                validate=True,
             )
         _trace(f"netflix out: {len(events)}")
     return events
