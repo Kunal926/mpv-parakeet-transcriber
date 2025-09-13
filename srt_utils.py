@@ -1,8 +1,8 @@
 from __future__ import annotations
 import math
 import re
-from typing import List, Dict, Any
-from segmenter import segment_by_pause_and_phrase
+from typing import List, Dict, Any, Tuple
+from segmenter import segment_by_pause_and_phrase, shape_words_into_two_lines_balanced
 
 # Helpers for enforcing minimum readable duration
 PUNCT = (".", "!", "?", "…", ",", ":", ";", "-", "—")
@@ -15,7 +15,110 @@ __all__ = [
     "format_time_srt",
     "srt_ts",
     "normalize_text",
+    "pack_into_two_line_blocks",
 ]
+
+
+def pack_into_two_line_blocks(
+    events: List[Dict[str, Any]],
+    max_chars_per_line: int = 40,
+    cps_target: float = 20.0,
+    coalesce_gap_ms: int = 360,
+    two_line_threshold: float = 0.55,
+) -> List[Dict[str, Any]]:
+    """Greedily merge consecutive events into a single 2-line block when:
+      - the inter-event gap ≤ coalesce_gap_ms
+      - shaped text fits in 2 lines (no overflow)
+      - chars-per-second stays within cps_target
+    Preserves word timings; zero text loss."""
+    out: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(events):
+        blk_words = events[i].get("words") or []
+        if not blk_words:
+            out.append(events[i])
+            i += 1
+            continue
+        start = float(blk_words[0]["start"])
+        end = float(events[i]["end"])
+        j = i
+
+        while j + 1 < len(events):
+            gap_ms = int(round((events[j + 1]["start"] - events[j]["end"]) * 1000))
+            if gap_ms > coalesce_gap_ms:
+                break
+
+            nxt_words = events[j + 1].get("words") or []
+            cand_words = blk_words + nxt_words
+            lines, _, overflow = shape_words_into_two_lines_balanced(
+                cand_words,
+                max_chars_per_line,
+                prefer_two_lines=True,
+                two_line_threshold=two_line_threshold,
+            )
+            if overflow:
+                break
+
+            cand_text = " ".join(w.get("word", "").strip() for w in cand_words)
+            cand_end = float(events[j + 1]["end"])
+            cps = len(cand_text.replace("\n", " ").strip()) / max(0.001, (cand_end - start))
+            if cps > cps_target:
+                break
+
+            blk_words = cand_words
+            end = cand_end
+            j += 1
+
+        lines, _, overflow = shape_words_into_two_lines_balanced(
+            blk_words,
+            max_chars_per_line,
+            prefer_two_lines=True,
+            two_line_threshold=two_line_threshold,
+        )
+        block = {
+            "start": float(blk_words[0]["start"]),
+            "end": float(end),
+            "text": "\n".join(lines[:2]),
+            "words": blk_words,
+        }
+        out.append(block)
+
+        # Practically unreachable because we avoid overflow before packing,
+        # but keep it correct just in case.
+        while overflow:
+            ow = overflow
+            lines2, used2, overflow = shape_words_into_two_lines_balanced(
+                ow,
+                max_chars_per_line,
+                prefer_two_lines=True,
+                two_line_threshold=two_line_threshold,
+            )
+            used_block2 = ow[:used2]
+            out.append(
+                {
+                    "start": float(used_block2[0]["start"]),
+                    "end": float(used_block2[-1]["end"]),
+                    "text": "\n".join(lines2[:2]),
+                    "words": used_block2,
+                }
+            )
+
+        i = j + 1
+    return out
+
+
+def _audit_monotonic_and_lossless(evts):
+    # monotonic
+    for i in range(1, len(evts)):
+        if evts[i]["start"] < evts[i - 1]["end"]:
+            print(
+                f"[WARN] overlap {i}: {evts[i-1]['end']:.3f} -> {evts[i]['start']:.3f}"
+            )
+    # lossless text (approximate)
+    def flat_text(events):
+        return " ".join(e["text"].replace("\n", " ").strip() for e in events)
+
+    return flat_text(evts)
 
 
 def format_time_srt(t: float) -> str:
@@ -50,10 +153,10 @@ def _smart_join(a: str, b: str) -> str:
 
 def enforce_min_readable(
     events: list[dict],
-    min_dur: float = 0.90,
+    min_dur: float = 1.10,
     max_dur: float = 7.0,
     reflow: bool = True,
-    max_chars_per_line: int = 46,
+    max_chars_per_line: int = 40,
 ):
     """Extend or merge very short cues so they remain readable."""
     i = 0
@@ -109,13 +212,17 @@ def enforce_min_readable(
 
 def postprocess_segments(
     segments: List[Dict[str, Any]],
-    max_chars_per_line: int = 46,
+    max_chars_per_line: int = 40,
     max_lines: int = 2,
-    pause_ms: int = 220,
+    pause_ms: int = 240,
+    punct_pause_ms: int = 160,
+    comma_pause_ms: int = 120,
     cps_target: float = 20.0,
     snap_fps: float | None = None,
     use_spacy: bool = True,
-    min_readable: float = 0.9,
+    min_readable: float = 1.1,
+    coalesce_gap_ms: int = 360,
+    two_line_threshold: float = 0.55,
 ) -> List[Dict[str, Any]]:
     """Segment words by pauses and phrases, shape lines, and quantize to frames."""
     # flatten word list (Parakeet provides accurate word timestamps)
@@ -135,8 +242,19 @@ def postprocess_segments(
         max_chars_per_line=max_chars_per_line,
         max_lines=max_lines,
         pause_ms=pause_ms,
+        punct_pause_ms=punct_pause_ms,
+        comma_pause_ms=comma_pause_ms,
         cps_target=cps_target,
         use_spacy=use_spacy,
+        two_line_threshold=two_line_threshold,
+    )
+
+    events = pack_into_two_line_blocks(
+        events,
+        max_chars_per_line=max_chars_per_line,
+        cps_target=cps_target,
+        coalesce_gap_ms=coalesce_gap_ms,
+        two_line_threshold=two_line_threshold,
     )
 
     events = enforce_min_readable(
@@ -146,6 +264,8 @@ def postprocess_segments(
         reflow=True,
         max_chars_per_line=max_chars_per_line,
     )
+
+    _ = _audit_monotonic_and_lossless(events)
 
     # frame-quantize: floor starts, ceil ends (prevents late starts)
     events = frame_quantize(events, snap_fps)
