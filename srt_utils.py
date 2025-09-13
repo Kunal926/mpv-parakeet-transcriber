@@ -573,7 +573,8 @@ def normalize_timing_netflix(
         dur_nxt = nxt["end"] - nxt["start"]
         txt_nxt = " ".join((w.get("word", "") or "").strip() for w in nxt.get("words") or [])
         cps_nxt = len(txt_nxt) / max(0.001, dur_nxt)
-        if dur_nxt + tolerance < min_dur or cps_nxt > cps_target:
+        changed = cur["end"] != orig_end or nxt["start"] != orig_start_nxt
+        if dur_nxt + tolerance < min_dur or cps_nxt > cps_target or not changed:
             cur["end"] = orig_end
             nxt["start"] = orig_start_nxt
             return False
