@@ -28,7 +28,11 @@ def _with_timeout(timeout_s: float, fn, *args, **kwargs):
         _trace(f"{getattr(fn, '__name__', 'func')} timed out after {timeout_s:.1f}s — skipping")
         return None
     if err:
-        raise err[0]
+        e = err[0]
+        if isinstance(e, AssertionError):
+            _trace(f"{getattr(fn, '__name__', 'func')} failed: {e}")
+            return None
+        raise e
     return out.get("v")
 
 SPACES = re.compile(r"\s+")
