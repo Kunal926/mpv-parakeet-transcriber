@@ -62,9 +62,10 @@ def _can_merge_pair(
 def pack_into_two_line_blocks(
     events: List[Dict[str, Any]],
     max_chars_per_line: int = 42,
-    cps_target: float = 19.0,
+    cps_target: float = 20.0,
     coalesce_gap_ms: int = 360,
     two_line_threshold: float = 0.60,
+    min_two_line_chars: int = 24,
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str,Any]] = []
     i = 0
@@ -83,10 +84,10 @@ def pack_into_two_line_blocks(
             cand = bw + cw
             lines, used, overflow = shape_words_into_two_lines_balanced(
                 cand,
-                max_chars_per_line,
+                max_chars=max_chars_per_line,
                 prefer_two_lines=True,
                 two_line_threshold=two_line_threshold,
-                min_two_line_chars=24,
+                min_two_line_chars=min_two_line_chars,
             )
             if overflow: break
             txt = " ".join((w.get("word","") or "").strip() for w in cand)
@@ -95,10 +96,10 @@ def pack_into_two_line_blocks(
             bw = cand; end = float(events[j+1]["end"]); j += 1
         lines, used, overflow = shape_words_into_two_lines_balanced(
             bw,
-            max_chars_per_line,
+            max_chars=max_chars_per_line,
             prefer_two_lines=True,
             two_line_threshold=two_line_threshold,
-            min_two_line_chars=24,
+            min_two_line_chars=min_two_line_chars,
         )
         used_block = bw[:used]
         out.append({
@@ -112,10 +113,11 @@ def pack_into_two_line_blocks(
 
 # ---------- orphan-aware min-readable (merges tiny one/two-word singles) ----------
 def enforce_min_readable_v2(
-    events: List[Dict[str,Any]],
-    min_dur: float = 1.20,
-    cps_target: float = 19.0,
+    events: List[Dict[str, Any]],
+    min_dur: float = 1.10,
+    cps_target: float = 20.0,
     max_chars_per_line: int = 42,
+    min_two_line_chars: int = 24,
     orphan_words: int = 2,
     orphan_chars: int = 12,
 ):
@@ -143,10 +145,10 @@ def enforce_min_readable_v2(
             cand = lw + rw
             lines, used, overflow = shape_words_into_two_lines_balanced(
                 cand,
-                max_chars_per_line,
+                max_chars=max_chars_per_line,
                 prefer_two_lines=True,
                 two_line_threshold=0.55,
-                min_two_line_chars=24,
+                min_two_line_chars=min_two_line_chars,
             )
             if overflow: return -1e9, None
             txt = " ".join((w.get("word","") or "").strip() for w in cand)
@@ -182,32 +184,32 @@ def enforce_min_readable_v2(
         if is_orphan:
             from segmenter import shape_words_into_two_lines_balanced
             if i + 1 < len(events):
-                nxt = events[i+1]
+                nxt = events[i + 1]
                 cand_words = (e.get("words") or []) + (nxt.get("words") or [])
                 lines, used, overflow = shape_words_into_two_lines_balanced(
                     cand_words,
-                    max_chars_per_line,
+                    max_chars=max_chars_per_line,
                     prefer_two_lines=True,
                     two_line_threshold=0.60,
-                    min_two_line_chars=24,
+                    min_two_line_chars=min_two_line_chars,
                 )
-                e["text"]  = "\n".join(lines[:2])
-                e["end"]   = nxt["end"]
+                e["text"] = "\n".join(lines[:2])
+                e["end"] = nxt["end"]
                 e["words"] = cand_words[:used]
-                del events[i+1]
+                del events[i + 1]
                 continue
             elif i > 0:
-                prv = events[i-1]
+                prv = events[i - 1]
                 cand_words = (prv.get("words") or []) + (e.get("words") or [])
                 lines, used, overflow = shape_words_into_two_lines_balanced(
                     cand_words,
-                    max_chars_per_line,
+                    max_chars=max_chars_per_line,
                     prefer_two_lines=True,
                     two_line_threshold=0.60,
-                    min_two_line_chars=24,
+                    min_two_line_chars=min_two_line_chars,
                 )
-                prv["text"]  = "\n".join(lines[:2])
-                prv["end"]   = e["end"]
+                prv["text"] = "\n".join(lines[:2])
+                prv["end"] = e["end"]
                 prv["words"] = cand_words[:used]
                 del events[i]
                 i -= 1
@@ -230,7 +232,7 @@ def normalize_timing_netflix(
     close_range_frames: Tuple[int,int] = (3,11),  # 24/23.976 only
     small_gap_floor_s: float = 0.5,
     max_chars_per_line: int = 42,
-    cps_target: float = 19.0,
+    cps_target: float = 20.0,
     two_line_threshold: float = 0.60,
     min_two_line_chars: int = 24,
 ) -> List[Dict[str,Any]]:
@@ -361,12 +363,12 @@ def postprocess_segments(
     pause_ms: int = 240,
     punct_pause_ms: int = 160,
     comma_pause_ms: int = 120,
-    cps_target: float = 19.0,
+    cps_target: float = 20.0,
     snap_fps: float | None = None,
     use_spacy: bool = True,
     coalesce_gap_ms: int = 360,
     two_line_threshold: float = 0.60,
-    min_readable: float = 1.20,
+    min_readable: float = 1.10,
     min_two_line_chars: int = 24,
 ) -> List[Dict[str,Any]]:
     # Flatten word list from raw ASR segments
@@ -403,6 +405,7 @@ def postprocess_segments(
         min_dur=min_readable,
         cps_target=cps_target,
         max_chars_per_line=max_chars_per_line,
+        min_two_line_chars=min_two_line_chars,
     )
     # Netflix timing: linger-only-when-safe + chaining + 20f for 1–2 words
     if snap_fps:

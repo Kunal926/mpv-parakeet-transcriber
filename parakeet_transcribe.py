@@ -200,16 +200,18 @@ def main():
                         help="Pause after sentence-ending punctuation to allow a split")
     parser.add_argument("--comma_pause_ms", type=int, default=120,
                         help="Pause after commas to allow a split")
-    parser.add_argument("--cps", type=float, default=19.0, help="Target characters-per-second reading speed")
+    parser.add_argument("--cps", type=float, default=20.0, help="Target characters-per-second reading speed")
     parser.add_argument("--no_spacy", action="store_true", help="Disable spaCy hints even if available")
     parser.add_argument("--coalesce_gap_ms", type=int, default=360,
                         help="Merge consecutive events if gap ≤ this and 2-line fit/cps ok")
     parser.add_argument("--two_line_threshold", type=float, default=0.60,
                         help="Prefer 2 lines once block length ≥60% of a line")
+    parser.add_argument("--min_two_line_chars", type=int, default=24,
+                        help="Don’t split very short text into 2 lines")
     parser.add_argument(
         "--min_readable_ms",
         type=int,
-        default=1200,
+        default=1100,
         help="Soft minimum on-screen time per cue; short cues extend/merge",
     )
     args = parser.parse_args()
@@ -229,6 +231,7 @@ def main():
     comma_pause_ms = args.comma_pause_ms
     cps = args.cps
     use_spacy = not args.no_spacy
+    min_two_line_chars = args.min_two_line_chars
     min_readable = args.min_readable_ms / 1000.0
     coalesce_gap_ms = args.coalesce_gap_ms
     two_line_threshold = args.two_line_threshold
@@ -433,9 +436,10 @@ def main():
             cps_target=cps,
             snap_fps=fps,
             use_spacy=use_spacy,
-            min_readable=min_readable,
             coalesce_gap_ms=coalesce_gap_ms,
             two_line_threshold=two_line_threshold,
+            min_readable=min_readable,
+            min_two_line_chars=min_two_line_chars,
         )
         _audit(segments, processed)
         write_srt(processed, srt_path)

@@ -45,12 +45,12 @@ def _spacy_bad_boundary(nlp, left_text: str, right_text: str) -> bool:
 
 # ---------- bottom-heavy 2-line shaping (word-preserving) ----------
 def shape_words_into_two_lines_balanced(
-    words: List[Dict[str,Any]],
+    words: List[Dict[str, Any]],
     max_chars: int,
     prefer_two_lines: bool = True,
     two_line_threshold: float = 0.70,
     min_two_line_chars: int = 24,
-) -> Tuple[List[str], int, List[Dict[str,Any]]]:
+) -> Tuple[List[str], int, List[Dict[str, Any]]]:
     toks = [_wtext(w) for w in words]
     if not toks:
         return [""], 0, []
@@ -113,7 +113,7 @@ def segment_by_pause_and_phrase(
     pause_ms: int = 240,
     punct_pause_ms: int = 160,
     comma_pause_ms: int = 120,
-    cps_target: float = 19.0,
+    cps_target: float = 20.0,
     use_spacy: bool = True,
     spacy_model: str = "en_core_web_sm",
     two_line_threshold: float = 0.70,
@@ -168,24 +168,28 @@ def segment_by_pause_and_phrase(
             flush()
     flush()
     # 2-line shaping preserving word timings, allowing continuations
-    shaped: List[Dict[str,Any]] = []
+    shaped: List[Dict[str, Any]] = []
     for seg in out:
         words_list = seg.get("words") or []
         if not words_list:
-            shaped.append(seg); continue
-            while words_list:
-                lines, used, overflow = shape_words_into_two_lines_balanced(
-                    words_list, max_chars_per_line,
-                    prefer_two_lines=True,
-                    two_line_threshold=two_line_threshold,
-                    min_two_line_chars=min_two_line_chars,
-                )
+            shaped.append(seg)
+            continue
+        while words_list:
+            lines, used, overflow = shape_words_into_two_lines_balanced(
+                words_list,
+                max_chars=max_chars_per_line,
+                prefer_two_lines=True,
+                two_line_threshold=two_line_threshold,
+                min_two_line_chars=min_two_line_chars,
+            )
             used_block = words_list[:used]
-            shaped.append({
-                "start": float(used_block[0]["start"]),
-                "end":   float(used_block[-1]["end"]),
-                "text":  "\n".join(lines[:2]),
-                "words": used_block,
-            })
+            shaped.append(
+                {
+                    "start": float(used_block[0]["start"]),
+                    "end": float(used_block[-1]["end"]),
+                    "text": "\n".join(lines[:2]),
+                    "words": used_block,
+                }
+            )
             words_list = overflow
     return shaped
