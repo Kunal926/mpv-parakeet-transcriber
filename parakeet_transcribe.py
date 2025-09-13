@@ -193,9 +193,9 @@ def main():
     parser.add_argument("--max_words", type=int, default=12, help="Maximum words per subtitle when using word segmentation")
     parser.add_argument("--max_duration", type=float, default=6.0, help="Maximum subtitle duration in seconds for word segmentation")
     parser.add_argument("--pause", type=float, default=0.6, help="Inter-word pause (s) that triggers a new subtitle when using word segmentation")
-    parser.add_argument("--fps", type=float, default=24.0, help="Video FPS for frame snapping")
-    parser.add_argument("--max_chars_per_line", type=int, default=40)
-    parser.add_argument("--pause_ms", type=int, default=240, help="Minimum inter-word silence to open a split candidate")
+    parser.add_argument("--fps", type=float, default=24.0, help="Video FPS for frame/frame-edge snapping")
+    parser.add_argument("--max_chars_per_line", type=int, default=42, help="42 CPL per Netflix guidance")
+    parser.add_argument("--pause_ms", type=int, default=240, help="Pause to split phrases (breath-group)")
     parser.add_argument("--punct_pause_ms", type=int, default=160,
                         help="Pause after sentence-ending punctuation to allow a split")
     parser.add_argument("--comma_pause_ms", type=int, default=120,
@@ -204,8 +204,8 @@ def main():
     parser.add_argument("--no_spacy", action="store_true", help="Disable spaCy hints even if available")
     parser.add_argument("--coalesce_gap_ms", type=int, default=360,
                         help="Merge consecutive events if gap ≤ this and 2-line fit/cps ok")
-    parser.add_argument("--two_line_threshold", type=float, default=0.55,
-                        help="Prefer 2 lines once block length ≥ this fraction of a line")
+    parser.add_argument("--two_line_threshold", type=float, default=0.60,
+                        help="Prefer 2 lines once block length ≥60% of a line")
     parser.add_argument(
         "--min_readable_ms",
         type=int,
