@@ -584,8 +584,17 @@ def normalize_timing_netflix(
         prev, cur = events[idx - 1], events[idx]
         gap = cur["start"] - prev["end"]
         spare_gap = max(0.0, gap - min_gap_frames*spf)
-        spare_prev = max(0.0, (prev["end"] - prev["start"]) - min_dur)
-        avail = spare_gap + spare_prev
+
+        # respect each block's audio boundaries
+        cur_ws = cur.get("words") or []
+        prev_ws = prev.get("words") or []
+        cur_audio_start = _floor(cur_ws[0]["start"], fps) if cur_ws else cur["start"]
+        prev_audio_end = _ceil(prev_ws[-1]["end"], fps) if prev_ws else prev["end"]
+        spare_cur = max(0.0, cur["start"] - cur_audio_start)
+        earliest_prev_end = max(prev_audio_end, prev["start"] + min_dur)
+        spare_prev = max(0.0, prev["end"] - earliest_prev_end)
+
+        avail = min(spare_gap + spare_prev, spare_cur)
         if avail <= 0:
             return False
         borrow = min(need, avail)
@@ -598,13 +607,24 @@ def normalize_timing_netflix(
         if borrow > 0:
             cur["start"] -= borrow
             prev["end"] -= borrow
+
         dur_prev = prev["end"] - prev["start"]
         txt_prev = " ".join((w.get("word", "") or "").strip() for w in prev.get("words") or [])
         cps_prev = len(txt_prev) / max(0.001, dur_prev)
-        if dur_prev + tolerance < min_dur or cps_prev > cps_target:
+        # ensure we didn't trim past audio end or violate min dur/cps
+        if prev["end"] < prev_audio_end - tolerance or dur_prev + tolerance < min_dur or cps_prev > cps_target:
             cur["start"] = orig_start
             prev["end"] = orig_end_prev
             return False
+        # final safeguard: don't start before audio
+        if cur["start"] < cur_audio_start:
+            diff = cur_audio_start - cur["start"]
+            cur["start"] = cur_audio_start
+            prev["end"] -= diff
+            if prev["end"] < prev_audio_end - tolerance:
+                cur["start"] = orig_start
+                prev["end"] = orig_end_prev
+                return False
         return True
 
     # 7) duration repair (ensure ≥20f)
