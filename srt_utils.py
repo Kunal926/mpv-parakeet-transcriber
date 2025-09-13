@@ -23,8 +23,8 @@ def pack_into_two_line_blocks(
     events: List[Dict[str, Any]],
     max_chars_per_line: int = 40,
     cps_target: float = 20.0,
-    coalesce_gap_ms: int = 300,
-    two_line_threshold: float = 0.60,
+    coalesce_gap_ms: int = 360,
+    two_line_threshold: float = 0.55,
 ) -> List[Dict[str, Any]]:
     """Greedily merge consecutive events into a single 2-line block when:
       - the inter-event gap ≤ coalesce_gap_ms
@@ -50,7 +50,7 @@ def pack_into_two_line_blocks(
 
             nxt_words = events[j + 1].get("words") or []
             cand_words = blk_words + nxt_words
-            lines, used_words, overflow = shape_words_into_two_lines_balanced(
+            lines, _, overflow = shape_words_into_two_lines_balanced(
                 cand_words,
                 max_chars_per_line,
                 prefer_two_lines=True,
@@ -69,7 +69,7 @@ def pack_into_two_line_blocks(
             end = cand_end
             j += 1
 
-        lines, used_words, overflow = shape_words_into_two_lines_balanced(
+        lines, _, overflow = shape_words_into_two_lines_balanced(
             blk_words,
             max_chars_per_line,
             prefer_two_lines=True,
@@ -153,10 +153,10 @@ def _smart_join(a: str, b: str) -> str:
 
 def enforce_min_readable(
     events: list[dict],
-    min_dur: float = 0.90,
+    min_dur: float = 1.10,
     max_dur: float = 7.0,
     reflow: bool = True,
-    max_chars_per_line: int = 46,
+    max_chars_per_line: int = 40,
 ):
     """Extend or merge very short cues so they remain readable."""
     i = 0
@@ -212,15 +212,17 @@ def enforce_min_readable(
 
 def postprocess_segments(
     segments: List[Dict[str, Any]],
-    max_chars_per_line: int = 46,
+    max_chars_per_line: int = 40,
     max_lines: int = 2,
-    pause_ms: int = 220,
+    pause_ms: int = 240,
+    punct_pause_ms: int = 160,
+    comma_pause_ms: int = 120,
     cps_target: float = 20.0,
     snap_fps: float | None = None,
     use_spacy: bool = True,
-    min_readable: float = 0.9,
-    coalesce_gap_ms: int = 300,
-    two_line_threshold: float = 0.60,
+    min_readable: float = 1.1,
+    coalesce_gap_ms: int = 360,
+    two_line_threshold: float = 0.55,
 ) -> List[Dict[str, Any]]:
     """Segment words by pauses and phrases, shape lines, and quantize to frames."""
     # flatten word list (Parakeet provides accurate word timestamps)
@@ -240,6 +242,8 @@ def postprocess_segments(
         max_chars_per_line=max_chars_per_line,
         max_lines=max_lines,
         pause_ms=pause_ms,
+        punct_pause_ms=punct_pause_ms,
+        comma_pause_ms=comma_pause_ms,
         cps_target=cps_target,
         use_spacy=use_spacy,
         two_line_threshold=two_line_threshold,

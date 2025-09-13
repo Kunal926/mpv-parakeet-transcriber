@@ -76,7 +76,7 @@ def shape_words_into_two_lines_balanced(
     words,
     max_chars,
     prefer_two_lines: bool = True,
-    two_line_threshold: float = 0.72,
+    two_line_threshold: float = 0.55,
 ):
     """
     Input: list of word dicts with 'word','start','end'
@@ -177,15 +177,15 @@ def coalesce_short_neighbors(
 
 def segment_by_pause_and_phrase(
     words: List[Dict[str, Any]],
-    max_chars_per_line: int = 46,
+    max_chars_per_line: int = 40,
     max_lines: int = 2,
-    pause_ms: int = 220,
+    pause_ms: int = 240,
     punct_pause_ms: int = 160,
     comma_pause_ms: int = 120,
     cps_target: float = 20.0,
     use_spacy: bool = True,
     spacy_model: str = "en_core_web_sm",
-    two_line_threshold: float = 0.70,
+    two_line_threshold: float = 0.55,
 ) -> List[Dict[str, Any]]:
     """
     Build segments from ASR word-level tokens using pauses as the primary cue.
