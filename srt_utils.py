@@ -458,57 +458,225 @@ def normalize_timing_netflix(
         if a["end"] <= a["start"]:
             a["end"] = a["start"] + spf
         i += 1
-    # 5) final snap & monotonic (do NOT make starts late)
-    for i,ev in enumerate(events):
+    # 5) final snap & monotonic (safe clamp, never late beyond audio +2f)
+    for i, ev in enumerate(events):
         ev["start"] = _floor(ev["start"], fps)
-        ev["end"]   = _ceil (ev["end"], fps)
-        if i>0:
+        ev["end"] = _ceil(ev["end"], fps)
+        if i > 0:
             ws = ev.get("words") or []
             audio_start_floor = _floor(ws[0]["start"], fps) if ws else ev["start"]
-            lower = events[i-1]["end"] + min_gap_frames*spf + 1e-6
-            upper = max(lower, audio_start_floor + min_gap_frames*spf)
+            lower = events[i-1]["end"] + min_gap_frames*spf
+            upper = audio_start_floor + min_gap_frames*spf
+            if upper < lower:
+                upper = lower
             ev["start"] = min(max(ev["start"], lower), upper)
         if ev["end"] <= ev["start"]:
             ev["end"] = ev["start"] + spf
 
-    # 6) post-quantization consolidation
-    # Chain gaps <0.5s to 2-frame separations
+    # 6) post-quantization gap normalizer
     for i in range(len(events) - 1):
         gap = events[i+1]["start"] - events[i]["end"]
-        if gap < small_gap_floor_s:
-            desired = events[i+1]["start"] - min_gap_frames*spf
-            if desired > events[i]["end"]:
-                events[i]["end"] = desired
-    # Merge adjacent cues with tiny gaps when safe
+        gap_f = int(round(gap / spf))
+        if gap_f <= 0:
+            events[i]["end"] = events[i+1]["start"] - min_gap_frames*spf
+        elif is_24ish and 3 <= gap_f <= 11:
+            events[i]["end"] = events[i+1]["start"] - min_gap_frames*spf
+        if events[i]["end"] <= events[i]["start"]:
+            events[i]["end"] = events[i]["start"] + spf
+
+    # helpers for duration and CPS borrowing
+    def _borrow_from_right(idx: int, need: float, tolerance: float = 0.002) -> bool:
+        if idx + 1 >= len(events):
+            return False
+        cur, nxt = events[idx], events[idx + 1]
+        gap = nxt["start"] - cur["end"]
+        spare_gap = max(0.0, gap - min_gap_frames*spf)
+        spare_nxt = max(0.0, (nxt["end"] - nxt["start"]) - min_dur)
+        avail = spare_gap + spare_nxt
+        if avail <= 0:
+            return False
+        borrow = min(need, avail)
+        orig_end = cur["end"]
+        orig_start_nxt = nxt["start"]
+        take = min(spare_gap, borrow)
+        cur["end"] += take
+        nxt["start"] += take
+        borrow -= take
+        if borrow > 0:
+            cur["end"] += borrow
+            nxt["start"] += borrow
+        dur_nxt = nxt["end"] - nxt["start"]
+        txt_nxt = " ".join((w.get("word", "") or "").strip() for w in nxt.get("words") or [])
+        cps_nxt = len(txt_nxt) / max(0.001, dur_nxt)
+        if dur_nxt + tolerance < min_dur or cps_nxt > cps_target:
+            cur["end"] = orig_end
+            nxt["start"] = orig_start_nxt
+            return False
+        return True
+
+    def _borrow_from_left(idx: int, need: float, tolerance: float = 0.002) -> bool:
+        if idx == 0:
+            return False
+        prev, cur = events[idx - 1], events[idx]
+        gap = cur["start"] - prev["end"]
+        spare_gap = max(0.0, gap - min_gap_frames*spf)
+        spare_prev = max(0.0, (prev["end"] - prev["start"]) - min_dur)
+        avail = spare_gap + spare_prev
+        if avail <= 0:
+            return False
+        borrow = min(need, avail)
+        orig_start = cur["start"]
+        orig_end_prev = prev["end"]
+        take = min(spare_gap, borrow)
+        cur["start"] -= take
+        prev["end"] -= take
+        borrow -= take
+        if borrow > 0:
+            cur["start"] -= borrow
+            prev["end"] -= borrow
+        dur_prev = prev["end"] - prev["start"]
+        txt_prev = " ".join((w.get("word", "") or "").strip() for w in prev.get("words") or [])
+        cps_prev = len(txt_prev) / max(0.001, dur_prev)
+        if dur_prev + tolerance < min_dur or cps_prev > cps_target:
+            cur["start"] = orig_start
+            prev["end"] = orig_end_prev
+            return False
+        return True
+
+    # 7) duration repair (ensure ≥20f)
+    tolerance = 0.002
+    min_dur = 20 * spf
     i = 0
-    while i < len(events) - 1:
-        gap = events[i+1]["start"] - events[i]["end"]
-        if gap <= min_gap_frames*spf:
-            b_text = (events[i+1].get("text") or "").lstrip()
-            if not (b_text.startswith("-") or b_text.startswith("[")):
+    while i < len(events):
+        ev = events[i]
+        dur = ev["end"] - ev["start"]
+        if dur + tolerance < min_dur:
+            need = min_dur - dur
+            if _borrow_from_right(i, need):
+                continue
+            if _borrow_from_left(i, need):
+                continue
+            merged = False
+            if i + 1 < len(events):
                 ok, payload = _can_merge_pair(
-                    events[i], events[i+1],
-                    max_chars_per_line, cps_target,
-                    two_line_threshold, min_two_line_chars,
-                    max_block_duration_s, shaper,
+                    ev,
+                    events[i + 1],
+                    max_chars_per_line,
+                    cps_target,
+                    two_line_threshold,
+                    min_two_line_chars,
+                    max_block_duration_s,
+                    shaper,
                 )
-                dur = events[i+1]["end"] - events[i]["start"]
-                if ok and payload and dur >= 20*spf:
+                if ok and payload:
                     words, text = payload
-                    events[i]["text"] = text
-                    events[i]["end"] = events[i+1]["end"]
-                    if events[i].get("words") and events[i+1].get("words"):
-                        events[i]["words"] = events[i]["words"] + events[i+1]["words"]
-                    del events[i+1]
+                    ev["text"] = text
+                    ev["end"] = events[i + 1]["end"]
+                    if ev.get("words") and events[i + 1].get("words"):
+                        ev["words"] = ev["words"] + events[i + 1]["words"]
+                    del events[i + 1]
+                    merged = True
+            if not merged and i > 0:
+                ok, payload = _can_merge_pair(
+                    events[i - 1],
+                    ev,
+                    max_chars_per_line,
+                    cps_target,
+                    two_line_threshold,
+                    min_two_line_chars,
+                    max_block_duration_s,
+                    shaper,
+                )
+                if ok and payload:
+                    prev = events[i - 1]
+                    words, text = payload
+                    prev["text"] = text
+                    prev["end"] = ev["end"]
+                    if prev.get("words") and ev.get("words"):
+                        prev["words"] = prev["words"] + ev["words"]
+                    del events[i]
+                    i -= 1
                     continue
         i += 1
-    # Re-chain after merges in case new small gaps were introduced
-    for i in range(len(events) - 1):
-        gap = events[i+1]["start"] - events[i]["end"]
-        if gap < small_gap_floor_s:
-            desired = events[i+1]["start"] - min_gap_frames*spf
-            if desired > events[i]["end"]:
-                events[i]["end"] = desired
+
+    # 8) reading speed balance (borrow before merge)
+    i = 0
+    while i < len(events):
+        ev = events[i]
+        txt = " ".join((w.get("word", "") or "").strip() for w in ev.get("words") or [])
+        dur = ev["end"] - ev["start"]
+        cps = len(txt) / max(0.001, dur)
+        if cps > cps_target:
+            need = (len(txt) / cps_target) - dur
+            if _borrow_from_right(i, need):
+                continue
+            if _borrow_from_left(i, need):
+                continue
+            merged = False
+            if i + 1 < len(events):
+                ok, payload = _can_merge_pair(
+                    ev,
+                    events[i + 1],
+                    max_chars_per_line,
+                    cps_target,
+                    two_line_threshold,
+                    min_two_line_chars,
+                    max_block_duration_s,
+                    shaper,
+                )
+                if ok and payload:
+                    words, text = payload
+                    ev["text"] = text
+                    ev["end"] = events[i + 1]["end"]
+                    if ev.get("words") and events[i + 1].get("words"):
+                        ev["words"] = ev["words"] + events[i + 1]["words"]
+                    del events[i + 1]
+                    continue
+            if i > 0:
+                ok, payload = _can_merge_pair(
+                    events[i - 1],
+                    ev,
+                    max_chars_per_line,
+                    cps_target,
+                    two_line_threshold,
+                    min_two_line_chars,
+                    max_block_duration_s,
+                    shaper,
+                )
+                if ok and payload:
+                    prev = events[i - 1]
+                    words, text = payload
+                    prev["text"] = text
+                    prev["end"] = ev["end"]
+                    if prev.get("words") and ev.get("words"):
+                        prev["words"] = prev["words"] + ev["words"]
+                    del events[i]
+                    i -= 1
+                    continue
+        i += 1
+
+    # 9) final snap & validate
+    for ev in events:
+        ev["start"] = _floor(ev["start"], fps)
+        ev["end"] = _ceil(ev["end"], fps)
+        if ev["end"] <= ev["start"]:
+            ev["end"] = ev["start"] + spf
+
+    prev_end = None
+    for ev in events:
+        lines = (ev.get("text") or "").split("\n")
+        assert len(lines) <= 2, "more than 2 lines"
+        if lines:
+            assert max(len(line) for line in lines) <= max_chars_per_line, "CPL > limit"
+        dur = ev["end"] - ev["start"]
+        assert dur + tolerance >= min_dur, "duration <20f"
+        txt = "".join(lines)
+        cps = len(txt) / max(0.001, dur)
+        assert cps <= cps_target + 1e-6, "cps > limit"
+        if prev_end is not None:
+            gap = ev["start"] - prev_end
+            assert gap >= min_gap_frames*spf - 1e-6, "gap <2f"
+        prev_end = ev["end"]
     return events
 
 # ---------- top-level postprocess ----------
