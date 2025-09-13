@@ -27,6 +27,39 @@ def write_srt(events: List[Dict[str,Any]], out_path: str) -> None:
         for i, ev in enumerate(events, 1):
             f.write(f"{i}\n{srt_ts(ev['start'])} --> {srt_ts(ev['end'])}\n{ev['text'].strip()}\n\n")
 
+# helper: can two cues be safely merged into a single 2-line block?
+def _can_merge_pair(
+    a: Dict[str,Any],
+    b: Dict[str,Any],
+    max_chars_per_line: int,
+    cps_target: float,
+    two_line_threshold: float = 0.60,
+    min_two_line_chars: int = 24,
+    max_block_duration_s: float | None = None,
+    shaper=shape_words_into_two_lines_balanced,
+):
+    lw, rw = (a.get("words") or []), (b.get("words") or [])
+    if not lw or not rw:
+        return False, None
+    cand = lw + rw
+    lines, used, overflow = shaper(
+        cand,
+        max_chars=max_chars_per_line,
+        prefer_two_lines=True,
+        two_line_threshold=two_line_threshold,
+        min_two_line_chars=min_two_line_chars,
+    )
+    if overflow:
+        return False, None
+    txt = " ".join((w.get("word","") or "").strip() for w in cand)
+    dur = b["end"] - a["start"]
+    cps = len(txt) / max(0.001, dur)
+    if cps > cps_target:
+        return False, None
+    if max_block_duration_s is not None and dur > max_block_duration_s:
+        return False, None
+    return True, (cand, "\n".join(lines[:2]))
+
 # ---------- 2-line packer: merge across short breaths if it fits & cps ok ----------
 def pack_into_two_line_blocks(
     events: List[Dict[str, Any]],
@@ -278,27 +311,6 @@ def normalize_timing_netflix(
     if not events: return events
     spf=_spf(fps)
     is_24ish = abs(fps-24.0)<0.2 or abs(fps-23.976)<0.2
-
-    def _can_merge_pair(a, b, _shaper=shaper):
-        lw, rw = (a.get("words") or []), (b.get("words") or [])
-        if not lw or not rw:
-            return (False, None)
-        cand = lw + rw
-        lines, used, overflow = _shaper(
-            cand,
-            max_chars=max_chars_per_line,
-            prefer_two_lines=True,
-            two_line_threshold=two_line_threshold,
-            min_two_line_chars=min_two_line_chars,
-        )
-        if overflow:
-            return (False, None)
-        txt = " ".join((w.get("word","") or "").strip() for w in cand)
-        dur = b["end"] - a["start"]
-        cps = len(txt) / max(0.001, dur)
-        if cps > cps_target or dur > max_block_duration_s:
-            return (False, None)
-        return (True, (cand, "\n".join(lines[:2])))
     # 1) Start on first audio frame; End on last audio frame (we'll linger later if safe)
     for ev in events:
         ws = ev.get("words") or []
@@ -307,15 +319,61 @@ def normalize_timing_netflix(
             ev["end"]   = _ceil (ws[-1]["end"], fps)
         if ev["end"] <= ev["start"]:
             ev["end"] = ev["start"] + spf
-    # 2) Reserve 20 frames for 1–2-word cues; extend longer slightly when space allows
-    for i,ev in enumerate(events):
-        ws = ev.get("words") or []
-        need = 20*spf if len(ws)<=2 else 0.0
-        if need and (ev["end"]-ev["start"]) < need:
-            if i+1<len(events):
-                room = max(0.0, events[i+1]["start"] - ev["end"])
-                take = min(need - (ev["end"]-ev["start"]), room)
-                if take>0: ev["end"] += take
+    # 2) Enforce 20-frame minimum duration by extending or merging
+    i = 0
+    min_dur = 20*spf
+    while i < len(events):
+        ev = events[i]
+        dur = ev["end"] - ev["start"]
+        if dur < min_dur:
+            # Try merge forward if gap small and mergeable
+            if i+1 < len(events):
+                gap_to_next = events[i+1]["start"] - ev["end"]
+                if gap_to_next <= small_gap_floor_s:
+                    ok, payload = _can_merge_pair(
+                        ev, events[i+1],
+                        max_chars_per_line, cps_target,
+                        two_line_threshold, min_two_line_chars,
+                        max_block_duration_s, shaper,
+                    )
+                    if ok and payload:
+                        words, text = payload
+                        ev["text"] = text
+                        ev["end"] = events[i+1]["end"]
+                        if ev.get("words") and events[i+1].get("words"):
+                            ev["words"] = ev["words"] + events[i+1]["words"]
+                        del events[i+1]
+                        dur = ev["end"] - ev["start"]
+                        # re-evaluate same index after merge
+                        continue
+            # Extend towards next cue if room
+            if i+1 < len(events):
+                max_end = events[i+1]["start"] - min_gap_frames*spf
+                target = min(ev["start"] + min_dur, max_end)
+                if target > ev["end"]:
+                    ev["end"] = target
+                    dur = ev["end"] - ev["start"]
+            # If still short, try merge backward
+            if dur < min_dur and i > 0:
+                gap_to_prev = ev["start"] - events[i-1]["end"]
+                if gap_to_prev <= small_gap_floor_s:
+                    ok, payload = _can_merge_pair(
+                        events[i-1], ev,
+                        max_chars_per_line, cps_target,
+                        two_line_threshold, min_two_line_chars,
+                        max_block_duration_s, shaper,
+                    )
+                    if ok and payload:
+                        prev = events[i-1]
+                        words, text = payload
+                        prev["text"] = text
+                        prev["end"] = ev["end"]
+                        if prev.get("words") and ev.get("words"):
+                            prev["words"] = prev["words"] + ev["words"]
+                        del events[i]
+                        i -= 1
+                        continue
+        i += 1
     # 3) Linger +0.5s ONLY when safe (i.e., there is NOT an immediate next subtitle)
     #    Safe = next.start - last_audio_end >= 0.5s. Otherwise don't linger here.
     for i,ev in enumerate(events):
@@ -357,7 +415,12 @@ def normalize_timing_netflix(
 
         if gap_f < min_gap_frames:
             # Borrow time first (merge) if it yields a valid 2-line block within cps AND cap
-            ok, payload = _can_merge_pair(a, b)
+            ok, payload = _can_merge_pair(
+                a, b,
+                max_chars_per_line, cps_target,
+                two_line_threshold, min_two_line_chars,
+                max_block_duration_s, shaper,
+            )
             if ok and payload:
                 words, text = payload
                 a["text"] = text
@@ -395,20 +458,57 @@ def normalize_timing_netflix(
         if a["end"] <= a["start"]:
             a["end"] = a["start"] + spf
         i += 1
-    # 5) final snap & monotonic (do NOT make starts late; also never overlap)
+    # 5) final snap & monotonic (do NOT make starts late)
     for i,ev in enumerate(events):
         ev["start"] = _floor(ev["start"], fps)
         ev["end"]   = _ceil (ev["end"], fps)
         if i>0:
-            min_allowed = events[i-1]["end"] + min_gap_frames*spf
             ws = ev.get("words") or []
             audio_start_floor = _floor(ws[0]["start"], fps) if ws else ev["start"]
-            if ev["start"] < events[i-1]["end"]:
-                ev["start"] = min(max(events[i-1]["end"], ev["start"]), audio_start_floor + min_gap_frames*spf)
-            elif ev["start"] < min_allowed and min_allowed <= audio_start_floor + min_gap_frames*spf:
-                ev["start"] = min_allowed
+            lower = events[i-1]["end"] + min_gap_frames*spf + 1e-6
+            upper = max(lower, audio_start_floor + min_gap_frames*spf)
+            ev["start"] = min(max(ev["start"], lower), upper)
         if ev["end"] <= ev["start"]:
             ev["end"] = ev["start"] + spf
+
+    # 6) post-quantization consolidation
+    # Chain gaps <0.5s to 2-frame separations
+    for i in range(len(events) - 1):
+        gap = events[i+1]["start"] - events[i]["end"]
+        if gap < small_gap_floor_s:
+            desired = events[i+1]["start"] - min_gap_frames*spf
+            if desired > events[i]["end"]:
+                events[i]["end"] = desired
+    # Merge adjacent cues with tiny gaps when safe
+    i = 0
+    while i < len(events) - 1:
+        gap = events[i+1]["start"] - events[i]["end"]
+        if gap <= min_gap_frames*spf:
+            b_text = (events[i+1].get("text") or "").lstrip()
+            if not (b_text.startswith("-") or b_text.startswith("[")):
+                ok, payload = _can_merge_pair(
+                    events[i], events[i+1],
+                    max_chars_per_line, cps_target,
+                    two_line_threshold, min_two_line_chars,
+                    max_block_duration_s, shaper,
+                )
+                dur = events[i+1]["end"] - events[i]["start"]
+                if ok and payload and dur >= 20*spf:
+                    words, text = payload
+                    events[i]["text"] = text
+                    events[i]["end"] = events[i+1]["end"]
+                    if events[i].get("words") and events[i+1].get("words"):
+                        events[i]["words"] = events[i]["words"] + events[i+1]["words"]
+                    del events[i+1]
+                    continue
+        i += 1
+    # Re-chain after merges in case new small gaps were introduced
+    for i in range(len(events) - 1):
+        gap = events[i+1]["start"] - events[i]["end"]
+        if gap < small_gap_floor_s:
+            desired = events[i+1]["start"] - min_gap_frames*spf
+            if desired > events[i]["end"]:
+                events[i]["end"] = desired
     return events
 
 # ---------- top-level postprocess ----------
