@@ -48,13 +48,16 @@ def shape_words_into_two_lines_balanced(
     words: List[Dict[str,Any]],
     max_chars: int,
     prefer_two_lines: bool = True,
-    two_line_threshold: float = 0.70
+    two_line_threshold: float = 0.70,
+    min_two_line_chars: int = 24,
 ) -> Tuple[List[str], int, List[Dict[str,Any]]]:
     toks = [_wtext(w) for w in words]
     if not toks:
         return [""], 0, []
     total = " ".join(toks)
-    want_two = prefer_two_lines and (len(total) >= int(two_line_threshold*max_chars))
+    want_two = prefer_two_lines and (
+        len(total) >= max(int(two_line_threshold*max_chars), min_two_line_chars)
+    )
     # Try all boundaries between words
     best_cut, best_score = None, -1e9
     for cut in range(1, len(toks)):
@@ -69,8 +72,9 @@ def shape_words_into_two_lines_balanced(
         score -= abs(L - R) * 0.8
         if R >= L: score += 1.0
         else:      score -= 1.0
-        # avoid 1–2 words on top line
+        # avoid 1–2 words on top or bottom line
         if len(left.split()) <= 2: score -= 6.0
+        if len(right.split()) <= 2: score -= 6.0
         # linguistic: after punctuation / before conj/prep
         if toks[cut-1][-1:] in HARD_PUNCT + SOFT_PUNCT: score += 3.0
         if cur in CONJ: score += 2.0
@@ -109,10 +113,11 @@ def segment_by_pause_and_phrase(
     pause_ms: int = 240,
     punct_pause_ms: int = 160,
     comma_pause_ms: int = 120,
-    cps_target: float = 20.0,
+    cps_target: float = 19.0,
     use_spacy: bool = True,
     spacy_model: str = "en_core_web_sm",
     two_line_threshold: float = 0.70,
+    min_two_line_chars: int = 24,
 ) -> List[Dict[str,Any]]:
     nlp = _load_spacy(spacy_model) if use_spacy else None
     out, buf, buf_start = [], [], None
@@ -168,11 +173,13 @@ def segment_by_pause_and_phrase(
         words_list = seg.get("words") or []
         if not words_list:
             shaped.append(seg); continue
-        while words_list:
-            lines, used, overflow = shape_words_into_two_lines_balanced(
-                words_list, max_chars_per_line,
-                prefer_two_lines=True, two_line_threshold=two_line_threshold
-            )
+            while words_list:
+                lines, used, overflow = shape_words_into_two_lines_balanced(
+                    words_list, max_chars_per_line,
+                    prefer_two_lines=True,
+                    two_line_threshold=two_line_threshold,
+                    min_two_line_chars=min_two_line_chars,
+                )
             used_block = words_list[:used]
             shaped.append({
                 "start": float(used_block[0]["start"]),

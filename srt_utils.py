@@ -27,11 +27,42 @@ def write_srt(events: List[Dict[str,Any]], out_path: str) -> None:
         for i, ev in enumerate(events, 1):
             f.write(f"{i}\n{srt_ts(ev['start'])} --> {srt_ts(ev['end'])}\n{ev['text'].strip()}\n\n")
 
+# Helper used by timing normalizer to test calm merges for gap chaining
+def _can_merge_pair(
+    a: Dict[str, Any],
+    b: Dict[str, Any],
+    max_chars_per_line: int,
+    cps_target: float,
+    two_line_threshold: float = 0.60,
+    min_two_line_chars: int = 24,
+):
+    from segmenter import shape_words_into_two_lines_balanced
+
+    lw, rw = a.get("words") or [], b.get("words") or []
+    if not lw or not rw:
+        return False, None
+    cand = lw + rw
+    lines, used, overflow = shape_words_into_two_lines_balanced(
+        cand,
+        max_chars=max_chars_per_line,
+        prefer_two_lines=True,
+        two_line_threshold=two_line_threshold,
+        min_two_line_chars=min_two_line_chars,
+    )
+    if overflow:
+        return False, None
+    txt = " ".join((w.get("word", "") or "").strip() for w in cand)
+    dur = b["end"] - a["start"]
+    cps = len(txt) / max(0.001, dur)
+    if cps > cps_target:
+        return False, None
+    return True, (cand, "\n".join(lines[:2]))
+
 # ---------- 2-line packer: merge across short breaths if it fits & cps ok ----------
 def pack_into_two_line_blocks(
     events: List[Dict[str, Any]],
     max_chars_per_line: int = 42,
-    cps_target: float = 20.0,
+    cps_target: float = 19.0,
     coalesce_gap_ms: int = 360,
     two_line_threshold: float = 0.60,
 ) -> List[Dict[str, Any]]:
@@ -51,8 +82,11 @@ def pack_into_two_line_blocks(
             cw = (events[j+1].get("words") or [])
             cand = bw + cw
             lines, used, overflow = shape_words_into_two_lines_balanced(
-                cand, max_chars_per_line,
-                prefer_two_lines=True, two_line_threshold=two_line_threshold
+                cand,
+                max_chars_per_line,
+                prefer_two_lines=True,
+                two_line_threshold=two_line_threshold,
+                min_two_line_chars=24,
             )
             if overflow: break
             txt = " ".join((w.get("word","") or "").strip() for w in cand)
@@ -60,7 +94,11 @@ def pack_into_two_line_blocks(
             if cps > cps_target: break
             bw = cand; end = float(events[j+1]["end"]); j += 1
         lines, used, overflow = shape_words_into_two_lines_balanced(
-            bw, max_chars_per_line, prefer_two_lines=True, two_line_threshold=two_line_threshold
+            bw,
+            max_chars_per_line,
+            prefer_two_lines=True,
+            two_line_threshold=two_line_threshold,
+            min_two_line_chars=24,
         )
         used_block = bw[:used]
         out.append({
@@ -75,8 +113,8 @@ def pack_into_two_line_blocks(
 # ---------- orphan-aware min-readable (merges tiny one/two-word singles) ----------
 def enforce_min_readable_v2(
     events: List[Dict[str,Any]],
-    min_dur: float = 1.10,
-    cps_target: float = 20.0,
+    min_dur: float = 1.20,
+    cps_target: float = 19.0,
     max_chars_per_line: int = 42,
     orphan_words: int = 2,
     orphan_chars: int = 12,
@@ -104,7 +142,11 @@ def enforce_min_readable_v2(
             if not lw or not rw: return -1e9, None
             cand = lw + rw
             lines, used, overflow = shape_words_into_two_lines_balanced(
-                cand, max_chars_per_line, prefer_two_lines=True, two_line_threshold=0.55
+                cand,
+                max_chars_per_line,
+                prefer_two_lines=True,
+                two_line_threshold=0.55,
+                min_two_line_chars=24,
             )
             if overflow: return -1e9, None
             txt = " ".join((w.get("word","") or "").strip() for w in cand)
@@ -136,22 +178,40 @@ def enforce_min_readable_v2(
                 if e.get("words") and nxt.get("words"):
                     e["words"] = e["words"] + nxt["words"]
                 del events[i+1]; continue
-        # last resort: merge orphan forward/back
+        # last resort: merge orphan forward/back (re-shape; never raw concat)
         if is_orphan:
-            if i+1 < len(events):
+            from segmenter import shape_words_into_two_lines_balanced
+            if i + 1 < len(events):
                 nxt = events[i+1]
-                e["text"] = e["text"].rstrip()+" "+nxt["text"].lstrip()
-                e["end"]  = nxt["end"]
-                if e.get("words") and nxt.get("words"):
-                    e["words"] = e["words"] + nxt["words"]
-                del events[i+1]; continue
-            elif i>0:
-                prev = events[i-1]
-                prev["text"] = prev["text"].rstrip()+" "+e["text"].lstrip()
-                prev["end"]  = e["end"]
-                if prev.get("words") and e.get("words"):
-                    prev["words"] = prev["words"] + e["words"]
-                del events[i]; i -= 1; continue
+                cand_words = (e.get("words") or []) + (nxt.get("words") or [])
+                lines, used, overflow = shape_words_into_two_lines_balanced(
+                    cand_words,
+                    max_chars_per_line,
+                    prefer_two_lines=True,
+                    two_line_threshold=0.60,
+                    min_two_line_chars=24,
+                )
+                e["text"]  = "\n".join(lines[:2])
+                e["end"]   = nxt["end"]
+                e["words"] = cand_words[:used]
+                del events[i+1]
+                continue
+            elif i > 0:
+                prv = events[i-1]
+                cand_words = (prv.get("words") or []) + (e.get("words") or [])
+                lines, used, overflow = shape_words_into_two_lines_balanced(
+                    cand_words,
+                    max_chars_per_line,
+                    prefer_two_lines=True,
+                    two_line_threshold=0.60,
+                    min_two_line_chars=24,
+                )
+                prv["text"]  = "\n".join(lines[:2])
+                prv["end"]   = e["end"]
+                prv["words"] = cand_words[:used]
+                del events[i]
+                i -= 1
+                continue
         i += 1
     return events
 
@@ -169,6 +229,10 @@ def normalize_timing_netflix(
     min_gap_frames: int = 2,
     close_range_frames: Tuple[int,int] = (3,11),  # 24/23.976 only
     small_gap_floor_s: float = 0.5,
+    max_chars_per_line: int = 42,
+    cps_target: float = 19.0,
+    two_line_threshold: float = 0.60,
+    min_two_line_chars: int = 24,
 ) -> List[Dict[str,Any]]:
     if not events: return events
     spf=_spf(fps)
@@ -199,8 +263,10 @@ def normalize_timing_netflix(
         if i+1 < len(events):
             gap_to_next = events[i+1]["start"] - last_audio_end
             if gap_to_next >= small_gap_floor_s:
-                target = min(last_audio_end + linger_after_audio_ms/1000.0,
-                             events[i+1]["start"] - min_gap_frames*spf)
+                target = min(
+                    last_audio_end + linger_after_audio_ms/1000.0,
+                    events[i+1]["start"] - min_gap_frames*spf,
+                )
                 if target > ev["end"]:
                     ev["end"] = target
         else:
@@ -209,23 +275,70 @@ def normalize_timing_netflix(
             if target > ev["end"]:
                 ev["end"] = target
     # 4) Chaining / closing gaps
-    i=0
-    while i < len(events)-1:
+    i = 0
+    while i < len(events) - 1:
         a, b = events[i], events[i+1]
+        # Snap frame edges for measuring gap
         a["end"] = _ceil(a["end"], fps)
         b["start"] = _floor(b["start"], fps)
+
+        spf = _spf(fps)
         gap_s = b["start"] - a["end"]
         gap_f = int(round(gap_s / spf))
+
+        # Audio boundaries
+        a_ws = a.get("words") or []
+        a_audio_end = _ceil(a_ws[-1]["end"], fps) if a_ws else a["end"]
+        max_linger = a_audio_end + linger_after_audio_ms/1000.0
+
+        # If gap < 2f:
         if gap_f < min_gap_frames:
-            # pull 'a' back so gap is ≥2 frames
-            a["end"] = b["start"] - min_gap_frames*spf
-        elif is_24ish and (3 <= gap_f <= 11):
-            # close 3–11f to 2f
-            a["end"] = b["start"] - min_gap_frames*spf
+            # Try borrowing time by merging into a calm 2-line block
+            ok, payload = _can_merge_pair(
+                a,
+                b,
+                max_chars_per_line=max_chars_per_line,
+                cps_target=cps_target,
+                two_line_threshold=two_line_threshold,
+                min_two_line_chars=min_two_line_chars,
+            )
+            if ok and payload:
+                words, text = payload
+                a["text"] = text
+                a["end"] = b["end"]
+                if a.get("words") and b.get("words"):
+                    a["words"] = a["words"] + b["words"]
+                del events[i+1]
+                # do not advance i; new a may chain with the next b
+                continue
+
+            # Otherwise, chain only if it does NOT cut into A audio
+            desired = b["start"] - min_gap_frames * spf
+            desired = min(desired, max_linger)
+            if desired >= a_audio_end:
+                a["end"] = desired
+            else:
+                # Preserve A audio: accept <2f gap (do NOT delay B in)
+                a["end"] = max(a["end"], a_audio_end)
+
+            if a["end"] <= a["start"]:
+                a["end"] = a["start"] + spf
+
         else:
-            # general rule: either 2f or ≥0.5s
-            if gap_s < small_gap_floor_s:
-                a["end"] = b["start"] - min_gap_frames*spf
+            # 24ish: close specified range to 2f, but still never cut earlier than audio
+            is_24ish = abs(fps - 24.0) < 0.2 or abs(fps - 23.976) < 0.2
+            low, high = close_range_frames
+            if is_24ish and (low <= gap_f <= high):
+                desired = b["start"] - min_gap_frames * spf
+                desired = min(desired, max_linger)
+                a["end"] = max(a_audio_end, desired)
+            else:
+                # general rule: either 2f or ≥0.5s
+                if gap_s < small_gap_floor_s:
+                    desired = b["start"] - min_gap_frames * spf
+                    desired = min(desired, max_linger)
+                    a["end"] = max(a_audio_end, desired)
+
         # never invert
         if a["end"] <= a["start"]:
             a["end"] = a["start"] + spf
@@ -248,12 +361,13 @@ def postprocess_segments(
     pause_ms: int = 240,
     punct_pause_ms: int = 160,
     comma_pause_ms: int = 120,
-    cps_target: float = 20.0,
+    cps_target: float = 19.0,
     snap_fps: float | None = None,
     use_spacy: bool = True,
     coalesce_gap_ms: int = 360,
     two_line_threshold: float = 0.60,
-    min_readable: float = 1.10,
+    min_readable: float = 1.20,
+    min_two_line_chars: int = 24,
 ) -> List[Dict[str,Any]]:
     # Flatten word list from raw ASR segments
     words: List[Dict[str,Any]] = []
@@ -272,6 +386,7 @@ def postprocess_segments(
         cps_target=cps_target,
         use_spacy=use_spacy,
         two_line_threshold=two_line_threshold,
+        min_two_line_chars=min_two_line_chars,
     )
     # Merge small neighbors into calm 2-line blocks
     events = pack_into_two_line_blocks(
@@ -280,6 +395,7 @@ def postprocess_segments(
         cps_target=cps_target,
         coalesce_gap_ms=coalesce_gap_ms,
         two_line_threshold=two_line_threshold,
+        min_two_line_chars=min_two_line_chars,
     )
     # Eliminate quick singles (orphans) and short flashes
     events = enforce_min_readable_v2(
@@ -297,5 +413,9 @@ def postprocess_segments(
             min_gap_frames=2,
             close_range_frames=(3,11),
             small_gap_floor_s=0.5,
+            max_chars_per_line=max_chars_per_line,
+            cps_target=cps_target,
+            two_line_threshold=two_line_threshold,
+            min_two_line_chars=min_two_line_chars,
         )
     return events

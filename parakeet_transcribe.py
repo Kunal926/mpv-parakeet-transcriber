@@ -200,7 +200,7 @@ def main():
                         help="Pause after sentence-ending punctuation to allow a split")
     parser.add_argument("--comma_pause_ms", type=int, default=120,
                         help="Pause after commas to allow a split")
-    parser.add_argument("--cps", type=float, default=20.0, help="Target characters-per-second reading speed")
+    parser.add_argument("--cps", type=float, default=19.0, help="Target characters-per-second reading speed")
     parser.add_argument("--no_spacy", action="store_true", help="Disable spaCy hints even if available")
     parser.add_argument("--coalesce_gap_ms", type=int, default=360,
                         help="Merge consecutive events if gap ≤ this and 2-line fit/cps ok")
@@ -209,7 +209,7 @@ def main():
     parser.add_argument(
         "--min_readable_ms",
         type=int,
-        default=1100,
+        default=1200,
         help="Soft minimum on-screen time per cue; short cues extend/merge",
     )
     args = parser.parse_args()
