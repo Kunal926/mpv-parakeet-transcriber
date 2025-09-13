@@ -784,6 +784,56 @@ def normalize_timing_netflix(
         prev_end = ev["end"]
     return events
 
+
+def rebalance_cps_borrow_time(
+    events: List[Dict[str, Any]],
+    fps: float = 23.976,
+    cps_target: float = 20.0,
+    min_gap_frames: int = 2,
+    min_dur_frames: int = 20,
+) -> List[Dict[str, Any]]:
+    spf = 1.0 / fps
+    min_gap = min_gap_frames * spf
+    min_dur = min_dur_frames * spf
+
+    def text_len(e: Dict[str, Any]) -> int:
+        return len(e.get("text", "").replace("\n", " ").strip())
+
+    i = 0
+    while i < len(events) - 1:
+        e = events[i]
+        nx = events[i + 1]
+        dur = e["end"] - e["start"]
+        chars = text_len(e)
+        need = max(0.0, chars / cps_target - dur)
+        if need <= 1e-3:
+            i += 1
+            continue
+
+        right_gap = nx["start"] - e["end"]
+        room_gap = max(0.0, right_gap - min_gap)
+
+        nx_dur = nx["end"] - nx["start"]
+        nx_chars = text_len(nx)
+        nx_min = max(min_dur, nx_chars / cps_target)
+        room_nx = max(0.0, nx_dur - nx_min)
+
+        give = min(need, room_gap + room_nx)
+        if give > 0:
+            take_gap = min(give, room_gap)
+            e["end"] += take_gap
+            nx["start"] += take_gap
+            give -= take_gap
+
+            if give > 0:
+                nx["start"] += give
+
+            nx["start"] = max(nx["start"], e["end"] + min_gap - 1e-9)
+            continue
+        i += 1
+    return events
+
+
 # ---------- top-level postprocess ----------
 def postprocess_segments(
     segments: List[Dict[str,Any]],
@@ -882,5 +932,27 @@ def postprocess_segments(
                            validate=not timed_out)
         if _e is not None:
             events = _e
+            events = rebalance_cps_borrow_time(
+                events,
+                fps=snap_fps,
+                cps_target=cps_target,
+                min_gap_frames=2,
+                min_dur_frames=20,
+            )
+            events = normalize_timing_netflix(
+                events,
+                fps=snap_fps,
+                linger_after_audio_ms=500,
+                min_gap_frames=2,
+                close_range_frames=(3,11),
+                small_gap_floor_s=0.5,
+                max_chars_per_line=max_chars_per_line,
+                cps_target=cps_target,
+                two_line_threshold=two_line_threshold,
+                min_two_line_chars=min_two_line_chars,
+                shaper=shape_words_into_two_lines_balanced,
+                max_block_duration_s=max_block_duration_s,
+                validate=False,
+            )
         _trace(f"netflix out: {len(events)}")
     return events
