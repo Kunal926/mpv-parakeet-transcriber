@@ -35,6 +35,7 @@ def pack_into_two_line_blocks(
     coalesce_gap_ms: int = 360,
     two_line_threshold: float = 0.60,
     min_two_line_chars: int = 24,
+    max_block_duration_s: float = 7.0,
     shaper=shape_words_into_two_lines_balanced,
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str,Any]] = []
@@ -50,6 +51,10 @@ def pack_into_two_line_blocks(
         while j+1 < len(events):
             gap_ms = int(round((events[j+1]["start"] - events[j]["end"]) * 1000))
             if gap_ms > coalesce_gap_ms: break
+            # Do not let the candidate block grow beyond max duration
+            cand_end = float(events[j+1]["end"])
+            if (cand_end - start) > max_block_duration_s:
+                break
             cw = (events[j+1].get("words") or [])
             cand = bw + cw
             lines, used, overflow = shaper(
@@ -88,6 +93,7 @@ def enforce_min_readable_v2(
     cps_target: float = 20.0,
     max_chars_per_line: int = 42,
     min_two_line_chars: int = 24,
+    max_merge_gap_ms: int = 360,
     orphan_words: int = 2,
     orphan_chars: int = 12,
     shaper=shape_words_into_two_lines_balanced,
@@ -113,6 +119,10 @@ def enforce_min_readable_v2(
         def score_merge(left, right, _shaper=shaper):
             lw, rw = (left.get("words") or []), (right.get("words") or [])
             if not lw or not rw: return -1e9, None
+            # Respect gap limit for borrowing/merge
+            gap_ms = int(round((right["start"] - left["end"]) * 1000))
+            if gap_ms > max_merge_gap_ms:
+                return -1e9, None
             cand = lw + rw
             lines, used, overflow = _shaper(
                 cand,
@@ -121,6 +131,7 @@ def enforce_min_readable_v2(
                 two_line_threshold=0.55,
                 min_two_line_chars=min_two_line_chars,
             )
+            # If overflow, refuse this merge in the scoring path (we'll handle overflow in explicit merges)
             if overflow: return -1e9, None
             txt = " ".join((w.get("word","") or "").strip() for w in cand)
             cps = len(txt) / max(0.001, (right["end"] - left["start"]))
@@ -154,36 +165,92 @@ def enforce_min_readable_v2(
         # last resort: merge orphan forward/back (re-shape; never raw concat)
         if is_orphan:
             if i + 1 < len(events):
-                nxt = events[i + 1]
-                cand_words = (e.get("words") or []) + (nxt.get("words") or [])
-                lines, used, overflow = shaper(
-                    cand_words,
-                    max_chars=max_chars_per_line,
-                    prefer_two_lines=True,
-                    two_line_threshold=0.60,
-                    min_two_line_chars=min_two_line_chars,
-                )
-                e["text"] = "\n".join(lines[:2])
-                e["end"] = nxt["end"]
-                e["words"] = cand_words[:used]
-                del events[i + 1]
-                continue
+                nxt = events[i+1]
+                # Only merge forward if the gap is small
+                gap_ms = int(round((nxt["start"] - e["end"]) * 1000))
+                if gap_ms <= max_merge_gap_ms:
+                    cand_words = (e.get("words") or []) + (nxt.get("words") or [])
+                    lines, used, overflow = shaper(
+                        cand_words,
+                        max_chars=max_chars_per_line,
+                        prefer_two_lines=True,
+                        two_line_threshold=0.60,
+                        min_two_line_chars=min_two_line_chars,
+                    )
+                    used_block = cand_words[:used]
+                    e["text"]  = "\n".join(lines[:2])
+                    e["end"]   = used_block[-1]["end"]
+                    e["words"] = used_block
+                    # If overflow exists, emit it as its own event(s)
+                    k = i+1
+                    cur_over = overflow
+                    while cur_over:
+                        lines2, used2, over2 = shaper(
+                            cur_over,
+                            max_chars=max_chars_per_line,
+                            prefer_two_lines=True,
+                            two_line_threshold=0.60,
+                            min_two_line_chars=min_two_line_chars,
+                        )
+                        used_block2 = cur_over[:used2]
+                        events.insert(k, {
+                            "start": float(used_block2[0]["start"]),
+                            "end":   float(used_block2[-1]["end"]),
+                            "text":  "\n".join(lines2[:2]),
+                            "words": used_block2,
+                        })
+                        k += 1
+                        cur_over = over2
+                    # Remove the original neighbor we merged into
+                    del events[k]
+                    continue
+                # else: cannot merge across long gap; fall through
             elif i > 0:
-                prv = events[i - 1]
-                cand_words = (prv.get("words") or []) + (e.get("words") or [])
-                lines, used, overflow = shaper(
-                    cand_words,
-                    max_chars=max_chars_per_line,
-                    prefer_two_lines=True,
-                    two_line_threshold=0.60,
-                    min_two_line_chars=min_two_line_chars,
-                )
-                prv["text"] = "\n".join(lines[:2])
-                prv["end"] = e["end"]
-                prv["words"] = cand_words[:used]
-                del events[i]
-                i -= 1
-                continue
+                prev = events[i-1]
+                # Only merge backward if the gap is small
+                gap_ms = int(round((e["start"] - prev["end"]) * 1000))
+                if gap_ms <= max_merge_gap_ms:
+                    cand_words = (prev.get("words") or []) + (e.get("words") or [])
+                    lines, used, overflow = shaper(
+                        cand_words,
+                        max_chars=max_chars_per_line,
+                        prefer_two_lines=True,
+                        two_line_threshold=0.60,
+                        min_two_line_chars=min_two_line_chars,
+                    )
+                    used_block = cand_words[:used]
+                    prev["text"]  = "\n".join(lines[:2])
+                    prev["end"]   = used_block[-1]["end"]
+                    prev["words"] = used_block
+                    # If overflow exists, emit it as its own event(s)
+                    k = i
+                    cur_over = overflow
+                    while cur_over:
+                        lines2, used2, over2 = shaper(
+                            cur_over,
+                            max_chars=max_chars_per_line,
+                            prefer_two_lines=True,
+                            two_line_threshold=0.60,
+                            min_two_line_chars=min_two_line_chars,
+                        )
+                        used_block2 = cur_over[:used2]
+                        events.insert(k, {
+                            "start": float(used_block2[0]["start"]),
+                            "end":   float(used_block2[-1]["end"]),
+                            "text":  "\n".join(lines2[:2]),
+                            "words": used_block2,
+                        })
+                        k += 1
+                        cur_over = over2
+                    # Remove the orphan we merged
+                    del events[k]
+                    i -= 1
+                    continue
+                # else: cannot merge across long gap; fall through
+            # If we get here, we couldn't merge (gap too big) — we already tried extending forward in step 1.
+            # Leave as-is; the normalizer will apply safe +0.5s linger if applicable.
+            i += 1
+            continue
         i += 1
     return events
 
@@ -359,8 +426,10 @@ def postprocess_segments(
     use_spacy: bool = True,
     coalesce_gap_ms: int = 360,
     two_line_threshold: float = 0.60,
-    min_readable: float = 1.10,
+    min_readable: float = 1.20,
     min_two_line_chars: int = 24,
+    max_block_duration_s: float = 7.0,
+    max_merge_gap_ms: int = 360,
 ) -> List[Dict[str,Any]]:
     # Flatten word list from raw ASR segments
     words: List[Dict[str,Any]] = []
@@ -389,6 +458,7 @@ def postprocess_segments(
         coalesce_gap_ms=coalesce_gap_ms,
         two_line_threshold=two_line_threshold,
         min_two_line_chars=min_two_line_chars,
+        max_block_duration_s=max_block_duration_s,
         shaper=shape_words_into_two_lines_balanced,
     )
     # Eliminate quick singles (orphans) and short flashes
@@ -398,6 +468,7 @@ def postprocess_segments(
         cps_target=cps_target,
         max_chars_per_line=max_chars_per_line,
         min_two_line_chars=min_two_line_chars,
+        max_merge_gap_ms=max_merge_gap_ms,
         shaper=shape_words_into_two_lines_balanced,
     )
     # Netflix timing: linger-only-when-safe + chaining + 20f for 1–2 words

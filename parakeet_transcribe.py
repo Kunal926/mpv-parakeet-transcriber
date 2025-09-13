@@ -211,9 +211,13 @@ def main():
     parser.add_argument(
         "--min_readable_ms",
         type=int,
-        default=1100,
+        default=1200,
         help="Soft minimum on-screen time per cue; short cues extend/merge",
     )
+    parser.add_argument("--max_block_duration_s", type=float, default=7.0,
+                        help="Max duration for a packed 2-line block")
+    parser.add_argument("--max_merge_gap_ms", type=int, default=360,
+                        help="Max gap for orphan merges/borrowing")
     args = parser.parse_args()
 
     audio_path = args.audio_file_path
@@ -235,6 +239,8 @@ def main():
     min_readable = args.min_readable_ms / 1000.0
     coalesce_gap_ms = args.coalesce_gap_ms
     two_line_threshold = args.two_line_threshold
+    max_block_duration_s = args.max_block_duration_s
+    max_merge_gap_ms = args.max_merge_gap_ms
 
     # Define a helper function to write error SRTs immediately
     def write_error_srt(message: str):
@@ -440,6 +446,8 @@ def main():
             two_line_threshold=two_line_threshold,
             min_readable=min_readable,
             min_two_line_chars=min_two_line_chars,
+            max_block_duration_s=max_block_duration_s,
+            max_merge_gap_ms=max_merge_gap_ms,
         )
         _audit(segments, processed)
         write_srt(processed, srt_path)
