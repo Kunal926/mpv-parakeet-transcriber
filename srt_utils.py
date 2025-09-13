@@ -27,37 +27,6 @@ def write_srt(events: List[Dict[str,Any]], out_path: str) -> None:
         for i, ev in enumerate(events, 1):
             f.write(f"{i}\n{srt_ts(ev['start'])} --> {srt_ts(ev['end'])}\n{ev['text'].strip()}\n\n")
 
-# Helper used by timing normalizer to test calm merges for gap chaining
-def _can_merge_pair(
-    a: Dict[str, Any],
-    b: Dict[str, Any],
-    max_chars_per_line: int,
-    cps_target: float,
-    two_line_threshold: float = 0.60,
-    min_two_line_chars: int = 24,
-):
-    from segmenter import shape_words_into_two_lines_balanced
-
-    lw, rw = a.get("words") or [], b.get("words") or []
-    if not lw or not rw:
-        return False, None
-    cand = lw + rw
-    lines, used, overflow = shape_words_into_two_lines_balanced(
-        cand,
-        max_chars=max_chars_per_line,
-        prefer_two_lines=True,
-        two_line_threshold=two_line_threshold,
-        min_two_line_chars=min_two_line_chars,
-    )
-    if overflow:
-        return False, None
-    txt = " ".join((w.get("word", "") or "").strip() for w in cand)
-    dur = b["end"] - a["start"]
-    cps = len(txt) / max(0.001, dur)
-    if cps > cps_target:
-        return False, None
-    return True, (cand, "\n".join(lines[:2]))
-
 # ---------- 2-line packer: merge across short breaths if it fits & cps ok ----------
 def pack_into_two_line_blocks(
     events: List[Dict[str, Any]],
@@ -66,6 +35,7 @@ def pack_into_two_line_blocks(
     coalesce_gap_ms: int = 360,
     two_line_threshold: float = 0.60,
     min_two_line_chars: int = 24,
+    shaper=shape_words_into_two_lines_balanced,
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str,Any]] = []
     i = 0
@@ -82,7 +52,7 @@ def pack_into_two_line_blocks(
             if gap_ms > coalesce_gap_ms: break
             cw = (events[j+1].get("words") or [])
             cand = bw + cw
-            lines, used, overflow = shape_words_into_two_lines_balanced(
+            lines, used, overflow = shaper(
                 cand,
                 max_chars=max_chars_per_line,
                 prefer_two_lines=True,
@@ -94,7 +64,7 @@ def pack_into_two_line_blocks(
             cps = len(txt) / max(0.001, (events[j+1]["end"] - start))
             if cps > cps_target: break
             bw = cand; end = float(events[j+1]["end"]); j += 1
-        lines, used, overflow = shape_words_into_two_lines_balanced(
+        lines, used, overflow = shaper(
             bw,
             max_chars=max_chars_per_line,
             prefer_two_lines=True,
@@ -120,6 +90,7 @@ def enforce_min_readable_v2(
     min_two_line_chars: int = 24,
     orphan_words: int = 2,
     orphan_chars: int = 12,
+    shaper=shape_words_into_two_lines_balanced,
 ):
     i = 0
     while i < len(events):
@@ -139,11 +110,11 @@ def enforce_min_readable_v2(
         if dur >= min_dur and not is_orphan:
             i += 1; continue
         # try merge with prev/next (score by 2-line fit & cps)
-        def score_merge(left, right):
+        def score_merge(left, right, _shaper=shaper):
             lw, rw = (left.get("words") or []), (right.get("words") or [])
             if not lw or not rw: return -1e9, None
             cand = lw + rw
-            lines, used, overflow = shape_words_into_two_lines_balanced(
+            lines, used, overflow = _shaper(
                 cand,
                 max_chars=max_chars_per_line,
                 prefer_two_lines=True,
@@ -182,11 +153,10 @@ def enforce_min_readable_v2(
                 del events[i+1]; continue
         # last resort: merge orphan forward/back (re-shape; never raw concat)
         if is_orphan:
-            from segmenter import shape_words_into_two_lines_balanced
             if i + 1 < len(events):
                 nxt = events[i + 1]
                 cand_words = (e.get("words") or []) + (nxt.get("words") or [])
-                lines, used, overflow = shape_words_into_two_lines_balanced(
+                lines, used, overflow = shaper(
                     cand_words,
                     max_chars=max_chars_per_line,
                     prefer_two_lines=True,
@@ -201,7 +171,7 @@ def enforce_min_readable_v2(
             elif i > 0:
                 prv = events[i - 1]
                 cand_words = (prv.get("words") or []) + (e.get("words") or [])
-                lines, used, overflow = shape_words_into_two_lines_balanced(
+                lines, used, overflow = shaper(
                     cand_words,
                     max_chars=max_chars_per_line,
                     prefer_two_lines=True,
@@ -235,10 +205,32 @@ def normalize_timing_netflix(
     cps_target: float = 20.0,
     two_line_threshold: float = 0.60,
     min_two_line_chars: int = 24,
+    shaper=shape_words_into_two_lines_balanced,
 ) -> List[Dict[str,Any]]:
     if not events: return events
     spf=_spf(fps)
     is_24ish = abs(fps-24.0)<0.2 or abs(fps-23.976)<0.2
+
+    def _can_merge_pair(a, b, _shaper=shaper):
+        lw, rw = (a.get("words") or []), (b.get("words") or [])
+        if not lw or not rw:
+            return (False, None)
+        cand = lw + rw
+        lines, used, overflow = _shaper(
+            cand,
+            max_chars=max_chars_per_line,
+            prefer_two_lines=True,
+            two_line_threshold=two_line_threshold,
+            min_two_line_chars=min_two_line_chars,
+        )
+        if overflow:
+            return (False, None)
+        txt = " ".join((w.get("word","") or "").strip() for w in cand)
+        dur = b["end"] - a["start"]
+        cps = len(txt) / max(0.001, dur)
+        if cps > cps_target:
+            return (False, None)
+        return (True, (cand, "\n".join(lines[:2])))
     # 1) Start on first audio frame; End on last audio frame (we'll linger later if safe)
     for ev in events:
         ws = ev.get("words") or []
@@ -296,14 +288,7 @@ def normalize_timing_netflix(
         # If gap < 2f:
         if gap_f < min_gap_frames:
             # Try borrowing time by merging into a calm 2-line block
-            ok, payload = _can_merge_pair(
-                a,
-                b,
-                max_chars_per_line=max_chars_per_line,
-                cps_target=cps_target,
-                two_line_threshold=two_line_threshold,
-                min_two_line_chars=min_two_line_chars,
-            )
+            ok, payload = _can_merge_pair(a, b)
             if ok and payload:
                 words, text = payload
                 a["text"] = text
@@ -345,12 +330,18 @@ def normalize_timing_netflix(
         if a["end"] <= a["start"]:
             a["end"] = a["start"] + spf
         i += 1
-    # 5) final snap & monotonic
+    # 5) final snap & monotonic (do NOT make starts late)
     for i,ev in enumerate(events):
         ev["start"] = _floor(ev["start"], fps)
         ev["end"]   = _ceil (ev["end"], fps)
-        if i>0 and ev["start"] < events[i-1]["end"] + min_gap_frames*spf:
-            ev["start"] = events[i-1]["end"] + min_gap_frames*spf
+        if i>0:
+            min_allowed = events[i-1]["end"] + min_gap_frames*spf
+            ws = ev.get("words") or []
+            audio_start_floor = _floor(ws[0]["start"], fps) if ws else ev["start"]
+            if ev["start"] < min_allowed:
+                if min_allowed <= audio_start_floor:
+                    ev["start"] = min_allowed
+                # else: keep audio-true start; accept <2f gap
         if ev["end"] <= ev["start"]:
             ev["end"] = ev["start"] + spf
     return events
@@ -398,6 +389,7 @@ def postprocess_segments(
         coalesce_gap_ms=coalesce_gap_ms,
         two_line_threshold=two_line_threshold,
         min_two_line_chars=min_two_line_chars,
+        shaper=shape_words_into_two_lines_balanced,
     )
     # Eliminate quick singles (orphans) and short flashes
     events = enforce_min_readable_v2(
@@ -406,6 +398,7 @@ def postprocess_segments(
         cps_target=cps_target,
         max_chars_per_line=max_chars_per_line,
         min_two_line_chars=min_two_line_chars,
+        shaper=shape_words_into_two_lines_balanced,
     )
     # Netflix timing: linger-only-when-safe + chaining + 20f for 1–2 words
     if snap_fps:
@@ -420,5 +413,6 @@ def postprocess_segments(
             cps_target=cps_target,
             two_line_threshold=two_line_threshold,
             min_two_line_chars=min_two_line_chars,
+            shaper=shape_words_into_two_lines_balanced,
         )
     return events
