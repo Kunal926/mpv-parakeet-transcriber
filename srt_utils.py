@@ -897,6 +897,21 @@ def rebalance_cps_borrow_time(
     return events
 
 
+# ensure a hard minimum gap between events regardless of prior passes
+def _force_min_gap(
+    events: List[Dict[str, Any]],
+    fps: float = 25.0,
+    min_gap_frames: int = 2,
+) -> List[Dict[str, Any]]:
+    spf = 1.0 / fps
+    for i in range(len(events) - 1):
+        if events[i + 1]["start"] - events[i]["end"] < min_gap_frames * spf - 1e-9:
+            events[i]["end"] = events[i + 1]["start"] - min_gap_frames * spf
+            if events[i]["end"] <= events[i]["start"]:
+                events[i]["end"] = events[i]["start"] + spf
+    return events
+
+
 # ---------- top-level postprocess ----------
 def postprocess_segments(
     segments: List[Dict[str,Any]],
@@ -1027,4 +1042,5 @@ def postprocess_segments(
         else:
             timed_out = True
         _trace(f"netflix re-snap out: {len(events)}")
+    events = _force_min_gap(events, fps=snap_fps or 25.0, min_gap_frames=2)
     return events
