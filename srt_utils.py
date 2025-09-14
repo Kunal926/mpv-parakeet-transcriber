@@ -39,10 +39,13 @@ SPACES = re.compile(r"\s+")
 def normalize_text(t: str) -> str:
     return SPACES.sub(" ", (t or "")).strip()
 
-def srt_ts(t: float) -> str:
-    if not math.isfinite(t) or t < 0:
-        t = 0.0
-    total_ms = int(round(t * 1000))
+def _ms_floor(t: float) -> int:
+    return 0 if not math.isfinite(t) or t < 0 else math.floor(t * 1000 + 1e-9)
+
+def _ms_ceil(t: float) -> int:
+    return 0 if not math.isfinite(t) or t < 0 else math.ceil(t * 1000 - 1e-9)
+
+def _fmt_ms(total_ms: int) -> str:
     ms = total_ms % 1000
     total_s = total_ms // 1000
     s = total_s % 60
@@ -51,13 +54,13 @@ def srt_ts(t: float) -> str:
     h = total_m // 60
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
-def format_time_srt(t: float) -> str:
-    return srt_ts(t)
+def format_start_ms(t: float) -> str: return _fmt_ms(_ms_floor(t))
+def format_end_ms  (t: float) -> str: return _fmt_ms(_ms_ceil (t))
 
 def write_srt(events: List[Dict[str,Any]], out_path: str) -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         for i, ev in enumerate(events, 1):
-            f.write(f"{i}\n{srt_ts(ev['start'])} --> {srt_ts(ev['end'])}\n{ev['text'].strip()}\n\n")
+            f.write(f"{i}\n{format_start_ms(ev['start'])} --> {format_end_ms(ev['end'])}\n{ev['text'].strip()}\n\n")
 
 # helper: cps of an event
 def _cps_of(ev: Dict[str, Any]) -> float:
@@ -260,7 +263,7 @@ def enforce_min_readable_v2(
                 # Only merge forward if the gap is small
                 gap_ms = int(round((nxt["start"] - e["end"]) * 1000))
                 if gap_ms <= max_merge_gap_ms:
-                    cand_words = (e.get("words") or []) + (nxt.get("words") or [])
+                    cand_words = _merged_words(e, nxt)
                     lines, used, overflow = shaper(
                         cand_words,
                         max_chars=max_chars_per_line,
@@ -308,7 +311,7 @@ def enforce_min_readable_v2(
                 # Only merge backward if the gap is small
                 gap_ms = int(round((e["start"] - prev["end"]) * 1000))
                 if gap_ms <= max_merge_gap_ms:
-                    cand_words = (prev.get("words") or []) + (e.get("words") or [])
+                    cand_words = _merged_words(prev, e)
                     lines, used, overflow = shaper(
                         cand_words,
                         max_chars=max_chars_per_line,

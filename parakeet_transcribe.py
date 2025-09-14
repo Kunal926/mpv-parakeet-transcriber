@@ -35,7 +35,7 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from srt_utils import format_time_srt, postprocess_segments, write_srt, normalize_text
+from srt_utils import format_start_ms, format_end_ms, postprocess_segments, write_srt, normalize_text
 
 
 def _audit(events_in, events_out):
@@ -97,7 +97,7 @@ def generate_srt_from_processed_timestamps(
                 end_s = segment_data.get('end_seconds', start_s + 0.1) # Ensure end is after start
                 if not text: continue # Skip empty segments
                 f.write(f"{segment_num}\n")
-                f.write(f"{format_time_srt(start_s)} --> {format_time_srt(end_s)}\n")
+                f.write(f"{format_start_ms(start_s)} --> {format_end_ms(end_s)}\n")
                 f.write(text + "\n\n")
             print(f"SRT file generated from {len(all_processed_timestamps)} segments at '{srt_file_path}'", file=sys.stderr)
 
@@ -112,7 +112,7 @@ def generate_srt_from_processed_timestamps(
                 if not current_words:
                     return
                 f.write(f"{segment_num}\n")
-                f.write(f"{format_time_srt(segment_start)} --> {format_time_srt(final_end)}\n")
+                f.write(f"{format_start_ms(segment_start)} --> {format_end_ms(final_end)}\n")
                 f.write(" ".join(current_words).strip() + "\n\n")
                 segment_num += 1
                 current_words = []
