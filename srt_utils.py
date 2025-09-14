@@ -534,16 +534,13 @@ def normalize_timing_netflix(
         if ev["end"] <= ev["start"]:
             ev["end"] = ev["start"] + spf
 
-    # 6) post-quantization gap normalizer
+    # 6) post-quantization gap normalizer (force ≥2f whenever gap < floor)
     for i in range(len(events) - 1):
         gap = events[i+1]["start"] - events[i]["end"]
-        gap_f = int(round(gap / spf))
-        if gap_f <= 0:
+        if gap < small_gap_floor_s:
             events[i]["end"] = events[i+1]["start"] - min_gap_frames*spf
-        elif is_24ish and 3 <= gap_f <= 11:
-            events[i]["end"] = events[i+1]["start"] - min_gap_frames*spf
-        if events[i]["end"] <= events[i]["start"]:
-            events[i]["end"] = events[i]["start"] + spf
+            if events[i]["end"] <= events[i]["start"]:
+                events[i]["end"] = events[i]["start"] + spf
 
     # helpers for duration and CPS borrowing
     def _borrow_from_right(idx: int, need: float, tolerance: float = 0.002) -> bool:
@@ -839,11 +836,22 @@ def rebalance_cps_borrow_time(
 
             give = min(need, room_nx)
             if give > 0:
-                nx["start"] += give
-                e["end"] = min(e["end"] + give, nx["start"] - min_gap)
-                if nx["start"] < e["end"] + min_gap:
-                    nx["start"] = e["end"] + min_gap - 1e-9
-                need -= give
+                orig_e_end = e["end"]
+                orig_nx_start = nx["start"]
+
+                new_nx_start = nx["start"] + give
+                new_e_end = min(e["end"] + give, new_nx_start - min_gap)
+
+                new_nx_dur = nx["end"] - new_nx_start
+                new_nx_cps = chars_of(nx) / max(1e-3, new_nx_dur)
+
+                if new_nx_dur + 1e-6 < min_dur or new_nx_cps > cps_target:
+                    nx["start"] = orig_nx_start
+                    e["end"] = orig_e_end
+                else:
+                    nx["start"] = new_nx_start
+                    e["end"] = new_e_end
+                    need -= give
 
         i += 1
     return events
