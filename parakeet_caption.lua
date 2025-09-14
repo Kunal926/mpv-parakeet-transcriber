@@ -651,21 +651,21 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         transcription_in_progress = false
       end
     })
-    local python_res = utils.subprocess({
+    mp.command_native_async({
+      name = "subprocess",
       args = python_command_args,
-      cancellable = false,
+      playback_only = false,
       capture_stdout = false,
       capture_stderr = false,
-      detach = true
-    })
-    if python_res and python_res.error then
-        log("error", "Failed to launch Parakeet Python script: ", to_str_safe(python_res.error))
-        mp.osd_message("Parakeet: Failed to launch Python. Check console.", 7)
-        abort()
-    else
-        log("info", "Parakeet Python script launched (PID: ", to_str_safe(python_res and python_res.pid), ")")
-        msg.info("[parakeet_mpv] Transcription started. SRT will load when ready.")
-    end
+    }, function(success, res, err)
+      local rc = (res and res.status) or -1
+      if not success or rc ~= 0 then
+        if attach_timer then attach_timer:kill(); attach_timer = nil end
+        transcription_in_progress = false
+        mp.osd_message(("Parakeet: transcription failed (rc=%s)."):format(tostring(rc)), 3)
+      end
+    end)
+    msg.info("[parakeet_mpv] Transcription started. SRT will load when ready.")
 end
 
 -- Perform FFmpeg extraction -> RoFormer separation -> Parakeet ASR
@@ -842,7 +842,13 @@ local function run_isolate_then_asr(model)
     for _,v in ipairs(seg_args) do table.insert(parakeet_args, v) end
     local fps = mp.get_property_native("container-fps") or mp.get_property_native("fps") or 24
     table.insert(parakeet_args, "--fps=" .. string.format("%.3f", fps))
-    local python_opts = { args = parakeet_args, cancellable = false, capture_stdout = false, capture_stderr = false, detach = true }
+    local python_opts = {
+      name = "subprocess",
+      args = parakeet_args,
+      playback_only = false,
+      capture_stdout = false,
+      capture_stderr = false,
+    }
     local initial_stat = _stat(srt_output_path)
     attach_when_ready(srt_output_path, {
       period         = SRT_POLL_PERIOD_S,
@@ -853,15 +859,15 @@ local function run_isolate_then_asr(model)
         transcription_in_progress = false
       end
     })
-    local python_res = utils.subprocess(python_opts)
-    if python_res and python_res.error then
-        log("error", "Failed to launch Parakeet Python script: ", to_str_safe(python_res.error))
-        mp.osd_message("Parakeet: Failed to launch Python.", 7)
-        abort()
-    else
-        log("info", "Parakeet Python script launched (PID: ", to_str_safe(python_res and python_res.pid), ")")
-        msg.info("[parakeet_mpv] Transcription started. SRT will load when ready.")
-    end
+    mp.command_native_async(python_opts, function(success, res, err)
+      local rc = (res and res.status) or -1
+      if not success or rc ~= 0 then
+        if attach_timer then attach_timer:kill(); attach_timer = nil end
+        transcription_in_progress = false
+        mp.osd_message(("Parakeet: transcription failed (rc=%s)."):format(tostring(rc)), 3)
+      end
+    end)
+    msg.info("[parakeet_mpv] Transcription started. SRT will load when ready.")
 end
 
 --- Wrapper function to call `do_transcription_core` with default settings.
