@@ -114,8 +114,9 @@ local files_to_cleanup_on_shutdown = {}
 -- @type boolean
 local transcription_in_progress = false
 
-local SRT_POLL_PERIOD_S  = 0.5
-local SRT_POLL_TIMEOUT_S = 240  -- hard stop if nothing shows up
+local SRT_POLL_PERIOD_S   = 0.5
+local SRT_BG_PERIOD_S     = 5.0   -- background polling after soft timeout
+local SRT_POLL_TIMEOUT_S  = 240   -- default if duration unknown
 
 local function _stat(path)
   local st = utils.file_info(path)
@@ -126,6 +127,18 @@ end
 local function _stat_eq(a, b)
   if not a or not b then return false end
   return a.size == b.size and a.mtime == b.mtime
+end
+
+local function _compute_timeout_s()
+  local dur = tonumber(mp.get_property("duration") or "") or 0
+  if dur > 0 then
+    -- 25% of program length, clamped between 120s and 1200s
+    local t = dur * 0.25
+    if t < 120 then t = 120 end
+    if t > 1200 then t = 1200 end
+    return t
+  end
+  return SRT_POLL_TIMEOUT_S
 end
 
 --- Safely converts a value to its string representation.
@@ -244,46 +257,60 @@ local function select_existing_or_add(srt_path, want_reload)
 end
 
 -- poll for SRT; attach as soon as it exists (and optionally when size is stable)
-local attach_timer -- single global timer
+local attach_timer   -- single live timer; new runs kill the old one
 local function attach_when_ready(srt_path, opts)
   opts = opts or {}
-  local period        = opts.period   or SRT_POLL_PERIOD_S
-  local timeout_s     = opts.timeout  or SRT_POLL_TIMEOUT_S
-  local require_stable= (opts.require_stable ~= false)
-  local initial_stat  = opts.initial_stat    -- {size, mtime}
-  local on_done       = opts.on_done         -- function(success, reason)
+  local period         = opts.period   or SRT_POLL_PERIOD_S
+  local timeout_s      = opts.timeout  or _compute_timeout_s()
+  local require_stable = (opts.require_stable ~= false)
+  local initial_stat   = opts.initial_stat  -- {size, mtime} before run
+  local on_done        = opts.on_done       -- function(success, reason)
+  local said_soft_msg  = false
+  local soft_timed_out = false
+  local t0             = mp.get_time()
+  local last_size      = -1
+  local added          = false
 
   if attach_timer then attach_timer:kill(); attach_timer = nil end
-  local t0        = mp.get_time()
-  local last_size = -1
-  local added     = false
 
   attach_timer = mp.add_periodic_timer(period, function()
-    local elapsed = mp.get_time() - t0
-    if elapsed > timeout_s then
+    local now     = mp.get_time()
+    local elapsed = now - t0
+
+    -- Soft timeout: free UI, switch to background polling, keep waiting
+    if (not soft_timed_out) and elapsed > timeout_s then
+      soft_timed_out = true
       if on_done then on_done(false, "timeout") end
-      mp.osd_message("Parakeet: SRT not found (timeout).", 4)
-      attach_timer:kill(); attach_timer = nil
+      if not said_soft_msg then
+        mp.osd_message("Parakeet: still transcribing… will attach when ready.", 3)
+        said_soft_msg = true
+      end
+      -- switch to slower background polling
+      attach_timer:kill()
+      attach_timer = mp.add_periodic_timer(SRT_BG_PERIOD_S, function()
+        local st = utils.file_info(srt_path)
+        if not st or not st.size or st.size <= 0 then return end
+        if initial_stat and _stat_eq(initial_stat, _stat(srt_path)) then return end
+        if require_stable then
+          if st.size ~= last_size then last_size = st.size; return end
+        end
+        if not added then
+          select_existing_or_add(srt_path, true)
+          added = true
+        end
+        attach_timer:kill(); attach_timer = nil
+      end)
       return
     end
 
+    -- Normal (pre-timeout) polling:
     local st = utils.file_info(srt_path)
     if not st or not st.size or st.size <= 0 then return end
-
-    -- P2: avoid stale reloads — ignore if same stat as before the run
-    if initial_stat and _stat_eq(initial_stat, _stat(srt_path)) then
-      return
-    end
-
+    if initial_stat and _stat_eq(initial_stat, _stat(srt_path)) then return end
     if require_stable then
-      if st.size ~= last_size then
-        last_size = st.size
-        return
-      end
+      if st.size ~= last_size then last_size = st.size; return end
     end
-
     if not added then
-      -- if a track already exists for this path, reload it (file changed)
       select_existing_or_add(srt_path, true)
       added = true
       if on_done then on_done(true) end
@@ -613,14 +640,14 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     table.insert(python_command_args, "--fps=" .. string.format("%.3f", fps))
 
     log("debug", "Running Python script: ", table.concat(python_command_args, " "))
-    local initial_stat = _stat(srt_output_path)  -- remember old file
+    local initial_stat = _stat(srt_output_path)
     attach_when_ready(srt_output_path, {
-      period = SRT_POLL_PERIOD_S,
-      timeout = SRT_POLL_TIMEOUT_S,
+      period         = SRT_POLL_PERIOD_S,
+      timeout        = _compute_timeout_s(),
       require_stable = true,
-      initial_stat = initial_stat,
-      on_done = function(ok)
-        -- clear state whether success or timeout/fail
+      initial_stat   = initial_stat,
+      on_done        = function(ok)
+        -- clear busy flag on both success and soft timeout
         transcription_in_progress = false
       end
     })
@@ -818,11 +845,11 @@ local function run_isolate_then_asr(model)
     local python_opts = { args = parakeet_args, cancellable = false, capture_stdout = false, capture_stderr = false, detach = true }
     local initial_stat = _stat(srt_output_path)
     attach_when_ready(srt_output_path, {
-      period = SRT_POLL_PERIOD_S,
-      timeout = SRT_POLL_TIMEOUT_S,
+      period         = SRT_POLL_PERIOD_S,
+      timeout        = _compute_timeout_s(),
       require_stable = true,
-      initial_stat = initial_stat,
-      on_done = function(ok)
+      initial_stat   = initial_stat,
+      on_done        = function(ok)
         transcription_in_progress = false
       end
     })
