@@ -784,6 +784,71 @@ def normalize_timing_netflix(
         prev_end = ev["end"]
     return events
 
+
+def rebalance_cps_borrow_time(
+    events: List[Dict[str, Any]],
+    fps: float = 25.0,
+    cps_target: float = 20.0,
+    min_gap_frames: int = 2,
+    min_dur_frames: int = 20,
+) -> List[Dict[str, Any]]:
+    spf = 1.0 / fps
+    min_gap = min_gap_frames * spf
+    min_dur = min_dur_frames * spf
+
+    def chars_of(e: Dict[str, Any]) -> int:
+        return len(" ".join((e.get("text") or "").split()))
+
+    i = 0
+    while i < len(events) - 1:
+        e, nx = events[i], events[i + 1]
+        dur = e["end"] - e["start"]
+        chars = chars_of(e)
+        need = max(0.0, chars / cps_target - dur)
+        need = max(need, max(0.0, min_dur - dur))
+
+        if need <= 1e-6:
+            i += 1
+            continue
+
+        if i > 0 and need > 0:
+            prev = events[i - 1]
+            gap_left = e["start"] - prev["end"]
+            left_slack = max(0.0, gap_left - min_gap)
+            take_left = min(need, left_slack)
+            if take_left > 0:
+                e["start"] -= take_left
+                need -= take_left
+
+        if need <= 1e-6:
+            i += 1
+            continue
+
+        gap = nx["start"] - e["end"]
+        gap_slack = max(0.0, gap - min_gap)
+        take_gap = min(need, gap_slack)
+        if take_gap > 0:
+            e["end"] += take_gap
+            need -= take_gap
+
+        if need > 0:
+            nx_dur = nx["end"] - nx["start"]
+            nx_chars = chars_of(nx)
+            nx_min = max(min_dur, nx_chars / cps_target)
+            room_nx = max(0.0, nx_dur - nx_min)
+
+            give = min(need, room_nx)
+            if give > 0:
+                nx["start"] += give
+                e["end"] = min(e["end"] + give, nx["start"] - min_gap)
+                if nx["start"] < e["end"] + min_gap:
+                    nx["start"] = e["end"] + min_gap - 1e-9
+                need -= give
+
+        i += 1
+    return events
+
+
 # ---------- top-level postprocess ----------
 def postprocess_segments(
     segments: List[Dict[str,Any]],
@@ -882,5 +947,36 @@ def postprocess_segments(
                            validate=not timed_out)
         if _e is not None:
             events = _e
+        else:
+            timed_out = True
         _trace(f"netflix out: {len(events)}")
+
+    if snap_fps and os.environ.get("PARAKEET_DISABLE_NETFLIX") != "1":
+        events = rebalance_cps_borrow_time(
+            events,
+            fps=snap_fps,
+            cps_target=cps_target,
+            min_gap_frames=2,
+            min_dur_frames=20,
+        )
+        _trace(f"netflix re-snap in: {len(events)}")
+        _e = _with_timeout(5.0, normalize_timing_netflix,
+                           events,
+                           fps=snap_fps,
+                           linger_after_audio_ms=500,
+                           min_gap_frames=2,
+                           close_range_frames=(3,11),
+                           small_gap_floor_s=0.5,
+                           max_chars_per_line=max_chars_per_line,
+                           cps_target=cps_target,
+                           two_line_threshold=two_line_threshold,
+                           min_two_line_chars=min_two_line_chars,
+                           shaper=shape_words_into_two_lines_balanced,
+                           max_block_duration_s=max_block_duration_s,
+                           validate=not timed_out)
+        if _e is not None:
+            events = _e
+        else:
+            timed_out = True
+        _trace(f"netflix re-snap out: {len(events)}")
     return events
