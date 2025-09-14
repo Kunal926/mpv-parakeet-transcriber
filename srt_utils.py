@@ -59,6 +59,12 @@ def write_srt(events: List[Dict[str,Any]], out_path: str) -> None:
         for i, ev in enumerate(events, 1):
             f.write(f"{i}\n{srt_ts(ev['start'])} --> {srt_ts(ev['end'])}\n{ev['text'].strip()}\n\n")
 
+# helper: cps of an event
+def _cps_of(ev: Dict[str, Any]) -> float:
+    txt = " ".join((w.get("word", "") or "").strip() for w in (ev.get("words") or []))
+    dur = max(0.001, ev["end"] - ev["start"])
+    return len(txt) / dur
+
 # helper: can two cues be safely merged into a single 2-line block?
 def _can_merge_pair(
     a: Dict[str,Any],
@@ -69,6 +75,7 @@ def _can_merge_pair(
     min_two_line_chars: int = 24,
     max_block_duration_s: float | None = None,
     shaper=shape_words_into_two_lines_balanced,
+    allow_cps_decrease: bool = False,
 ):
     lw, rw = (a.get("words") or []), (b.get("words") or [])
     if not lw or not rw:
@@ -85,12 +92,16 @@ def _can_merge_pair(
         return False, None
     txt = " ".join((w.get("word","") or "").strip() for w in cand)
     dur = b["end"] - a["start"]
-    cps = len(txt) / max(0.001, dur)
-    if cps > cps_target:
-        return False, None
+    cps_merged = len(txt) / max(0.001, dur)
     if max_block_duration_s is not None and dur > max_block_duration_s:
         return False, None
-    return True, (cand, "\n".join(lines[:2]))
+    if cps_merged <= cps_target:
+        return True, (cand, "\n".join(lines[:2]))
+    if allow_cps_decrease:
+        worst_local = max(_cps_of(a), _cps_of(b))
+        if cps_merged < worst_local - 1e-6:
+            return True, (cand, "\n".join(lines[:2]))
+    return False, None
 
 # ---------- 2-line packer: merge across short breaths if it fits & cps ok ----------
 def pack_into_two_line_blocks(
@@ -396,6 +407,7 @@ def normalize_timing_netflix(
                         max_chars_per_line, cps_target,
                         two_line_threshold, min_two_line_chars,
                         max_block_duration_s, shaper,
+                        allow_cps_decrease=True,
                     )
                     if ok and payload:
                         words, text = payload
@@ -423,6 +435,7 @@ def normalize_timing_netflix(
                         max_chars_per_line, cps_target,
                         two_line_threshold, min_two_line_chars,
                         max_block_duration_s, shaper,
+                        allow_cps_decrease=True,
                     )
                     if ok and payload:
                         prev = events[i-1]
@@ -481,6 +494,7 @@ def normalize_timing_netflix(
                 max_chars_per_line, cps_target,
                 two_line_threshold, min_two_line_chars,
                 max_block_duration_s, shaper,
+                allow_cps_decrease=True,
             )
             if ok and payload:
                 words, text = payload
@@ -534,16 +548,13 @@ def normalize_timing_netflix(
         if ev["end"] <= ev["start"]:
             ev["end"] = ev["start"] + spf
 
-    # 6) post-quantization gap normalizer
+    # 6) post-quantization gap normalizer (force ≥2f whenever gap < floor)
     for i in range(len(events) - 1):
         gap = events[i+1]["start"] - events[i]["end"]
-        gap_f = int(round(gap / spf))
-        if gap_f <= 0:
+        if gap < small_gap_floor_s:
             events[i]["end"] = events[i+1]["start"] - min_gap_frames*spf
-        elif is_24ish and 3 <= gap_f <= 11:
-            events[i]["end"] = events[i+1]["start"] - min_gap_frames*spf
-        if events[i]["end"] <= events[i]["start"]:
-            events[i]["end"] = events[i]["start"] + spf
+            if events[i]["end"] <= events[i]["start"]:
+                events[i]["end"] = events[i]["start"] + spf
 
     # helpers for duration and CPS borrowing
     def _borrow_from_right(idx: int, need: float, tolerance: float = 0.002) -> bool:
@@ -559,6 +570,7 @@ def normalize_timing_netflix(
         borrow = min(need, avail)
         orig_end = cur["end"]
         orig_start_nxt = nxt["start"]
+        orig_end_nxt = nxt["end"]
         take = min(spare_gap, borrow)
         # use silent gap without shifting the next cue's start
         cur["end"] += take
@@ -574,13 +586,22 @@ def normalize_timing_netflix(
                     shift = nxt["start"] - upper
                     nxt["start"] = upper
                     cur["end"] -= shift
+            # try to restore nxt duration so CPS stays stable
+            ws2 = nxt.get("words") or []
+            nxt_audio_end = _ceil(ws2[-1]["end"], fps) if ws2 else orig_end_nxt
+            next_of_next_start = events[idx + 2]["start"] if idx + 2 < len(events) else float("inf")
+            linger_cap = nxt_audio_end + linger_after_audio_ms/1000.0
+            max_extend = min(linger_cap, next_of_next_start - min_gap_frames*spf) - orig_end_nxt
+            if max_extend > 0:
+                nxt["end"] = min(orig_end_nxt + borrow, orig_end_nxt + max_extend)
         dur_nxt = nxt["end"] - nxt["start"]
         txt_nxt = " ".join((w.get("word", "") or "").strip() for w in nxt.get("words") or [])
         cps_nxt = len(txt_nxt) / max(0.001, dur_nxt)
-        changed = cur["end"] != orig_end or nxt["start"] != orig_start_nxt
+        changed = (cur["end"] != orig_end or nxt["start"] != orig_start_nxt or nxt["end"] != orig_end_nxt)
         if dur_nxt + tolerance < min_dur or cps_nxt > cps_target or not changed:
             cur["end"] = orig_end
             nxt["start"] = orig_start_nxt
+            nxt["end"] = orig_end_nxt
             return False
         return True
 
@@ -657,6 +678,7 @@ def normalize_timing_netflix(
                     min_two_line_chars,
                     max_block_duration_s,
                     shaper,
+                    allow_cps_decrease=True,
                 )
                 if ok and payload:
                     words, text = payload
@@ -676,6 +698,7 @@ def normalize_timing_netflix(
                     min_two_line_chars,
                     max_block_duration_s,
                     shaper,
+                    allow_cps_decrease=True,
                 )
                 if ok and payload:
                     prev = events[i - 1]
@@ -713,6 +736,7 @@ def normalize_timing_netflix(
                     min_two_line_chars,
                     max_block_duration_s,
                     shaper,
+                    allow_cps_decrease=True,
                 )
                 if ok and payload:
                     words, text = payload
@@ -732,6 +756,7 @@ def normalize_timing_netflix(
                     min_two_line_chars,
                     max_block_duration_s,
                     shaper,
+                    allow_cps_decrease=True,
                 )
                 if ok and payload:
                     prev = events[i - 1]
@@ -839,13 +864,51 @@ def rebalance_cps_borrow_time(
 
             give = min(need, room_nx)
             if give > 0:
-                nx["start"] += give
-                e["end"] = min(e["end"] + give, nx["start"] - min_gap)
-                if nx["start"] < e["end"] + min_gap:
-                    nx["start"] = e["end"] + min_gap - 1e-9
-                need -= give
+                orig_e_end = e["end"]
+                orig_nx_start = nx["start"]
+                orig_nx_end = nx["end"]
+
+                new_nx_start = nx["start"] + give
+                ws = nx.get("words") or []
+                nx_audio_end = ws[-1]["end"] if ws else orig_nx_end
+                next_of_next_start = events[i + 2]["start"] if i + 2 < len(events) else float("inf")
+                linger_cap = nx_audio_end + 0.5
+                max_extend = min(linger_cap, next_of_next_start - min_gap) - orig_nx_end
+                new_nx_end = orig_nx_end
+                if max_extend > 0:
+                    new_nx_end = min(orig_nx_end + give, orig_nx_end + max_extend)
+
+                new_e_end = min(e["end"] + give, new_nx_start - min_gap)
+
+                new_nx_dur = new_nx_end - new_nx_start
+                new_nx_cps = chars_of(nx) / max(1e-3, new_nx_dur)
+
+                if new_nx_dur + 1e-6 < min_dur or new_nx_cps > cps_target:
+                    nx["start"] = orig_nx_start
+                    nx["end"] = orig_nx_end
+                    e["end"] = orig_e_end
+                else:
+                    nx["start"] = new_nx_start
+                    nx["end"] = new_nx_end
+                    e["end"] = new_e_end
+                    need -= give
 
         i += 1
+    return events
+
+
+# ensure a hard minimum gap between events regardless of prior passes
+def _force_min_gap(
+    events: List[Dict[str, Any]],
+    fps: float = 25.0,
+    min_gap_frames: int = 2,
+) -> List[Dict[str, Any]]:
+    spf = 1.0 / fps
+    for i in range(len(events) - 1):
+        if events[i + 1]["start"] - events[i]["end"] < min_gap_frames * spf - 1e-9:
+            events[i]["end"] = events[i + 1]["start"] - min_gap_frames * spf
+            if events[i]["end"] <= events[i]["start"]:
+                events[i]["end"] = events[i]["start"] + spf
     return events
 
 
@@ -979,4 +1042,5 @@ def postprocess_segments(
         else:
             timed_out = True
         _trace(f"netflix re-snap out: {len(events)}")
+    events = _force_min_gap(events, fps=snap_fps or 25.0, min_gap_frames=2)
     return events
