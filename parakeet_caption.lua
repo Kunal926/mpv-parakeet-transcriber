@@ -8,6 +8,7 @@
 
 local mp = require 'mp'
 local utils = require 'mp.utils'
+local msg   = mp.msg
 
 local osd_duration_default = 3 -- seconds
 
@@ -197,35 +198,56 @@ local function safe_remove(filepath, description)
     end
 end
 
+-- idempotent "select if already present else add"
 local function select_existing_or_add(srt_path)
-    local tracks = mp.get_property_native("track-list")
-    for _, t in ipairs(tracks or {}) do
-        if t.type == "sub" and t.external and t["external-filename"] == srt_path then
-            mp.set_property_number("sid", t.id)
-            return true
-        end
+  local tracks = mp.get_property_native("track-list") or {}
+  for _, t in ipairs(tracks) do
+    if t.type == "sub" and t.external and t["external-filename"] == srt_path then
+      mp.set_property_number("sid", t.id)
+      msg.info("[parakeet_mpv] selected existing sub: " .. srt_path)
+      return true
     end
-    mp.command_native_async({"sub-add", srt_path, "select"}, function(ok, _, err)
-        if not ok then
-            mp.msg.error("[parakeet_mpv] sub-add failed: " .. (err or "unknown"))
-            mp.commandv("rescan-external-files", "reselect")
-        end
-    end)
-    return false
+  end
+  mp.command_native_async({"sub-add", srt_path, "select"}, function(ok, _, err)
+    if ok then
+      msg.info("[parakeet_mpv] sub-add OK")
+    else
+      msg.error("[parakeet_mpv] sub-add failed: " .. (err or "unknown"))
+      mp.commandv("rescan-external-files", "reselect")
+    end
+  end)
+  return false
 end
 
-local function attach_when_ready(srt_path, poll_s, on_ready)
-    local added = false
-    local t = mp.add_periodic_timer(poll_s or 0.5, function()
-        local st = utils.file_info(srt_path)
-        if st and st.size > 0 and not added then
-            added = true
-            mp.msg.info("[parakeet_mpv] sub-add: " .. srt_path)
-            select_existing_or_add(srt_path)
-            if on_ready then on_ready() end
-            t:kill()
+-- poll for SRT; attach as soon as it exists (and optionally when size is stable)
+local attach_timer -- keep a ref so we can kill it later
+local function attach_when_ready(srt_path, period_s, require_stable)
+  if attach_timer then attach_timer:kill(); attach_timer = nil end
+  local added, last_size = false, -1
+  local period = period_s or 0.5
+  attach_timer = mp.add_periodic_timer(period, function()
+    local st = utils.file_info(srt_path)
+    if not st or not st.size or st.size <= 0 then return end
+    if require_stable then
+      if st.size == last_size then
+        if not added then
+          select_existing_or_add(srt_path)
+          transcription_in_progress = false
+          added = true
         end
-    end)
+        attach_timer:kill(); attach_timer = nil
+      else
+        last_size = st.size
+      end
+    else
+      if not added then
+        select_existing_or_add(srt_path)
+        transcription_in_progress = false
+        added = true
+      end
+      attach_timer:kill(); attach_timer = nil
+    end
+  end)
 end
 
 --- Retrieves audio stream information using ffprobe.
@@ -549,7 +571,7 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     table.insert(python_command_args, "--fps=" .. string.format("%.3f", fps))
 
     log("debug", "Running Python script: ", table.concat(python_command_args, " "))
-    attach_when_ready(srt_output_path, 0.5, abort)
+    attach_when_ready(srt_output_path, 0.5, true)
     local python_res = utils.subprocess({ args = python_command_args, cancellable = false, capture_stdout = false, capture_stderr = false, detach = true })
     if python_res and python_res.error then
         log("error", "Failed to launch Parakeet Python script: ", to_str_safe(python_res.error))
@@ -557,8 +579,8 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         abort()
     else
         log("info", "Parakeet Python script launched (PID: ", to_str_safe(python_res and python_res.pid), ")")
+        msg.info("[parakeet_mpv] Transcription started. SRT will load when ready.")
     end
-    log("info", "Transcription process started. SRT will load when ready.")
 end
 
 -- Perform FFmpeg extraction -> RoFormer separation -> Parakeet ASR
@@ -736,7 +758,7 @@ local function run_isolate_then_asr(model)
     local fps = mp.get_property_native("container-fps") or mp.get_property_native("fps") or 24
     table.insert(parakeet_args, "--fps=" .. string.format("%.3f", fps))
     local python_opts = { args = parakeet_args, cancellable = false, capture_stdout = false, capture_stderr = false, detach = true }
-    attach_when_ready(srt_output_path, 0.5, abort)
+    attach_when_ready(srt_output_path, 0.5, true)
     local python_res = utils.subprocess(python_opts)
     if python_res and python_res.error then
         log("error", "Failed to launch Parakeet Python script: ", to_str_safe(python_res.error))
@@ -744,7 +766,7 @@ local function run_isolate_then_asr(model)
         abort()
     else
         log("info", "Parakeet Python script launched (PID: ", to_str_safe(python_res and python_res.pid), ")")
-        log("info", "Transcription started. SRT will load when ready.")
+        msg.info("[parakeet_mpv] Transcription started. SRT will load when ready.")
     end
 end
 
@@ -820,5 +842,6 @@ mp.register_event("shutdown", function()
     else
         log("info", "No temporary files registered for cleanup.")
     end
+    if attach_timer then attach_timer:kill(); attach_timer = nil end
     log("info", "Parakeet shutdown cleanup finished.")
 end)
