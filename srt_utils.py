@@ -947,27 +947,36 @@ def postprocess_segments(
                            validate=not timed_out)
         if _e is not None:
             events = _e
-            events = rebalance_cps_borrow_time(
-                events,
-                fps=snap_fps,
-                cps_target=cps_target,
-                min_gap_frames=2,
-                min_dur_frames=20,
-            )
-            events = normalize_timing_netflix(
-                events,
-                fps=snap_fps,
-                linger_after_audio_ms=500,
-                min_gap_frames=2,
-                close_range_frames=(3,11),
-                small_gap_floor_s=0.5,
-                max_chars_per_line=max_chars_per_line,
-                cps_target=cps_target,
-                two_line_threshold=two_line_threshold,
-                min_two_line_chars=min_two_line_chars,
-                shaper=shape_words_into_two_lines_balanced,
-                max_block_duration_s=max_block_duration_s,
-                validate=True,
-            )
+        else:
+            timed_out = True
         _trace(f"netflix out: {len(events)}")
+
+    if snap_fps and os.environ.get("PARAKEET_DISABLE_NETFLIX") != "1":
+        events = rebalance_cps_borrow_time(
+            events,
+            fps=snap_fps,
+            cps_target=cps_target,
+            min_gap_frames=2,
+            min_dur_frames=20,
+        )
+        _trace(f"netflix re-snap in: {len(events)}")
+        _e = _with_timeout(5.0, normalize_timing_netflix,
+                           events,
+                           fps=snap_fps,
+                           linger_after_audio_ms=500,
+                           min_gap_frames=2,
+                           close_range_frames=(3,11),
+                           small_gap_floor_s=0.5,
+                           max_chars_per_line=max_chars_per_line,
+                           cps_target=cps_target,
+                           two_line_threshold=two_line_threshold,
+                           min_two_line_chars=min_two_line_chars,
+                           shaper=shape_words_into_two_lines_balanced,
+                           max_block_duration_s=max_block_duration_s,
+                           validate=not timed_out)
+        if _e is not None:
+            events = _e
+        else:
+            timed_out = True
+        _trace(f"netflix re-snap out: {len(events)}")
     return events
