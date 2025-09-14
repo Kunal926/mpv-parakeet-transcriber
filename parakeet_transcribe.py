@@ -23,6 +23,8 @@ import argparse
 import numpy as np
 import torch
 import gc
+import time
+import json
 from pathlib import Path
 from torch.cuda.amp import autocast
 
@@ -267,6 +269,7 @@ def main():
     audio_duration_seconds = 0.0
 
     try:
+        t0 = time.perf_counter()
         model_name = "nvidia/parakeet-tdt-0.6b-v2" # Specify the Parakeet model
         print(f"Loading ASR model '{model_name}'...", file=sys.stderr)
         # Load the ASR model from NeMo's pre-trained models
@@ -299,6 +302,7 @@ def main():
             print("CUDA not available. Using CPU (float32).", file=sys.stderr)
         
         asr_model.eval() # Set model to evaluation mode
+        t1 = time.perf_counter()
 
         # Get model's expected sample rate
         target_sr_from_model_cfg = asr_model.cfg.preprocessor.sample_rate
@@ -353,6 +357,7 @@ def main():
               print(f"Transcribing with precision: {model_dtype if use_cuda else 'float32 (CPU)'}. Autocast enabled: {use_amp_autocast}", file=sys.stderr)
               # Call the transcribe method with timestamp and hypothesis options
               output_from_transcribe = asr_model.transcribe(transcribe_input_files, timestamps=True, return_hypotheses=True)
+        t2 = time.perf_counter()
 
         if not output_from_transcribe or not isinstance(output_from_transcribe, list) or not output_from_transcribe[0]:
             err_msg = "Transcription failed or produced no hypotheses"
@@ -449,8 +454,18 @@ def main():
             max_block_duration_s=max_block_duration_s,
             max_merge_gap_ms=max_merge_gap_ms,
         )
+        t3 = time.perf_counter()
         _audit(segments, processed)
         write_srt(processed, srt_path)
+        t4 = time.perf_counter()
+        with open(srt_path + ".timings.json", "w") as f:
+            json.dump({
+                "model_load_s": round(t1 - t0, 3),
+                "asr_s":        round(t2 - t1, 3),
+                "postproc_s":   round(t3 - t2, 3),
+                "write_s":      round(t4 - t3, 3),
+                "total_s":      round(t4 - t0, 3),
+            }, f, indent=2)
         print(f"SRT file generated at '{srt_path}'", file=sys.stderr)
 
         print(f"SRT file processing completed for '{srt_path}'", file=sys.stderr)
