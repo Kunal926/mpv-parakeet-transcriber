@@ -386,7 +386,8 @@ def main():
             write_error_srt(err_msg)
             sys.exit(1)
             
-        print(f"\nFull Transcript:\n{full_transcript}\n", file=sys.stderr)
+        if os.environ.get("PARAKEET_VERBOSE") == "1":
+            print(f"\nFull Transcript:\n{full_transcript}\n", file=sys.stderr, flush=True)
 
         # Build segments for post-processing
         segments = []
