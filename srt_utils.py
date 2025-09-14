@@ -86,7 +86,7 @@ def _can_merge_pair(
     lw, rw = (a.get("words") or []), (b.get("words") or [])
     if not lw or not rw:
         return False, None
-    cand = lw + rw
+    cand = _merged_words(a, b)
     lines, used, overflow = shaper(
         cand,
         max_chars=max_chars_per_line,
@@ -219,7 +219,7 @@ def enforce_min_readable_v2(
             gap_ms = int(round((right["start"] - left["end"]) * 1000))
             if gap_ms > max_merge_gap_ms:
                 return -1e9, None
-            cand = lw + rw
+            cand = _merged_words(left, right)
             lines, used, overflow = _shaper(
                 cand,
                 max_chars=max_chars_per_line,
@@ -774,11 +774,7 @@ def normalize_timing_netflix(
         if ev["end"] <= ev["start"]:
             ev["end"] = ev["start"] + spf
 
-    do_validate = (
-        validate
-        and os.environ.get("PARAKEET_DISABLE_PACKER") != "1"
-        and os.environ.get("PARAKEET_DISABLE_MINREADABLE") != "1"
-    )
+    do_validate = validate
 
     def _enforce(cond: bool, msg: str) -> None:
         if do_validate:
