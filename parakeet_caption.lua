@@ -9,6 +9,8 @@
 local mp = require 'mp'
 local utils = require 'mp.utils'
 
+local osd_duration_default = 3 -- seconds
+
 -- Subtitle alignment and styling are configured via mpv.conf;
 -- this script intentionally avoids forcing ASS overrides.
 
@@ -193,6 +195,37 @@ local function safe_remove(filepath, description)
     else
         log("debug", "Temporary file (" .. (description or "unspecified") .. ") not found for removal, skipping: ", filepath)
     end
+end
+
+local function select_existing_or_add(srt_path)
+    local tracks = mp.get_property_native("track-list")
+    for _, t in ipairs(tracks or {}) do
+        if t.type == "sub" and t.external and t["external-filename"] == srt_path then
+            mp.set_property_number("sid", t.id)
+            return true
+        end
+    end
+    mp.command_native_async({"sub-add", srt_path, "select"}, function(ok, _, err)
+        if not ok then
+            mp.msg.error("[parakeet_mpv] sub-add failed: " .. (err or "unknown"))
+            mp.commandv("rescan-external-files", "reselect")
+        end
+    end)
+    return false
+end
+
+local function attach_when_ready(srt_path, poll_s, on_ready)
+    local added = false
+    local t = mp.add_periodic_timer(poll_s or 0.5, function()
+        local st = utils.file_info(srt_path)
+        if st and st.size > 0 and not added then
+            added = true
+            mp.msg.info("[parakeet_mpv] sub-add: " .. srt_path)
+            select_existing_or_add(srt_path)
+            if on_ready then on_ready() end
+            t:kill()
+        end
+    end)
 end
 
 --- Retrieves audio stream information using ffprobe.
@@ -516,38 +549,16 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     table.insert(python_command_args, "--fps=" .. string.format("%.3f", fps))
 
     log("debug", "Running Python script: ", table.concat(python_command_args, " "))
-    local python_res = utils.subprocess({ args = python_command_args, cancellable = false, capture_stdout = false, capture_stderr = false })
-
-    if python_res.error then
-        log("error", "Failed to launch Parakeet Python script: ", (python_res.error or "Unknown error"))
-        if python_res.stderr and string.len(python_res.stderr) > 0 then
-             log("error", "Stderr from Python launch failure: ", python_res.stderr)
-        end
+    attach_when_ready(srt_output_path, 0.5, abort)
+    local python_res = utils.subprocess({ args = python_command_args, cancellable = false, capture_stdout = false, capture_stderr = false, detach = true })
+    if python_res and python_res.error then
+        log("error", "Failed to launch Parakeet Python script: ", to_str_safe(python_res.error))
         mp.osd_message("Parakeet: Failed to launch Python. Check console.", 7)
+        abort()
     else
-        log("info", "Parakeet Python script finished (PID: ", (python_res.pid or "unknown"), "). Status: ", to_str_safe(python_res.status))
-        if python_res.stdout and string.len(python_res.stdout) > 0 then log("debug", "Python script stdout: ", python_res.stdout) end
-        if python_res.stderr and string.len(python_res.stderr) > 0 then log("debug", "Python script stderr: ", python_res.stderr) end
-
-        if python_res.status ~= nil and python_res.status ~= 0 then
-             log("warn", "Python script exited with an error. Status: ", to_str_safe(python_res.status), ". Check Python script's own logging for details.")
-             mp.osd_message("Parakeet: Python script error. Check console.", 7)
-        end
-
-        log("info", "Attempting to load SRT immediately: ", srt_output_path)
-        if utils.file_info(srt_output_path) and utils.file_info(srt_output_path).size > 0 then
-            mp.commandv("sub-add", srt_output_path, "select") -- Use "select" to force MPV to switch to this subtitle
-            mp.osd_message("Parakeet: Loaded " .. (srt_output_path:match("([^/\\]+)$") or srt_output_path), 3)
-        elseif utils.file_info(srt_output_path) then
-            log("warn", "SRT file found but is empty: ", srt_output_path, ". This might indicate a transcription problem or an error SRT with no content.")
-            mp.osd_message("Parakeet: SRT file empty. Check console.", 5)
-        else
-            log("warn", "SRT file not found after Python script execution: ", srt_output_path, ". Transcription may have failed.")
-            mp.osd_message("Parakeet: SRT not found. Check Python logs.", 7)
-        end
+        log("info", "Parakeet Python script launched (PID: ", to_str_safe(python_res and python_res.pid), ")")
     end
-    log("info", "Transcription process complete. Temporary audio files (if any) will be cleaned on MPV shutdown.")
-    abort()
+    log("info", "Transcription process started. SRT will load when ready.")
 end
 
 -- Perform FFmpeg extraction -> RoFormer separation -> Parakeet ASR
@@ -724,25 +735,17 @@ local function run_isolate_then_asr(model)
     for _,v in ipairs(seg_args) do table.insert(parakeet_args, v) end
     local fps = mp.get_property_native("container-fps") or mp.get_property_native("fps") or 24
     table.insert(parakeet_args, "--fps=" .. string.format("%.3f", fps))
-    local python_opts = { args = parakeet_args, cancellable = false, capture_stdout = false, capture_stderr = false }
+    local python_opts = { args = parakeet_args, cancellable = false, capture_stdout = false, capture_stderr = false, detach = true }
+    attach_when_ready(srt_output_path, 0.5, abort)
     local python_res = utils.subprocess(python_opts)
-    if python_res.error then
+    if python_res and python_res.error then
         log("error", "Failed to launch Parakeet Python script: ", to_str_safe(python_res.error))
         mp.osd_message("Parakeet: Failed to launch Python.", 7)
+        abort()
     else
-        if python_res.stderr and string.len(python_res.stderr) > 0 then log("debug", "Python stderr: ", python_res.stderr) end
-        if python_res.status ~= nil and python_res.status ~= 0 then
-            mp.osd_message("Parakeet: Python script error.", 7)
-        end
-        if utils.file_info(srt_output_path) and utils.file_info(srt_output_path).size > 0 then
-            mp.commandv("sub-add", srt_output_path, "select")
-            mp.osd_message("Parakeet: Loaded SRT", 3)
-        else
-            mp.osd_message("Parakeet: SRT not found.", 7)
-        end
+        log("info", "Parakeet Python script launched (PID: ", to_str_safe(python_res and python_res.pid), ")")
+        log("info", "Transcription started. SRT will load when ready.")
     end
-
-    abort()
 end
 
 --- Wrapper function to call `do_transcription_core` with default settings.
