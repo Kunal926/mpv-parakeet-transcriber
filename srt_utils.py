@@ -65,6 +65,9 @@ def _cps_of(ev: Dict[str, Any]) -> float:
     dur = max(0.001, ev["end"] - ev["start"])
     return len(txt) / dur
 
+def _merged_words(a: Dict[str, Any], b: Dict[str, Any]):
+    return (a.get("words") or []) + (b.get("words") or [])
+
 # helper: can two cues be safely merged into a single 2-line block?
 def _can_merge_pair(
     a: Dict[str,Any],
@@ -242,15 +245,13 @@ def enforce_min_readable_v2(
                 prev = events[i-1]
                 prev["text"] = text
                 prev["end"]  = events[i]["end"]
-                if prev.get("words") and e.get("words"):
-                    prev["words"] = prev["words"] + e["words"]
+                prev["words"] = _merged_words(prev, e)
                 del events[i]; i -= 1; continue
             else:
                 nxt = events[i+1]
                 e["text"] = text
                 e["end"]  = nxt["end"]
-                if e.get("words") and nxt.get("words"):
-                    e["words"] = e["words"] + nxt["words"]
+                e["words"] = _merged_words(e, nxt)
                 del events[i+1]; continue
         # last resort: merge orphan forward/back (re-shape; never raw concat)
         if is_orphan:
@@ -413,8 +414,7 @@ def normalize_timing_netflix(
                         words, text = payload
                         ev["text"] = text
                         ev["end"] = events[i+1]["end"]
-                        if ev.get("words") and events[i+1].get("words"):
-                            ev["words"] = ev["words"] + events[i+1]["words"]
+                        ev["words"] = _merged_words(ev, events[i+1])
                         del events[i+1]
                         dur = ev["end"] - ev["start"]
                         # re-evaluate same index after merge
@@ -442,8 +442,7 @@ def normalize_timing_netflix(
                         words, text = payload
                         prev["text"] = text
                         prev["end"] = ev["end"]
-                        if prev.get("words") and ev.get("words"):
-                            prev["words"] = prev["words"] + ev["words"]
+                        prev["words"] = _merged_words(prev, ev)
                         del events[i]
                         i -= 1
                         continue
@@ -500,8 +499,7 @@ def normalize_timing_netflix(
                 words, text = payload
                 a["text"] = text
                 a["end"] = b["end"]
-                if a.get("words") and b.get("words"):
-                    a["words"] = a["words"] + b["words"]
+                a["words"] = _merged_words(a, b)
                 del events[i+1]
                 continue
             # Else, resolve without overlap
@@ -684,8 +682,7 @@ def normalize_timing_netflix(
                     words, text = payload
                     ev["text"] = text
                     ev["end"] = events[i + 1]["end"]
-                    if ev.get("words") and events[i + 1].get("words"):
-                        ev["words"] = ev["words"] + events[i + 1]["words"]
+                    ev["words"] = _merged_words(ev, events[i + 1])
                     del events[i + 1]
                     merged = True
             if not merged and i > 0:
@@ -705,8 +702,7 @@ def normalize_timing_netflix(
                     words, text = payload
                     prev["text"] = text
                     prev["end"] = ev["end"]
-                    if prev.get("words") and ev.get("words"):
-                        prev["words"] = prev["words"] + ev["words"]
+                    prev["words"] = _merged_words(prev, ev)
                     del events[i]
                     i -= 1
                     continue
@@ -742,8 +738,7 @@ def normalize_timing_netflix(
                     words, text = payload
                     ev["text"] = text
                     ev["end"] = events[i + 1]["end"]
-                    if ev.get("words") and events[i + 1].get("words"):
-                        ev["words"] = ev["words"] + events[i + 1]["words"]
+                    ev["words"] = _merged_words(ev, events[i + 1])
                     del events[i + 1]
                     continue
             if i > 0:
@@ -763,8 +758,7 @@ def normalize_timing_netflix(
                     words, text = payload
                     prev["text"] = text
                     prev["end"] = ev["end"]
-                    if prev.get("words") and ev.get("words"):
-                        prev["words"] = prev["words"] + ev["words"]
+                    prev["words"] = _merged_words(prev, ev)
                     del events[i]
                     i -= 1
                     continue
@@ -1043,4 +1037,22 @@ def postprocess_segments(
             timed_out = True
         _trace(f"netflix re-snap out: {len(events)}")
     events = _force_min_gap(events, fps=snap_fps or 25.0, min_gap_frames=2)
+    if snap_fps and os.environ.get("PARAKEET_DISABLE_NETFLIX") != "1":
+        _trace("final snap/validate in")
+        _e = _with_timeout(3.0, normalize_timing_netflix,
+                           events,
+                           fps=snap_fps,
+                           linger_after_audio_ms=500,
+                           min_gap_frames=2,
+                           close_range_frames=(3,11),
+                           small_gap_floor_s=0.5,
+                           max_chars_per_line=max_chars_per_line,
+                           cps_target=cps_target,
+                           two_line_threshold=two_line_threshold,
+                           min_two_line_chars=min_two_line_chars,
+                           shaper=shape_words_into_two_lines_balanced,
+                           max_block_duration_s=max_block_duration_s,
+                           validate=not timed_out)
+        if _e is not None:
+            events = _e
     return events
