@@ -114,6 +114,20 @@ local files_to_cleanup_on_shutdown = {}
 -- @type boolean
 local transcription_in_progress = false
 
+local SRT_POLL_PERIOD_S  = 0.5
+local SRT_POLL_TIMEOUT_S = 240  -- hard stop if nothing shows up
+
+local function _stat(path)
+  local st = utils.file_info(path)
+  if not st then return nil end
+  return { size = st.size or 0, mtime = st.mtime or 0 }
+end
+
+local function _stat_eq(a, b)
+  if not a or not b then return false end
+  return a.size == b.size and a.mtime == b.mtime
+end
+
 --- Safely converts a value to its string representation.
 -- Handles `nil` values by returning the string "nil", preventing errors
 -- that would occur if `tostring(nil)` was called directly in concatenations.
@@ -198,13 +212,23 @@ local function safe_remove(filepath, description)
     end
 end
 
--- idempotent "select if already present else add"
-local function select_existing_or_add(srt_path)
+local function select_existing_or_add(srt_path, want_reload)
   local tracks = mp.get_property_native("track-list") or {}
   for _, t in ipairs(tracks) do
     if t.type == "sub" and t.external and t["external-filename"] == srt_path then
-      mp.set_property_number("sid", t.id)
-      msg.info("[parakeet_mpv] selected existing sub: " .. srt_path)
+      if want_reload then
+        -- try reload; on failure, remove+add
+        mp.command_native_async({"sub-reload", tostring(t.id)}, function(ok)
+          if not ok then
+            mp.command_native_async({"sub-remove", tostring(t.id)}, function()
+              mp.command_native_async({"sub-add", srt_path, "select"}, function() end)
+            end)
+          end
+        end)
+      else
+        mp.set_property_number("sid", t.id)
+        msg.info("[parakeet_mpv] selected existing sub: " .. srt_path)
+      end
       return true
     end
   end
@@ -220,33 +244,51 @@ local function select_existing_or_add(srt_path)
 end
 
 -- poll for SRT; attach as soon as it exists (and optionally when size is stable)
-local attach_timer -- keep a ref so we can kill it later
-local function attach_when_ready(srt_path, period_s, require_stable)
+local attach_timer -- single global timer
+local function attach_when_ready(srt_path, opts)
+  opts = opts or {}
+  local period        = opts.period   or SRT_POLL_PERIOD_S
+  local timeout_s     = opts.timeout  or SRT_POLL_TIMEOUT_S
+  local require_stable= (opts.require_stable ~= false)
+  local initial_stat  = opts.initial_stat    -- {size, mtime}
+  local on_done       = opts.on_done         -- function(success, reason)
+
   if attach_timer then attach_timer:kill(); attach_timer = nil end
-  local added, last_size = false, -1
-  local period = period_s or 0.5
+  local t0        = mp.get_time()
+  local last_size = -1
+  local added     = false
+
   attach_timer = mp.add_periodic_timer(period, function()
+    local elapsed = mp.get_time() - t0
+    if elapsed > timeout_s then
+      if on_done then on_done(false, "timeout") end
+      mp.osd_message("Parakeet: SRT not found (timeout).", 4)
+      attach_timer:kill(); attach_timer = nil
+      return
+    end
+
     local st = utils.file_info(srt_path)
     if not st or not st.size or st.size <= 0 then return end
-    if require_stable then
-      if st.size == last_size then
-        if not added then
-          select_existing_or_add(srt_path)
-          transcription_in_progress = false
-          added = true
-        end
-        attach_timer:kill(); attach_timer = nil
-      else
-        last_size = st.size
-      end
-    else
-      if not added then
-        select_existing_or_add(srt_path)
-        transcription_in_progress = false
-        added = true
-      end
-      attach_timer:kill(); attach_timer = nil
+
+    -- P2: avoid stale reloads — ignore if same stat as before the run
+    if initial_stat and _stat_eq(initial_stat, _stat(srt_path)) then
+      return
     end
+
+    if require_stable then
+      if st.size ~= last_size then
+        last_size = st.size
+        return
+      end
+    end
+
+    if not added then
+      -- if a track already exists for this path, reload it (file changed)
+      select_existing_or_add(srt_path, true)
+      added = true
+      if on_done then on_done(true) end
+    end
+    attach_timer:kill(); attach_timer = nil
   end)
 end
 
@@ -571,8 +613,24 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     table.insert(python_command_args, "--fps=" .. string.format("%.3f", fps))
 
     log("debug", "Running Python script: ", table.concat(python_command_args, " "))
-    attach_when_ready(srt_output_path, 0.5, true)
-    local python_res = utils.subprocess({ args = python_command_args, cancellable = false, capture_stdout = false, capture_stderr = false, detach = true })
+    local initial_stat = _stat(srt_output_path)  -- remember old file
+    attach_when_ready(srt_output_path, {
+      period = SRT_POLL_PERIOD_S,
+      timeout = SRT_POLL_TIMEOUT_S,
+      require_stable = true,
+      initial_stat = initial_stat,
+      on_done = function(ok)
+        -- clear state whether success or timeout/fail
+        transcription_in_progress = false
+      end
+    })
+    local python_res = utils.subprocess({
+      args = python_command_args,
+      cancellable = false,
+      capture_stdout = false,
+      capture_stderr = false,
+      detach = true
+    })
     if python_res and python_res.error then
         log("error", "Failed to launch Parakeet Python script: ", to_str_safe(python_res.error))
         mp.osd_message("Parakeet: Failed to launch Python. Check console.", 7)
@@ -758,7 +816,16 @@ local function run_isolate_then_asr(model)
     local fps = mp.get_property_native("container-fps") or mp.get_property_native("fps") or 24
     table.insert(parakeet_args, "--fps=" .. string.format("%.3f", fps))
     local python_opts = { args = parakeet_args, cancellable = false, capture_stdout = false, capture_stderr = false, detach = true }
-    attach_when_ready(srt_output_path, 0.5, true)
+    local initial_stat = _stat(srt_output_path)
+    attach_when_ready(srt_output_path, {
+      period = SRT_POLL_PERIOD_S,
+      timeout = SRT_POLL_TIMEOUT_S,
+      require_stable = true,
+      initial_stat = initial_stat,
+      on_done = function(ok)
+        transcription_in_progress = false
+      end
+    })
     local python_res = utils.subprocess(python_opts)
     if python_res and python_res.error then
         log("error", "Failed to launch Parakeet Python script: ", to_str_safe(python_res.error))
