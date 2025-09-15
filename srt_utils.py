@@ -1073,13 +1073,30 @@ def postprocess_segments(
                            validate=not timed_out)
         if _e is not None:
             events = _e
-    if snap_fps:
-        spf = 1.0 / snap_fps
+    def _infer_fps(events):
+        # fallback if snap_fps is falsy; picks closest known grid
+        cand = [23.976, 24.0, 25.0, 29.97, 30.0]
+        def rmse(fps):
+            spf = 1.0 / max(1e-9, fps)
+            import math
+            # measure how close starts/ends are to frame grid
+            err = []
+            for ev in events:
+                for t in (ev["start"], ev["end"]):
+                    q = round(t / spf)
+                    err.append((t - q * spf) ** 2)
+            return (sum(err) / max(1, len(err))) ** 0.5
+        return min(cand, key=rmse)
+
+    eff_fps = snap_fps or _infer_fps(events)
+    spf = 1.0 / eff_fps
+    for i in range(len(events) - 1):
+        ns = events[i + 1]["start"]
+        pe = events[i]["end"]
         min_gap = 2 * spf
-        for i in range(len(events) - 1):
-            gap = events[i + 1]["start"] - events[i]["end"]
-            if gap < min_gap - 1e-9:
-                events[i]["end"] = events[i + 1]["start"] - min_gap
-                if events[i]["end"] <= events[i]["start"]:
-                    events[i]["end"] = events[i]["start"] + spf
+        if ns - pe < min_gap - 1e-9:
+            # make the left end exactly 2 frames before the next start
+            events[i]["end"] = ns - min_gap
+            if events[i]["end"] <= events[i]["start"]:
+                events[i]["end"] = events[i]["start"] + spf
     return events
