@@ -8,6 +8,9 @@
 
 local mp = require 'mp'
 local utils = require 'mp.utils'
+local msg   = mp.msg
+
+local osd_duration_default = 3 -- seconds
 
 -- Subtitle alignment and styling are configured via mpv.conf;
 -- this script intentionally avoids forcing ASS overrides.
@@ -111,6 +114,33 @@ local files_to_cleanup_on_shutdown = {}
 -- @type boolean
 local transcription_in_progress = false
 
+local SRT_POLL_PERIOD_S   = 0.5
+local SRT_BG_PERIOD_S     = 5.0   -- background polling after soft timeout
+local SRT_POLL_TIMEOUT_S  = 240   -- default if duration unknown
+
+local function _stat(path)
+  local st = utils.file_info(path)
+  if not st then return nil end
+  return { size = st.size or 0, mtime = st.mtime or 0 }
+end
+
+local function _stat_eq(a, b)
+  if not a or not b then return false end
+  return a.size == b.size and a.mtime == b.mtime
+end
+
+local function _compute_timeout_s()
+  local dur = tonumber(mp.get_property("duration") or "") or 0
+  if dur > 0 then
+    -- 25% of program length, clamped between 120s and 1200s
+    local t = dur * 0.25
+    if t < 120 then t = 120 end
+    if t > 1200 then t = 1200 end
+    return t
+  end
+  return SRT_POLL_TIMEOUT_S
+end
+
 --- Safely converts a value to its string representation.
 -- Handles `nil` values by returning the string "nil", preventing errors
 -- that would occur if `tostring(nil)` was called directly in concatenations.
@@ -193,6 +223,100 @@ local function safe_remove(filepath, description)
     else
         log("debug", "Temporary file (" .. (description or "unspecified") .. ") not found for removal, skipping: ", filepath)
     end
+end
+
+local function select_existing_or_add(srt_path, want_reload)
+  local tracks = mp.get_property_native("track-list") or {}
+  for _, t in ipairs(tracks) do
+    if t.type == "sub" and t.external and t["external-filename"] == srt_path then
+      if want_reload then
+        -- try reload; on failure, remove+add
+        mp.command_native_async({"sub-reload", tostring(t.id)}, function(ok)
+          if not ok then
+            mp.command_native_async({"sub-remove", tostring(t.id)}, function()
+              mp.command_native_async({"sub-add", srt_path, "select"}, function() end)
+            end)
+          end
+        end)
+      else
+        mp.set_property_number("sid", t.id)
+        msg.info("[parakeet_mpv] selected existing sub: " .. srt_path)
+      end
+      return true
+    end
+  end
+  mp.command_native_async({"sub-add", srt_path, "select"}, function(ok, _, err)
+    if ok then
+      msg.info("[parakeet_mpv] sub-add OK")
+    else
+      msg.error("[parakeet_mpv] sub-add failed: " .. (err or "unknown"))
+      mp.commandv("rescan-external-files", "reselect")
+    end
+  end)
+  return false
+end
+
+-- poll for SRT; attach as soon as it exists (and optionally when size is stable)
+local attach_timer   -- single live timer; new runs kill the old one
+local function attach_when_ready(srt_path, opts)
+  opts = opts or {}
+  local period         = opts.period   or SRT_POLL_PERIOD_S
+  local timeout_s      = opts.timeout  or _compute_timeout_s()
+  local require_stable = (opts.require_stable ~= false)
+  local initial_stat   = opts.initial_stat  -- {size, mtime} before run
+  local on_done        = opts.on_done       -- function(success, reason)
+  local said_soft_msg  = false
+  local soft_timed_out = false
+  local t0             = mp.get_time()
+  local last_size      = -1
+  local added          = false
+
+  if attach_timer then attach_timer:kill(); attach_timer = nil end
+
+  attach_timer = mp.add_periodic_timer(period, function()
+    local now     = mp.get_time()
+    local elapsed = now - t0
+
+    -- Soft timeout: free UI, switch to background polling, keep waiting
+    if (not soft_timed_out) and elapsed > timeout_s then
+      soft_timed_out = true
+      if on_done then on_done(false, "timeout") end
+      if not said_soft_msg then
+        mp.osd_message("Parakeet: still transcribing… will attach when ready.", 3)
+        said_soft_msg = true
+      end
+      -- switch to slower background polling
+      attach_timer:kill()
+      attach_timer = mp.add_periodic_timer(SRT_BG_PERIOD_S, function()
+        local st = utils.file_info(srt_path)
+        if not st or not st.size or st.size <= 0 then return end
+        if initial_stat and _stat_eq(initial_stat, _stat(srt_path)) then return end
+        if require_stable then
+          if st.size ~= last_size then last_size = st.size; return end
+        end
+        if not added then
+          select_existing_or_add(srt_path, true)
+          added = true
+        end
+        attach_timer:kill(); attach_timer = nil
+      end)
+      return
+    end
+
+    -- Normal (pre-timeout) polling:
+    local st = utils.file_info(srt_path)
+    if not st or not st.size or st.size <= 0 then return end
+    if initial_stat and _stat_eq(initial_stat, _stat(srt_path)) then return end
+    if require_stable then
+      if st.size ~= last_size then last_size = st.size; return end
+    end
+    if not added then
+      select_existing_or_add(srt_path, true)
+      added = true
+      if on_done then on_done(true) end
+    end
+    attach_timer:kill(); attach_timer = nil
+  end)
 end
 
 --- Retrieves audio stream information using ffprobe.
@@ -516,38 +640,32 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     table.insert(python_command_args, "--fps=" .. string.format("%.3f", fps))
 
     log("debug", "Running Python script: ", table.concat(python_command_args, " "))
-    local python_res = utils.subprocess({ args = python_command_args, cancellable = false, capture_stdout = true, capture_stderr = true })
-
-    if python_res.error then
-        log("error", "Failed to launch Parakeet Python script: ", (python_res.error or "Unknown error"))
-        if python_res.stderr and string.len(python_res.stderr) > 0 then
-             log("error", "Stderr from Python launch failure: ", python_res.stderr)
-        end
-        mp.osd_message("Parakeet: Failed to launch Python. Check console.", 7)
-    else
-        log("info", "Parakeet Python script finished (PID: ", (python_res.pid or "unknown"), "). Status: ", to_str_safe(python_res.status))
-        if python_res.stdout and string.len(python_res.stdout) > 0 then log("debug", "Python script stdout: ", python_res.stdout) end
-        if python_res.stderr and string.len(python_res.stderr) > 0 then log("debug", "Python script stderr: ", python_res.stderr) end
-
-        if python_res.status ~= nil and python_res.status ~= 0 then
-             log("warn", "Python script exited with an error. Status: ", to_str_safe(python_res.status), ". Check Python script's own logging for details.")
-             mp.osd_message("Parakeet: Python script error. Check console.", 7)
-        end
-
-        log("info", "Attempting to load SRT immediately: ", srt_output_path)
-        if utils.file_info(srt_output_path) and utils.file_info(srt_output_path).size > 0 then
-            mp.commandv("sub-add", srt_output_path, "select") -- Use "select" to force MPV to switch to this subtitle
-            mp.osd_message("Parakeet: Loaded " .. (srt_output_path:match("([^/\\]+)$") or srt_output_path), 3)
-        elseif utils.file_info(srt_output_path) then
-            log("warn", "SRT file found but is empty: ", srt_output_path, ". This might indicate a transcription problem or an error SRT with no content.")
-            mp.osd_message("Parakeet: SRT file empty. Check console.", 5)
-        else
-            log("warn", "SRT file not found after Python script execution: ", srt_output_path, ". Transcription may have failed.")
-            mp.osd_message("Parakeet: SRT not found. Check Python logs.", 7)
-        end
-    end
-    log("info", "Transcription process complete. Temporary audio files (if any) will be cleaned on MPV shutdown.")
-    abort()
+    local initial_stat = _stat(srt_output_path)
+    attach_when_ready(srt_output_path, {
+      period         = SRT_POLL_PERIOD_S,
+      timeout        = _compute_timeout_s(),
+      require_stable = true,
+      initial_stat   = initial_stat,
+      on_done        = function(ok)
+        -- clear busy flag on both success and soft timeout
+        transcription_in_progress = false
+      end
+    })
+    mp.command_native_async({
+      name = "subprocess",
+      args = python_command_args,
+      playback_only = false,
+      capture_stdout = false,
+      capture_stderr = false,
+    }, function(success, res, err)
+      local rc = (res and res.status) or -1
+      if not success or rc ~= 0 then
+        if attach_timer then attach_timer:kill(); attach_timer = nil end
+        transcription_in_progress = false
+        mp.osd_message(("Parakeet: transcription failed (rc=%s)."):format(tostring(rc)), 3)
+      end
+    end)
+    msg.info("[parakeet_mpv] Transcription started. SRT will load when ready.")
 end
 
 -- Perform FFmpeg extraction -> RoFormer separation -> Parakeet ASR
@@ -724,25 +842,32 @@ local function run_isolate_then_asr(model)
     for _,v in ipairs(seg_args) do table.insert(parakeet_args, v) end
     local fps = mp.get_property_native("container-fps") or mp.get_property_native("fps") or 24
     table.insert(parakeet_args, "--fps=" .. string.format("%.3f", fps))
-    local python_opts = { args = parakeet_args, cancellable = false, capture_stdout = true, capture_stderr = true }
-    local python_res = utils.subprocess(python_opts)
-    if python_res.error then
-        log("error", "Failed to launch Parakeet Python script: ", to_str_safe(python_res.error))
-        mp.osd_message("Parakeet: Failed to launch Python.", 7)
-    else
-        if python_res.stderr and string.len(python_res.stderr) > 0 then log("debug", "Python stderr: ", python_res.stderr) end
-        if python_res.status ~= nil and python_res.status ~= 0 then
-            mp.osd_message("Parakeet: Python script error.", 7)
-        end
-        if utils.file_info(srt_output_path) and utils.file_info(srt_output_path).size > 0 then
-            mp.commandv("sub-add", srt_output_path, "select")
-            mp.osd_message("Parakeet: Loaded SRT", 3)
-        else
-            mp.osd_message("Parakeet: SRT not found.", 7)
-        end
-    end
-
-    abort()
+    local python_opts = {
+      name = "subprocess",
+      args = parakeet_args,
+      playback_only = false,
+      capture_stdout = false,
+      capture_stderr = false,
+    }
+    local initial_stat = _stat(srt_output_path)
+    attach_when_ready(srt_output_path, {
+      period         = SRT_POLL_PERIOD_S,
+      timeout        = _compute_timeout_s(),
+      require_stable = true,
+      initial_stat   = initial_stat,
+      on_done        = function(ok)
+        transcription_in_progress = false
+      end
+    })
+    mp.command_native_async(python_opts, function(success, res, err)
+      local rc = (res and res.status) or -1
+      if not success or rc ~= 0 then
+        if attach_timer then attach_timer:kill(); attach_timer = nil end
+        transcription_in_progress = false
+        mp.osd_message(("Parakeet: transcription failed (rc=%s)."):format(tostring(rc)), 3)
+      end
+    end)
+    msg.info("[parakeet_mpv] Transcription started. SRT will load when ready.")
 end
 
 --- Wrapper function to call `do_transcription_core` with default settings.
@@ -817,5 +942,6 @@ mp.register_event("shutdown", function()
     else
         log("info", "No temporary files registered for cleanup.")
     end
+    if attach_timer then attach_timer:kill(); attach_timer = nil end
     log("info", "Parakeet shutdown cleanup finished.")
 end)
