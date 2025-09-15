@@ -76,14 +76,25 @@ def format_start_ms(t: float) -> str: return _fmt_ms(_ms_ceil (t))
 def format_end_ms  (t: float) -> str: return _fmt_ms(_ms_floor(t))
 
 def _write_diag_sidecar(events, out_path):
+    def _chars(ev):
+        # use shaped text (as printed), not the raw word list
+        return len((ev.get("text") or "").replace("\n", ""))
+
     rows = []
     for i, ev in enumerate(events, 1):
         d = ev.get("_dbg", {}) or {}
+        dur_f = max(1e-9, ev["end"] - ev["start"])
+        cps_f = _chars(ev) / dur_f
+        s_ms = _ms_ceil(ev["start"])
+        e_ms = _ms_floor(ev["end"])
+        dur_ms_render = max(0, e_ms - s_ms)
         rows.append({
             "idx": i,
             "start": ev["start"],
             "end": ev["end"],
-            "dur_ms": int(round((ev["end"] - ev["start"]) * 1000)),
+            "dur_ms": int(round(dur_f * 1000)),
+            "cps_float": round(cps_f, 2),
+            "dur_ms_rendered": dur_ms_render,
             "linger_ms": d.get("linger_ms", 0),
             "linger_clamped": bool(d.get("linger_clamped", False)),
             "borrow_from_right_ms": d.get("borrow_from_right_ms", 0),
