@@ -54,8 +54,8 @@ def _fmt_ms(total_ms: int) -> str:
     h = total_m // 60
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
-def format_start_ms(t: float) -> str: return _fmt_ms(_ms_floor(t))
-def format_end_ms  (t: float) -> str: return _fmt_ms(_ms_ceil (t))
+def format_start_ms(t: float) -> str: return _fmt_ms(_ms_ceil (t))
+def format_end_ms  (t: float) -> str: return _fmt_ms(_ms_floor(t))
 
 def write_srt(events: List[Dict[str,Any]], out_path: str) -> None:
     with open(out_path, "w", encoding="utf-8") as f:
@@ -417,11 +417,11 @@ def normalize_timing_netflix(
         dur = ev["end"] - ev["start"]
         if dur < min_dur:
             # Try merge forward if gap small and mergeable
-            if i+1 < len(events):
-                gap_to_next = events[i+1]["start"] - ev["end"]
+            if i + 1 < len(events):
+                gap_to_next = events[i + 1]["start"] - ev["end"]
                 if gap_to_next <= small_gap_floor_s:
                     ok, payload = _can_merge_pair(
-                        ev, events[i+1],
+                        ev, events[i + 1],
                         max_chars_per_line, cps_target,
                         two_line_threshold, min_two_line_chars,
                         max_block_duration_s, shaper,
@@ -430,32 +430,52 @@ def normalize_timing_netflix(
                     if ok and payload:
                         words, text = payload
                         ev["text"] = text
-                        ev["end"] = events[i+1]["end"]
-                        ev["words"] = _merged_words(ev, events[i+1])
-                        del events[i+1]
+                        ev["end"] = events[i + 1]["end"]
+                        ev["words"] = _merged_words(ev, events[i + 1])
+                        del events[i + 1]
                         dur = ev["end"] - ev["start"]
                         # re-evaluate same index after merge
                         continue
-            # Extend towards next cue if room
-            if i+1 < len(events):
-                max_end = events[i+1]["start"] - min_gap_frames*spf
-                target = min(ev["start"] + min_dur, max_end)
-                if target > ev["end"]:
-                    ev["end"] = target
-                    dur = ev["end"] - ev["start"]
-            # If still short, try merge backward
-            if dur < min_dur and i > 0:
-                gap_to_prev = ev["start"] - events[i-1]["end"]
+            # If forward merge failed, try merge backward next
+            if i > 0:
+                gap_to_prev = ev["start"] - events[i - 1]["end"]
                 if gap_to_prev <= small_gap_floor_s:
                     ok, payload = _can_merge_pair(
-                        events[i-1], ev,
+                        events[i - 1], ev,
                         max_chars_per_line, cps_target,
                         two_line_threshold, min_two_line_chars,
                         max_block_duration_s, shaper,
                         allow_cps_decrease=True,
                     )
                     if ok and payload:
-                        prev = events[i-1]
+                        prev = events[i - 1]
+                        words, text = payload
+                        prev["text"] = text
+                        prev["end"] = ev["end"]
+                        prev["words"] = _merged_words(prev, ev)
+                        del events[i]
+                        i -= 1
+                        continue
+            # Extend towards next cue if room
+            if i + 1 < len(events):
+                max_end = events[i + 1]["start"] - min_gap_frames * spf
+                target = min(ev["start"] + min_dur, max_end)
+                if target > ev["end"]:
+                    ev["end"] = target
+                    dur = ev["end"] - ev["start"]
+            # If still short, try merge backward again
+            if dur < min_dur and i > 0:
+                gap_to_prev = ev["start"] - events[i - 1]["end"]
+                if gap_to_prev <= small_gap_floor_s:
+                    ok, payload = _can_merge_pair(
+                        events[i - 1], ev,
+                        max_chars_per_line, cps_target,
+                        two_line_threshold, min_two_line_chars,
+                        max_block_duration_s, shaper,
+                        allow_cps_decrease=True,
+                    )
+                    if ok and payload:
+                        prev = events[i - 1]
                         words, text = payload
                         prev["text"] = text
                         prev["end"] = ev["end"]
@@ -1049,7 +1069,6 @@ def postprocess_segments(
         else:
             timed_out = True
         _trace(f"netflix re-snap out: {len(events)}")
-    events = _force_min_gap(events, fps=snap_fps or 25.0, min_gap_frames=2)
     if snap_fps and os.environ.get("PARAKEET_DISABLE_NETFLIX") != "1":
         _trace("final snap/validate in")
         _e = _with_timeout(3.0, normalize_timing_netflix,
@@ -1068,4 +1087,5 @@ def postprocess_segments(
                            validate=not timed_out)
         if _e is not None:
             events = _e
+    events = _force_min_gap(events, fps=snap_fps or 25.0, min_gap_frames=2)
     return events
