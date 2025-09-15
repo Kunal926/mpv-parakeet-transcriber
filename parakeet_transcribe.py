@@ -564,8 +564,10 @@ def main():
         _cleanup_t0 = time.perf_counter()
         _log_event("cleanup_begin", long_audio=long_audio_settings_applied)
         # Cleanup: revert model settings, move model to CPU, and clear cache
+        revert_s = cpu_move_s = empty_cache_s = None
         if asr_model is not None:
             if long_audio_settings_applied:
+                _revert_t0 = time.perf_counter()
                 try:
                     print("Reverting long audio settings...", file=sys.stderr)
                     # Revert to default attention and subsampling settings
@@ -574,16 +576,39 @@ def main():
                     print("Long audio settings reverted.", file=sys.stderr)
                 except Exception as revert_e:
                     print(f"Warning: Failed to revert long audio settings: {revert_e}", file=sys.stderr)
+                finally:
+                    revert_s = round(time.perf_counter() - _revert_t0, 3)
+
+            _cpu_t0 = time.perf_counter()
             try:
                 # Move model to CPU and clear memory
-                if hasattr(asr_model, 'cpu'): asr_model.cpu()
+                if hasattr(asr_model, 'cpu'):
+                    asr_model.cpu()
                 del asr_model
                 gc.collect() # Force garbage collection
-                if torch.cuda.is_available(): torch.cuda.empty_cache() # Clear CUDA cache
-                print("Model moved to CPU and CUDA cache cleared (if applicable).", file=sys.stderr)
             except Exception as cleanup_e:
                 print(f"Error during model cleanup: {cleanup_e}", file=sys.stderr)
-        _log_event("cleanup_done", cleanup_s=round(time.perf_counter() - _cleanup_t0, 3))
+            finally:
+                cpu_move_s = round(time.perf_counter() - _cpu_t0, 3)
+
+            _cache_t0 = time.perf_counter()
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache() # Clear CUDA cache
+            except Exception as cache_e:
+                print(f"Error during cache cleanup: {cache_e}", file=sys.stderr)
+            finally:
+                empty_cache_s = round(time.perf_counter() - _cache_t0, 3)
+
+            print("Model moved to CPU and CUDA cache cleared (if applicable).", file=sys.stderr)
+
+        _log_event(
+            "cleanup_done",
+            revert_s=revert_s,
+            cpu_move_s=cpu_move_s,
+            empty_cache_s=empty_cache_s,
+            cleanup_s=round(time.perf_counter() - _cleanup_t0, 3),
+        )
 
 if __name__ == "__main__":
     main()
