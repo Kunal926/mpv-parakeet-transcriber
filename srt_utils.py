@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import List, Dict, Any, Tuple
-import math, sys, os, time, re
+import math, sys, os, time, re, csv, json
 from segmenter import segment_by_pause_and_phrase, shape_words_into_two_lines_balanced
 
 # ---------- tiny helpers ----------
@@ -39,6 +39,24 @@ SPACES = re.compile(r"\s+")
 def normalize_text(t: str) -> str:
     return SPACES.sub(" ", (t or "")).strip()
 
+# --- diagnostics helpers ---
+def _dbg(ev):
+    d = ev.get("_dbg")
+    if d is None:
+        d = {}
+        ev["_dbg"] = d
+    return d
+
+def _dbg_add_ms(ev, key, ms):
+    if ms <= 0:
+        return
+    d = _dbg(ev)
+    d[key] = int(d.get(key, 0) + round(ms))
+
+def _last_word_end(ev):
+    w = ev.get("words") or []
+    return float(w[-1]["end"]) if w else float(ev["end"])
+
 def _ms_floor(t: float) -> int:
     return 0 if not math.isfinite(t) or t < 0 else math.floor(t * 1000 + 1e-9)
 
@@ -57,10 +75,36 @@ def _fmt_ms(total_ms: int) -> str:
 def format_start_ms(t: float) -> str: return _fmt_ms(_ms_ceil (t))
 def format_end_ms  (t: float) -> str: return _fmt_ms(_ms_floor(t))
 
+def _write_diag_sidecar(events, out_path):
+    rows = []
+    for i, ev in enumerate(events, 1):
+        d = ev.get("_dbg", {}) or {}
+        rows.append({
+            "idx": i,
+            "start": ev["start"],
+            "end": ev["end"],
+            "dur_ms": int(round((ev["end"] - ev["start"]) * 1000)),
+            "linger_ms": d.get("linger_ms", 0),
+            "linger_clamped": bool(d.get("linger_clamped", False)),
+            "borrow_from_right_ms": d.get("borrow_from_right_ms", 0),
+            "gave_to_left_ms": d.get("gave_to_left_ms", 0),
+            "final_gap_fence_ms": d.get("final_gap_fence_ms", 0),
+        })
+    base = out_path
+    with open(base + ".diag.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader(); w.writerows(rows)
+    with open(base + ".diag.json", "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
+
 def write_srt(events: List[Dict[str,Any]], out_path: str) -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         for i, ev in enumerate(events, 1):
-            f.write(f"{i}\n{format_start_ms(ev['start'])} --> {format_end_ms(ev['end'])}\n{ev['text'].strip()}\n\n")
+            f.write(f"{i}\n{format_start_ms(ev['start'])} --> {format_end_ms(ev['end'])}\n{(ev['text'] or '').strip()}\n\n")
+    try:
+        _write_diag_sidecar(events, out_path)
+    except Exception:
+        pass
 
 # helper: cps of an event
 def _cps_of(ev: Dict[str, Any]) -> float:
@@ -488,22 +532,30 @@ def normalize_timing_netflix(
     #    Safe = next.start - last_audio_end >= 0.5s. Otherwise don't linger here.
     for i,ev in enumerate(events):
         ws = ev.get("words") or []
-        if not ws: continue
-        last_audio_end = ws[-1]["end"]
+        if not ws:
+            continue
+        audio_end = _last_word_end(ev)
+        target = ev["end"]
         if i+1 < len(events):
-            gap_to_next = events[i+1]["start"] - last_audio_end
+            gap_to_next = events[i+1]["start"] - audio_end
             if gap_to_next >= small_gap_floor_s:
-                target = min(
-                    last_audio_end + linger_after_audio_ms/1000.0,
+                candidate = min(
+                    audio_end + linger_after_audio_ms/1000.0,
                     events[i+1]["start"] - min_gap_frames*spf,
                 )
-                if target > ev["end"]:
-                    ev["end"] = target
+                if candidate > ev["end"]:
+                    target = candidate
         else:
             # last cue in file
-            target = last_audio_end + linger_after_audio_ms/1000.0
-            if target > ev["end"]:
-                ev["end"] = target
+            candidate = audio_end + linger_after_audio_ms/1000.0
+            if candidate > ev["end"]:
+                target = candidate
+        prev_end = ev["end"]
+        ev["end"] = target
+        _linger_ms = max(0.0, (target - audio_end) * 1000.0)
+        _dbg_add_ms(ev, "linger_ms", _linger_ms)
+        if target < audio_end + linger_after_audio_ms/1000.0 - 1e-9:
+            _dbg(ev)["linger_clamped"] = True
     # 4) Chaining / closing gaps
     i = 0
     while i < len(events) - 1:
@@ -606,6 +658,7 @@ def normalize_timing_netflix(
         orig_end = cur["end"]
         orig_start_nxt = nxt["start"]
         orig_end_nxt = nxt["end"]
+        give = 0.0
         take = min(spare_gap, borrow)
         # use silent gap without shifting the next cue's start
         cur["end"] += take
@@ -613,6 +666,7 @@ def normalize_timing_netflix(
         if borrow > 0:
             cur["end"] += borrow
             nxt["start"] += borrow
+            give = borrow
             ws = nxt.get("words") or []
             if ws:
                 audio_start = _floor(ws[0]["start"], fps)
@@ -638,6 +692,8 @@ def normalize_timing_netflix(
             nxt["start"] = orig_start_nxt
             nxt["end"] = orig_end_nxt
             return False
+        _dbg_add_ms(cur, "borrow_from_right_ms", give * 1000.0)
+        _dbg_add_ms(nxt, "gave_to_left_ms", give * 1000.0)
         return True
 
     def _borrow_from_left(idx: int, need: float, tolerance: float = 0.002) -> bool:
@@ -919,6 +975,8 @@ def rebalance_cps_borrow_time(
                     nx["end"] = new_nx_end
                     e["end"] = new_e_end
                     need -= give
+                    _dbg_add_ms(e, "borrow_from_right_ms", give * 1000.0)
+                    _dbg_add_ms(nx, "gave_to_left_ms", give * 1000.0)
 
         i += 1
     return events
@@ -1095,8 +1153,8 @@ def postprocess_segments(
         pe = events[i]["end"]
         min_gap = 2 * spf
         if ns - pe < min_gap - 1e-9:
-            # make the left end exactly 2 frames before the next start
-            events[i]["end"] = ns - min_gap
-            if events[i]["end"] <= events[i]["start"]:
-                events[i]["end"] = events[i]["start"] + spf
+            new_end = ns - min_gap
+            if pe - new_end > 1e-9:
+                _dbg_add_ms(events[i], "final_gap_fence_ms", (pe - new_end) * 1000.0)
+            events[i]["end"] = max(new_end, events[i]["start"] + spf)
     return events
