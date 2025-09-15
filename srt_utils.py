@@ -214,26 +214,40 @@ def enforce_min_readable_v2(
         # try merge with prev/next (score by 2-line fit & cps)
         def score_merge(left, right, _shaper=shaper):
             lw, rw = (left.get("words") or []), (right.get("words") or [])
-            if not lw or not rw: return -1e9, None
+            if not lw or not rw:
+                return -1e9, None
             # Respect gap limit for borrowing/merge
             gap_ms = int(round((right["start"] - left["end"]) * 1000))
             if gap_ms > max_merge_gap_ms:
                 return -1e9, None
-            cand = _merged_words(left, right)
+            cand = lw + rw
             lines, used, overflow = _shaper(
                 cand,
                 max_chars=max_chars_per_line,
                 prefer_two_lines=True,
-                two_line_threshold=0.55,
+                two_line_threshold=0.60,
                 min_two_line_chars=min_two_line_chars,
             )
-            # If overflow, refuse this merge in the scoring path (we'll handle overflow in explicit merges)
-            if overflow: return -1e9, None
-            txt = " ".join((w.get("word","") or "").strip() for w in cand)
-            cps = len(txt) / max(0.001, (right["end"] - left["start"]))
-            if cps > cps_target: return -1e9, None
+            if overflow:
+                return -1e9, None
+            txt = " ".join((w.get("word", "") or "").strip() for w in cand)
+            dur = max(0.001, right["end"] - left["start"])
+            cps = len(txt) / dur
+            # New policy: allow merge when merged CPS strictly decreases
+            # versus the worst local CPS, even if still above target.
+            if cps > cps_target:
+                def _cps_of(ev):
+                    t = (ev.get("text") or "")
+                    if not t:
+                        t = " ".join((w.get("word", "") or "").strip() for w in (ev.get("words") or []))
+                    d = max(0.001, ev["end"] - ev["start"])
+                    return len(t.replace("\n", " ")) / d
+                worst_local = max(_cps_of(left), _cps_of(right))
+                # Require a strictly lower CPS (epsilon for float noise)
+                if cps >= worst_local - 1e-6:
+                    return -1e9, None
             diff = abs(len(lines[0]) - len(lines[-1]))
-            return -(diff + cps*0.4), (cand, "\n".join(lines[:2]))
+            return -(diff + cps * 0.4), (cand, "\n".join(lines[:2]))
         best = None
         if i>0:
             s,p = score_merge(events[i-1], e)
