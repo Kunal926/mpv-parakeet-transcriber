@@ -14,19 +14,193 @@
 #   the error message is flushed to the file.
 # - Supports generation of SRT files based on segment-level or word-level timestamps.
 
-import nemo.collections.asr as nemo_asr
-import sys
 import os
-import soundfile as sf
-import librosa
-import argparse
-import numpy as np
-import torch
-import gc
+import sys
 import time
+import uuid
+import tempfile
+import shutil
 import json
+from datetime import datetime, timezone
 from pathlib import Path
+
+import argparse
+import gc
+import librosa
+import nemo.collections.asr as nemo_asr
+import numpy as np
+import soundfile as sf
+import torch
 from torch.cuda.amp import autocast
+
+# --- logging bootstrap (robust, race-safe) ---
+RUN_ID = str(uuid.uuid4())
+RUN_DIR = None
+LOG_PATH = None
+JSONL_PATH = None
+_LOG_FH = None
+
+
+def _safe_makedirs(path: str):
+    if not path:
+        return
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass  # never let logging kill the process
+
+
+def _purge_old_runs(root: str, max_age_hours: float):
+    """Delete only *expired* run dirs; ignore errors so concurrent runs survive."""
+    now = time.time()
+    try:
+        for name in os.listdir(root):
+            p = os.path.join(root, name)
+            try:
+                if not os.path.isdir(p):
+                    continue
+                age_h = (now - os.path.getmtime(p)) / 3600.0
+                if age_h >= max_age_hours:
+                    shutil.rmtree(p, ignore_errors=True)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def _open_log_file(path: str):
+    """Open a line-buffered utf-8 log file; return file handle or None on failure."""
+    try:
+        _safe_makedirs(os.path.dirname(path))
+        return open(path, "a", encoding="utf-8", buffering=1)
+    except Exception:
+        return None
+
+
+def _setup_logs():
+    """
+    Create:
+      - run.log (human-readable; captures stderr)
+      - run.jsonl (structured; can be disabled)
+    Never throws. Defaults:
+      - stderr is TEE'd to console + file (so CLI users still see progress).
+      - logs live under %TEMP%/parakeet_runs/<timestamp>_<uuid>/ unless PARAKEET_LOG_FILE is set.
+    """
+    global RUN_DIR, LOG_PATH, JSONL_PATH, _LOG_FH
+
+    # Choose destination
+    forced_file = os.environ.get("PARAKEET_LOG_FILE")
+    if forced_file:
+        LOG_PATH = forced_file
+        RUN_DIR = os.path.dirname(LOG_PATH) or tempfile.gettempdir()
+    else:
+        root = os.environ.get("PARAKEET_LOG_ROOT") or os.path.join(tempfile.gettempdir(), "parakeet_runs")
+        _safe_makedirs(root)
+        # Only purge *old* runs, not everything, to avoid races.
+        max_age_h = float(os.environ.get("PARAKEET_PURGE_MAX_AGE_HOURS", "24"))
+        _purge_old_runs(root, max_age_h)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        RUN_DIR = os.path.join(root, f"{stamp}_{RUN_ID[:8]}")
+        _safe_makedirs(RUN_DIR)
+        LOG_PATH = os.path.join(RUN_DIR, "run.log")
+
+    JSONL_PATH = os.path.join(RUN_DIR, "run.jsonl")
+
+    # Open log file (but never crash if it fails)
+    _LOG_FH = _open_log_file(LOG_PATH)
+
+    # Before redirecting anything, announce the log location to the real stderr (P1).
+    try:
+        sys.__stderr__.write(f"[parakeet] logging to: {LOG_PATH}\n")
+        if os.environ.get("PARAKEET_JSONL", "1") == "1":
+            sys.__stderr__.write(f"[parakeet] jsonl at: {JSONL_PATH}\n")
+        sys.__stderr__.flush()
+    except Exception:
+        pass
+
+    # Decide stderr routing: default to TEE (console + file). (P1)
+    mirror = os.environ.get("PARAKEET_MIRROR_STDERR")
+    file_only = os.environ.get("PARAKEET_FILE_ONLY_STDERR")
+    if _LOG_FH is not None:
+        if file_only == "1":
+            # file only
+            class _FileOnly:
+                def write(self, s):
+                    try:
+                        _LOG_FH.write(s)
+                    except Exception:
+                        pass
+
+                def flush(self):
+                    try:
+                        _LOG_FH.flush()
+                    except Exception:
+                        pass
+
+            sys.stderr = _FileOnly()
+        else:
+            # tee by default (or if PARAKEET_MIRROR_STDERR=1)
+            class _Tee:
+                def __init__(self, *streams):
+                    self._streams = streams
+
+                def write(self, s):
+                    for st in self._streams:
+                        try:
+                            st.write(s)
+                        except Exception:
+                            pass
+
+                def flush(self):
+                    for st in self._streams:
+                        try:
+                            st.flush()
+                        except Exception:
+                            pass
+
+            # Always tee unless user explicitly asked for file-only.
+            sys.stderr = _Tee(sys.__stderr__, _LOG_FH)
+
+    # Header
+    try:
+        ts = datetime.now(timezone.utc).isoformat()
+        if _LOG_FH:
+            _LOG_FH.write(f"===== Parakeet run {RUN_ID} started {ts} =====\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+    _log_event(
+        "run_start",
+        pid=os.getpid(),
+        log_path=LOG_PATH,
+        jsonl_path=(JSONL_PATH if os.environ.get("PARAKEET_JSONL", "1") == "1" else None),
+    )
+
+
+def _log_event(event: str, **fields):
+    """Append one structured JSON line (disable via PARAKEET_JSONL=0). Never throws."""
+    if os.environ.get("PARAKEET_JSONL", "1") != "1":
+        return
+    try:
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "run_id": RUN_ID,
+            "event": event,
+            **fields,
+        }
+        _safe_makedirs(os.path.dirname(JSONL_PATH))
+        with open(JSONL_PATH, "a", encoding="utf-8") as jf:
+            json.dump(rec, jf, ensure_ascii=False)
+            jf.write("\n")
+    except Exception:
+        # fall back to human log so we still see the event if JSONL path vanishes
+        try:
+            if _LOG_FH:
+                _LOG_FH.write(f"[event:{event}] {fields}\n")
+        except Exception:
+            pass
+# --- end bootstrap ---
 
 # Ensure repository modules are importable when launched without a
 # preconfigured PYTHONPATH. Python adds the script directory to
@@ -222,6 +396,8 @@ def main():
                         help="Max gap for orphan merges/borrowing")
     args = parser.parse_args()
 
+    _setup_logs()
+
     audio_path = args.audio_file_path
     srt_path = args.srt_output_file_path
     global_offset_seconds = args.audio_start_offset
@@ -303,6 +479,7 @@ def main():
         
         asr_model.eval() # Set model to evaluation mode
         t1 = time.perf_counter()
+        _log_event("model_loaded", use_cuda=use_cuda, dtype=str(model_dtype), load_s=round(t1 - t0, 3))
 
         # Get model's expected sample rate
         target_sr_from_model_cfg = asr_model.cfg.preprocessor.sample_rate
@@ -332,10 +509,13 @@ def main():
                 print(f"Error: {err_msg}", file=sys.stderr)
                 write_error_srt(err_msg)
                 sys.exit(1)
+        _log_event("audio_info", duration_s=audio_duration_seconds, samplerate=actual_sr if 'actual_sr' in locals() else None,
+                   channels=actual_channels if 'actual_channels' in locals() else None)
 
         # Configure model for long audio if duration exceeds threshold
         LONG_AUDIO_THRESHOLD_S = 480 # 8 minutes
         if audio_duration_seconds > LONG_AUDIO_THRESHOLD_S:
+            _log_event("long_audio_apply_attempt", threshold_s=LONG_AUDIO_THRESHOLD_S, dur_s=audio_duration_seconds)
             try:
                 print(f"Audio duration ({audio_duration_seconds:.2f}s) > {LONG_AUDIO_THRESHOLD_S}s. Applying long audio settings.", file=sys.stderr)
                 # Change attention mechanism and subsampling for longer audio files
@@ -343,21 +523,25 @@ def main():
                 asr_model.change_subsampling_conv_chunking_factor(1)
                 long_audio_settings_applied = True
                 print("Long audio settings applied: Local Attention and Auto Conv Chunking.", file=sys.stderr)
+                _log_event("long_audio_applied", ok=True)
             except Exception as setting_e:
                 print(f"Warning: Failed to apply long audio settings: {setting_e}. Proceeding without them.", file=sys.stderr)
+                _log_event("long_audio_applied", ok=False, error=str(setting_e))
         
         print(f"Starting transcription for '{audio_path}' (using file path input)...", file=sys.stderr)
         
         transcribe_input_files = [audio_path] # Model expects a list of file paths
         # Determine if automatic mixed precision (AMP) should be used with autocast
         use_amp_autocast = use_cuda and not force_float32 and model_dtype != torch.float32
-        
+
+        _log_event("transcribe_begin", amp_autocast=use_amp_autocast, dtype=str(model_dtype))
         # Perform transcription within autocast context if using mixed precision
         with autocast(dtype=model_dtype if use_amp_autocast else torch.float32, enabled=use_amp_autocast):
               print(f"Transcribing with precision: {model_dtype if use_cuda else 'float32 (CPU)'}. Autocast enabled: {use_amp_autocast}", file=sys.stderr)
               # Call the transcribe method with timestamp and hypothesis options
               output_from_transcribe = asr_model.transcribe(transcribe_input_files, timestamps=True, return_hypotheses=True)
         t2 = time.perf_counter()
+        _log_event("transcribe_done", asr_s=round(t2 - t1, 3))
 
         if not output_from_transcribe or not isinstance(output_from_transcribe, list) or not output_from_transcribe[0]:
             err_msg = "Transcription failed or produced no hypotheses"
@@ -423,6 +607,8 @@ def main():
                 segments.append({"start": words_list[0]["start"], "end": words_list[-1]["end"], "text": text, "words": words_list})
         elif full_transcript is not None:
             segments.append({"start": 0.0, "end": audio_duration_seconds, "text": full_transcript})
+        _log_event("segments_built", n_segments=len(segments),
+                   n_words=sum(len(s.get("words") or []) for s in segments))
 
         if not segments:
             write_error_srt("No transcript text available")
@@ -456,18 +642,27 @@ def main():
             max_merge_gap_ms=max_merge_gap_ms,
         )
         t3 = time.perf_counter()
+        _log_event("postprocess_done", out_events=len(processed), postproc_s=round(t3 - t2, 3))
         _audit(segments, processed)
         write_srt(processed, srt_path)
         t4 = time.perf_counter()
-        with open(srt_path + ".timings.json", "w") as f:
-            json.dump({
-                "model_load_s": round(t1 - t0, 3),
-                "asr_s":        round(t2 - t1, 3),
-                "postproc_s":   round(t3 - t2, 3),
-                "write_s":      round(t4 - t3, 3),
-                "total_s":      round(t4 - t0, 3),
-            }, f, indent=2)
+        print(
+            "TIMINGS  load={:.3f}s  asr={:.3f}s  post={:.3f}s  write={:.3f}s  total={:.3f}s".format(
+                t1 - t0, t2 - t1, t3 - t2, t4 - t3, t4 - t0
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        _log_event(
+            "timings",
+            model_load_s=round(t1 - t0, 3),
+            asr_s=round(t2 - t1, 3),
+            postproc_s=round(t3 - t2, 3),
+            write_s=round(t4 - t3, 3),
+            total_s=round(t4 - t0, 3),
+        )
         print(f"SRT file generated at '{srt_path}'", file=sys.stderr)
+        _log_event("srt_written")
 
         print(f"SRT file processing completed for '{srt_path}'", file=sys.stderr)
 
@@ -488,9 +683,13 @@ def main():
         write_error_srt(f"Error during transcription: {str(e)[:100]}") # Write concise error to SRT
         sys.exit(1)
     finally:
+        _cleanup_t0 = time.perf_counter()
+        _log_event("cleanup_begin", long_audio=long_audio_settings_applied)
         # Cleanup: revert model settings, move model to CPU, and clear cache
+        revert_s = cpu_move_s = empty_cache_s = None
         if asr_model is not None:
             if long_audio_settings_applied:
+                _revert_t0 = time.perf_counter()
                 try:
                     print("Reverting long audio settings...", file=sys.stderr)
                     # Revert to default attention and subsampling settings
@@ -499,15 +698,39 @@ def main():
                     print("Long audio settings reverted.", file=sys.stderr)
                 except Exception as revert_e:
                     print(f"Warning: Failed to revert long audio settings: {revert_e}", file=sys.stderr)
+                finally:
+                    revert_s = round(time.perf_counter() - _revert_t0, 3)
+
+            _cpu_t0 = time.perf_counter()
             try:
                 # Move model to CPU and clear memory
-                if hasattr(asr_model, 'cpu'): asr_model.cpu()
+                if hasattr(asr_model, 'cpu'):
+                    asr_model.cpu()
                 del asr_model
                 gc.collect() # Force garbage collection
-                if torch.cuda.is_available(): torch.cuda.empty_cache() # Clear CUDA cache
-                print("Model moved to CPU and CUDA cache cleared (if applicable).", file=sys.stderr)
             except Exception as cleanup_e:
                 print(f"Error during model cleanup: {cleanup_e}", file=sys.stderr)
+            finally:
+                cpu_move_s = round(time.perf_counter() - _cpu_t0, 3)
+
+            _cache_t0 = time.perf_counter()
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache() # Clear CUDA cache
+            except Exception as cache_e:
+                print(f"Error during cache cleanup: {cache_e}", file=sys.stderr)
+            finally:
+                empty_cache_s = round(time.perf_counter() - _cache_t0, 3)
+
+            print("Model moved to CPU and CUDA cache cleared (if applicable).", file=sys.stderr)
+
+        _log_event(
+            "cleanup_done",
+            revert_s=revert_s,
+            cpu_move_s=cpu_move_s,
+            empty_cache_s=empty_cache_s,
+            cleanup_s=round(time.perf_counter() - _cleanup_t0, 3),
+        )
 
 if __name__ == "__main__":
     main()
