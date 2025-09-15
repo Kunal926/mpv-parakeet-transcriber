@@ -24,54 +24,96 @@ import numpy as np
 import torch
 import gc
 import time
-import json
+import tempfile, shutil, uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from torch.cuda.amp import autocast
 
-import logging, uuid
-from datetime import datetime, timezone
-
 RUN_ID = str(uuid.uuid4())
-_JSONL_PATH = None
+RUN_DIR = None
+LOG_PATH = None
+JSONL_PATH = None
 
-class _TeeStderr:
-    def __init__(self, *streams):
-        self._streams = streams
+
+def _make_run_dir() -> str:
+    root = os.environ.get("PARAKEET_LOG_ROOT") or os.path.join(tempfile.gettempdir(), "parakeet_runs")
+    os.makedirs(root, exist_ok=True)
+    # optional purge on every run
+    if os.environ.get("PARAKEET_PURGE_OLD", "1") == "1":
+        for name in os.listdir(root):
+            p = os.path.join(root, name)
+            try:
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+            except Exception:
+                pass
+    run_dir = os.path.join(root, RUN_ID)
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+
+class _FileOnlyStderr:
+    """Redirect stderr to a file (keeps mpv log clean)."""
+
+    def __init__(self, fh):
+        self._fh = fh
+
     def write(self, s):
-        for st in self._streams:
-            try:
-                st.write(s)
-            except Exception:
-                pass
+        try:
+            self._fh.write(s)
+        except Exception:
+            pass
+
     def flush(self):
-        for st in self._streams:
-            try:
-                st.flush()
-            except Exception:
-                pass
+        try:
+            self._fh.flush()
+        except Exception:
+            pass
 
-def _setup_run_logs(srt_path: str, explicit_log_file: str | None = None):
-    """
-    Creates two files next to the SRT:
-      1) .run.log  (human-readable; captures ALL stderr)
-      2) .run.jsonl (structured event stream; one JSON per line)
-    """
-    global _JSONL_PATH
-    base = srt_path
-    log_file = explicit_log_file or (base + ".run.log")
-    _JSONL_PATH = base + ".run.jsonl"
 
-    # tee stderr -> file + real stderr
-    fh = open(log_file, "a", encoding="utf-8", buffering=1)
-    fh.write(f"\n===== Parakeet run {RUN_ID} started {datetime.now(timezone.utc).isoformat()} =====\n")
+def _setup_logs():
+    global RUN_DIR, LOG_PATH, JSONL_PATH
+    RUN_DIR = _make_run_dir()
+    LOG_PATH = os.path.join(RUN_DIR, "run.log")
+    JSONL_PATH = os.path.join(RUN_DIR, "run.jsonl")
+
+    # open run.log in line-buffered append mode
+    fh = open(LOG_PATH, "a", encoding="utf-8", buffering=1)
+    fh.write(f"===== Parakeet run {RUN_ID} started {datetime.now(timezone.utc).isoformat()} =====\n")
     fh.flush()
-    sys.stderr = _TeeStderr(sys.stderr, fh)
 
-    # first structured entry
-    _log_event("run_start", run_id=RUN_ID, srt_path=srt_path, pid=os.getpid())
+    # by default, silence mpv: send all stderr ONLY to file
+    # (flip PARAKEET_MIRROR_STDERR=1 to also mirror to console)
+    if os.environ.get("PARAKEET_MIRROR_STDERR") == "1":
+        class _Tee:
+            def __init__(self, *streams):
+                self._streams = streams
+
+            def write(self, s):
+                for st in self._streams:
+                    try:
+                        st.write(s)
+                    except Exception:
+                        pass
+
+            def flush(self):
+                for st in self._streams:
+                    try:
+                        st.flush()
+                    except Exception:
+                        pass
+
+        sys.stderr = _Tee(sys.stderr, fh)
+    else:
+        sys.stderr = _FileOnlyStderr(fh)
+
+    _log_event("run_start", pid=os.getpid())
+
 
 def _log_event(event: str, **fields):
-    """Append one structured line (JSON) to .run.jsonl."""
+    """Structured JSONL; disable via PARAKEET_JSONL=0."""
+    if os.environ.get("PARAKEET_JSONL", "1") != "1":
+        return
     try:
         rec = {
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -79,11 +121,11 @@ def _log_event(event: str, **fields):
             "event": event,
             **fields,
         }
-        with open(_JSONL_PATH, "a", encoding="utf-8") as jf:
-            json.dump(rec, jf, ensure_ascii=False)
+        with open(JSONL_PATH, "a", encoding="utf-8") as jf:
+            import json as _json
+            _json.dump(rec, jf, ensure_ascii=False)
             jf.write("\n")
     except Exception:
-        # never crash on logging
         pass
 
 # Ensure repository modules are importable when launched without a
@@ -280,7 +322,7 @@ def main():
                         help="Max gap for orphan merges/borrowing")
     args = parser.parse_args()
 
-    _setup_run_logs(args.srt_output_file_path, os.environ.get("PARAKEET_LOG_FILE"))
+    _setup_logs()
 
     audio_path = args.audio_file_path
     srt_path = args.srt_output_file_path
@@ -330,7 +372,6 @@ def main():
 
     try:
         t0 = time.perf_counter()
-        _log_event("init", audio=audio_path, srt=srt_path)
         model_name = "nvidia/parakeet-tdt-0.6b-v2" # Specify the Parakeet model
         print(f"Loading ASR model '{model_name}'...", file=sys.stderr)
         # Load the ASR model from NeMo's pre-trained models
@@ -531,16 +572,23 @@ def main():
         _audit(segments, processed)
         write_srt(processed, srt_path)
         t4 = time.perf_counter()
-        with open(srt_path + ".timings.json", "w") as f:
-            json.dump({
-                "model_load_s": round(t1 - t0, 3),
-                "asr_s":        round(t2 - t1, 3),
-                "postproc_s":   round(t3 - t2, 3),
-                "write_s":      round(t4 - t3, 3),
-                "total_s":      round(t4 - t0, 3),
-            }, f, indent=2)
+        print(
+            "TIMINGS  load={:.3f}s  asr={:.3f}s  post={:.3f}s  write={:.3f}s  total={:.3f}s".format(
+                t1 - t0, t2 - t1, t3 - t2, t4 - t3, t4 - t0
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        _log_event(
+            "timings",
+            model_load_s=round(t1 - t0, 3),
+            asr_s=round(t2 - t1, 3),
+            postproc_s=round(t3 - t2, 3),
+            write_s=round(t4 - t3, 3),
+            total_s=round(t4 - t0, 3),
+        )
         print(f"SRT file generated at '{srt_path}'", file=sys.stderr)
-        _log_event("srt_written", write_s=round(t4 - t3, 3), total_s=round(t4 - t0, 3))
+        _log_event("srt_written")
 
         print(f"SRT file processing completed for '{srt_path}'", file=sys.stderr)
 
