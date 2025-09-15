@@ -57,6 +57,14 @@ def _last_word_end(ev):
     w = ev.get("words") or []
     return float(w[-1]["end"]) if w else float(ev["end"])
 
+def _final_linger_ms(ev) -> int:
+    audio_end = _last_word_end(ev)
+    return max(0, int(round((ev["end"] - audio_end) * 1000)))
+
+def _chars(ev):
+    """Character count of rendered text (shaped with line breaks removed)."""
+    return len((ev.get("text") or "").replace("\n", ""))
+
 def _ms_floor(t: float) -> int:
     return 0 if not math.isfinite(t) or t < 0 else math.floor(t * 1000 + 1e-9)
 
@@ -76,10 +84,6 @@ def format_start_ms(t: float) -> str: return _fmt_ms(_ms_ceil (t))
 def format_end_ms  (t: float) -> str: return _fmt_ms(_ms_floor(t))
 
 def _write_diag_sidecar(events, out_path):
-    def _chars(ev):
-        # use shaped text (as printed), not the raw word list
-        return len((ev.get("text") or "").replace("\n", ""))
-
     rows = []
     for i, ev in enumerate(events, 1):
         d = ev.get("_dbg", {}) or {}
@@ -95,7 +99,8 @@ def _write_diag_sidecar(events, out_path):
             "dur_ms": int(round(dur_f * 1000)),
             "cps_float": round(cps_f, 2),
             "dur_ms_rendered": dur_ms_render,
-            "linger_ms": d.get("linger_ms", 0),
+            "linger_ms": _final_linger_ms(ev),
+            "linger_added_ms": int(d.get("linger_ms", 0)),
             "linger_clamped": bool(d.get("linger_clamped", False)),
             "borrow_from_right_ms": d.get("borrow_from_right_ms", 0),
             "gave_to_left_ms": d.get("gave_to_left_ms", 0),
@@ -453,7 +458,13 @@ def normalize_timing_netflix(
     max_block_duration_s: float = 7.0,
     validate: bool = True,
 ) -> List[Dict[str,Any]]:
-    if not events: return events
+    if not events:
+        return events
+    for ev in events:
+        dbg = ev.get("_dbg")
+        if dbg:
+            dbg.pop("linger_ms", None)
+            dbg.pop("linger_clamped", None)
     spf=_spf(fps)
     is_24ish = abs(fps-24.0)<0.2 or abs(fps-23.976)<0.2
     # 1) Start on first audio frame; End on last audio frame (we'll linger later if safe)
