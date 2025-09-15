@@ -28,6 +28,64 @@ import json
 from pathlib import Path
 from torch.cuda.amp import autocast
 
+import logging, uuid
+from datetime import datetime, timezone
+
+RUN_ID = str(uuid.uuid4())
+_JSONL_PATH = None
+
+class _TeeStderr:
+    def __init__(self, *streams):
+        self._streams = streams
+    def write(self, s):
+        for st in self._streams:
+            try:
+                st.write(s)
+            except Exception:
+                pass
+    def flush(self):
+        for st in self._streams:
+            try:
+                st.flush()
+            except Exception:
+                pass
+
+def _setup_run_logs(srt_path: str, explicit_log_file: str | None = None):
+    """
+    Creates two files next to the SRT:
+      1) .run.log  (human-readable; captures ALL stderr)
+      2) .run.jsonl (structured event stream; one JSON per line)
+    """
+    global _JSONL_PATH
+    base = srt_path
+    log_file = explicit_log_file or (base + ".run.log")
+    _JSONL_PATH = base + ".run.jsonl"
+
+    # tee stderr -> file + real stderr
+    fh = open(log_file, "a", encoding="utf-8", buffering=1)
+    fh.write(f"\n===== Parakeet run {RUN_ID} started {datetime.now(timezone.utc).isoformat()} =====\n")
+    fh.flush()
+    sys.stderr = _TeeStderr(sys.stderr, fh)
+
+    # first structured entry
+    _log_event("run_start", run_id=RUN_ID, srt_path=srt_path, pid=os.getpid())
+
+def _log_event(event: str, **fields):
+    """Append one structured line (JSON) to .run.jsonl."""
+    try:
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "run_id": RUN_ID,
+            "event": event,
+            **fields,
+        }
+        with open(_JSONL_PATH, "a", encoding="utf-8") as jf:
+            json.dump(rec, jf, ensure_ascii=False)
+            jf.write("\n")
+    except Exception:
+        # never crash on logging
+        pass
+
 # Ensure repository modules are importable when launched without a
 # preconfigured PYTHONPATH. Python adds the script directory to
 # ``sys.path`` by default when executing a file directly, but inserting it
@@ -222,6 +280,8 @@ def main():
                         help="Max gap for orphan merges/borrowing")
     args = parser.parse_args()
 
+    _setup_run_logs(args.srt_output_file_path, os.environ.get("PARAKEET_LOG_FILE"))
+
     audio_path = args.audio_file_path
     srt_path = args.srt_output_file_path
     global_offset_seconds = args.audio_start_offset
@@ -270,6 +330,7 @@ def main():
 
     try:
         t0 = time.perf_counter()
+        _log_event("init", audio=audio_path, srt=srt_path)
         model_name = "nvidia/parakeet-tdt-0.6b-v2" # Specify the Parakeet model
         print(f"Loading ASR model '{model_name}'...", file=sys.stderr)
         # Load the ASR model from NeMo's pre-trained models
@@ -303,6 +364,7 @@ def main():
         
         asr_model.eval() # Set model to evaluation mode
         t1 = time.perf_counter()
+        _log_event("model_loaded", use_cuda=use_cuda, dtype=str(model_dtype), load_s=round(t1 - t0, 3))
 
         # Get model's expected sample rate
         target_sr_from_model_cfg = asr_model.cfg.preprocessor.sample_rate
@@ -332,10 +394,13 @@ def main():
                 print(f"Error: {err_msg}", file=sys.stderr)
                 write_error_srt(err_msg)
                 sys.exit(1)
+        _log_event("audio_info", duration_s=audio_duration_seconds, samplerate=actual_sr if 'actual_sr' in locals() else None,
+                   channels=actual_channels if 'actual_channels' in locals() else None)
 
         # Configure model for long audio if duration exceeds threshold
         LONG_AUDIO_THRESHOLD_S = 480 # 8 minutes
         if audio_duration_seconds > LONG_AUDIO_THRESHOLD_S:
+            _log_event("long_audio_apply_attempt", threshold_s=LONG_AUDIO_THRESHOLD_S, dur_s=audio_duration_seconds)
             try:
                 print(f"Audio duration ({audio_duration_seconds:.2f}s) > {LONG_AUDIO_THRESHOLD_S}s. Applying long audio settings.", file=sys.stderr)
                 # Change attention mechanism and subsampling for longer audio files
@@ -343,21 +408,25 @@ def main():
                 asr_model.change_subsampling_conv_chunking_factor(1)
                 long_audio_settings_applied = True
                 print("Long audio settings applied: Local Attention and Auto Conv Chunking.", file=sys.stderr)
+                _log_event("long_audio_applied", ok=True)
             except Exception as setting_e:
                 print(f"Warning: Failed to apply long audio settings: {setting_e}. Proceeding without them.", file=sys.stderr)
+                _log_event("long_audio_applied", ok=False, error=str(setting_e))
         
         print(f"Starting transcription for '{audio_path}' (using file path input)...", file=sys.stderr)
         
         transcribe_input_files = [audio_path] # Model expects a list of file paths
         # Determine if automatic mixed precision (AMP) should be used with autocast
         use_amp_autocast = use_cuda and not force_float32 and model_dtype != torch.float32
-        
+
+        _log_event("transcribe_begin", amp_autocast=use_amp_autocast, dtype=str(model_dtype))
         # Perform transcription within autocast context if using mixed precision
         with autocast(dtype=model_dtype if use_amp_autocast else torch.float32, enabled=use_amp_autocast):
               print(f"Transcribing with precision: {model_dtype if use_cuda else 'float32 (CPU)'}. Autocast enabled: {use_amp_autocast}", file=sys.stderr)
               # Call the transcribe method with timestamp and hypothesis options
               output_from_transcribe = asr_model.transcribe(transcribe_input_files, timestamps=True, return_hypotheses=True)
         t2 = time.perf_counter()
+        _log_event("transcribe_done", asr_s=round(t2 - t1, 3))
 
         if not output_from_transcribe or not isinstance(output_from_transcribe, list) or not output_from_transcribe[0]:
             err_msg = "Transcription failed or produced no hypotheses"
@@ -423,6 +492,8 @@ def main():
                 segments.append({"start": words_list[0]["start"], "end": words_list[-1]["end"], "text": text, "words": words_list})
         elif full_transcript is not None:
             segments.append({"start": 0.0, "end": audio_duration_seconds, "text": full_transcript})
+        _log_event("segments_built", n_segments=len(segments),
+                   n_words=sum(len(s.get("words") or []) for s in segments))
 
         if not segments:
             write_error_srt("No transcript text available")
@@ -456,6 +527,7 @@ def main():
             max_merge_gap_ms=max_merge_gap_ms,
         )
         t3 = time.perf_counter()
+        _log_event("postprocess_done", out_events=len(processed), postproc_s=round(t3 - t2, 3))
         _audit(segments, processed)
         write_srt(processed, srt_path)
         t4 = time.perf_counter()
@@ -468,6 +540,7 @@ def main():
                 "total_s":      round(t4 - t0, 3),
             }, f, indent=2)
         print(f"SRT file generated at '{srt_path}'", file=sys.stderr)
+        _log_event("srt_written", write_s=round(t4 - t3, 3), total_s=round(t4 - t0, 3))
 
         print(f"SRT file processing completed for '{srt_path}'", file=sys.stderr)
 
@@ -488,6 +561,8 @@ def main():
         write_error_srt(f"Error during transcription: {str(e)[:100]}") # Write concise error to SRT
         sys.exit(1)
     finally:
+        _cleanup_t0 = time.perf_counter()
+        _log_event("cleanup_begin", long_audio=long_audio_settings_applied)
         # Cleanup: revert model settings, move model to CPU, and clear cache
         if asr_model is not None:
             if long_audio_settings_applied:
@@ -508,6 +583,7 @@ def main():
                 print("Model moved to CPU and CUDA cache cleared (if applicable).", file=sys.stderr)
             except Exception as cleanup_e:
                 print(f"Error during model cleanup: {cleanup_e}", file=sys.stderr)
+        _log_event("cleanup_done", cleanup_s=round(time.perf_counter() - _cleanup_t0, 3))
 
 if __name__ == "__main__":
     main()
