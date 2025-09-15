@@ -14,104 +14,172 @@
 #   the error message is flushed to the file.
 # - Supports generation of SRT files based on segment-level or word-level timestamps.
 
-import nemo.collections.asr as nemo_asr
-import sys
 import os
-import soundfile as sf
-import librosa
-import argparse
-import numpy as np
-import torch
-import gc
+import sys
 import time
-import tempfile, shutil, uuid
+import uuid
+import tempfile
+import shutil
+import json
 from datetime import datetime, timezone
 from pathlib import Path
+
+import argparse
+import gc
+import librosa
+import nemo.collections.asr as nemo_asr
+import numpy as np
+import soundfile as sf
+import torch
 from torch.cuda.amp import autocast
 
+# --- logging bootstrap (robust, race-safe) ---
 RUN_ID = str(uuid.uuid4())
 RUN_DIR = None
 LOG_PATH = None
 JSONL_PATH = None
+_LOG_FH = None
 
 
-def _make_run_dir() -> str:
-    root = os.environ.get("PARAKEET_LOG_ROOT") or os.path.join(tempfile.gettempdir(), "parakeet_runs")
-    os.makedirs(root, exist_ok=True)
-    # optional purge on every run
-    if os.environ.get("PARAKEET_PURGE_OLD", "1") == "1":
+def _safe_makedirs(path: str):
+    if not path:
+        return
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass  # never let logging kill the process
+
+
+def _purge_old_runs(root: str, max_age_hours: float):
+    """Delete only *expired* run dirs; ignore errors so concurrent runs survive."""
+    now = time.time()
+    try:
         for name in os.listdir(root):
             p = os.path.join(root, name)
             try:
-                if os.path.isdir(p):
+                if not os.path.isdir(p):
+                    continue
+                age_h = (now - os.path.getmtime(p)) / 3600.0
+                if age_h >= max_age_hours:
                     shutil.rmtree(p, ignore_errors=True)
             except Exception:
-                pass
-    run_dir = os.path.join(root, RUN_ID)
-    os.makedirs(run_dir, exist_ok=True)
-    return run_dir
+                continue
+    except Exception:
+        pass
 
 
-class _FileOnlyStderr:
-    """Redirect stderr to a file (keeps mpv log clean)."""
-
-    def __init__(self, fh):
-        self._fh = fh
-
-    def write(self, s):
-        try:
-            self._fh.write(s)
-        except Exception:
-            pass
-
-    def flush(self):
-        try:
-            self._fh.flush()
-        except Exception:
-            pass
+def _open_log_file(path: str):
+    """Open a line-buffered utf-8 log file; return file handle or None on failure."""
+    try:
+        _safe_makedirs(os.path.dirname(path))
+        return open(path, "a", encoding="utf-8", buffering=1)
+    except Exception:
+        return None
 
 
 def _setup_logs():
-    global RUN_DIR, LOG_PATH, JSONL_PATH
-    RUN_DIR = _make_run_dir()
-    LOG_PATH = os.path.join(RUN_DIR, "run.log")
+    """
+    Create:
+      - run.log (human-readable; captures stderr)
+      - run.jsonl (structured; can be disabled)
+    Never throws. Defaults:
+      - stderr is TEE'd to console + file (so CLI users still see progress).
+      - logs live under %TEMP%/parakeet_runs/<timestamp>_<uuid>/ unless PARAKEET_LOG_FILE is set.
+    """
+    global RUN_DIR, LOG_PATH, JSONL_PATH, _LOG_FH
+
+    # Choose destination
+    forced_file = os.environ.get("PARAKEET_LOG_FILE")
+    if forced_file:
+        LOG_PATH = forced_file
+        RUN_DIR = os.path.dirname(LOG_PATH) or tempfile.gettempdir()
+    else:
+        root = os.environ.get("PARAKEET_LOG_ROOT") or os.path.join(tempfile.gettempdir(), "parakeet_runs")
+        _safe_makedirs(root)
+        # Only purge *old* runs, not everything, to avoid races.
+        max_age_h = float(os.environ.get("PARAKEET_PURGE_MAX_AGE_HOURS", "24"))
+        _purge_old_runs(root, max_age_h)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        RUN_DIR = os.path.join(root, f"{stamp}_{RUN_ID[:8]}")
+        _safe_makedirs(RUN_DIR)
+        LOG_PATH = os.path.join(RUN_DIR, "run.log")
+
     JSONL_PATH = os.path.join(RUN_DIR, "run.jsonl")
 
-    # open run.log in line-buffered append mode
-    fh = open(LOG_PATH, "a", encoding="utf-8", buffering=1)
-    fh.write(f"===== Parakeet run {RUN_ID} started {datetime.now(timezone.utc).isoformat()} =====\n")
-    fh.flush()
+    # Open log file (but never crash if it fails)
+    _LOG_FH = _open_log_file(LOG_PATH)
 
-    # by default, silence mpv: send all stderr ONLY to file
-    # (flip PARAKEET_MIRROR_STDERR=1 to also mirror to console)
-    if os.environ.get("PARAKEET_MIRROR_STDERR") == "1":
-        class _Tee:
-            def __init__(self, *streams):
-                self._streams = streams
+    # Before redirecting anything, announce the log location to the real stderr (P1).
+    try:
+        sys.__stderr__.write(f"[parakeet] logging to: {LOG_PATH}\n")
+        if os.environ.get("PARAKEET_JSONL", "1") == "1":
+            sys.__stderr__.write(f"[parakeet] jsonl at: {JSONL_PATH}\n")
+        sys.__stderr__.flush()
+    except Exception:
+        pass
 
-            def write(self, s):
-                for st in self._streams:
+    # Decide stderr routing: default to TEE (console + file). (P1)
+    mirror = os.environ.get("PARAKEET_MIRROR_STDERR")
+    file_only = os.environ.get("PARAKEET_FILE_ONLY_STDERR")
+    if _LOG_FH is not None:
+        if file_only == "1":
+            # file only
+            class _FileOnly:
+                def write(self, s):
                     try:
-                        st.write(s)
+                        _LOG_FH.write(s)
                     except Exception:
                         pass
 
-            def flush(self):
-                for st in self._streams:
+                def flush(self):
                     try:
-                        st.flush()
+                        _LOG_FH.flush()
                     except Exception:
                         pass
 
-        sys.stderr = _Tee(sys.stderr, fh)
-    else:
-        sys.stderr = _FileOnlyStderr(fh)
+            sys.stderr = _FileOnly()
+        else:
+            # tee by default (or if PARAKEET_MIRROR_STDERR=1)
+            class _Tee:
+                def __init__(self, *streams):
+                    self._streams = streams
 
-    _log_event("run_start", pid=os.getpid())
+                def write(self, s):
+                    for st in self._streams:
+                        try:
+                            st.write(s)
+                        except Exception:
+                            pass
+
+                def flush(self):
+                    for st in self._streams:
+                        try:
+                            st.flush()
+                        except Exception:
+                            pass
+
+            # Always tee unless user explicitly asked for file-only.
+            sys.stderr = _Tee(sys.__stderr__, _LOG_FH)
+
+    # Header
+    try:
+        ts = datetime.now(timezone.utc).isoformat()
+        if _LOG_FH:
+            _LOG_FH.write(f"===== Parakeet run {RUN_ID} started {ts} =====\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+    _log_event(
+        "run_start",
+        pid=os.getpid(),
+        log_path=LOG_PATH,
+        jsonl_path=(JSONL_PATH if os.environ.get("PARAKEET_JSONL", "1") == "1" else None),
+    )
 
 
 def _log_event(event: str, **fields):
-    """Structured JSONL; disable via PARAKEET_JSONL=0."""
+    """Append one structured JSON line (disable via PARAKEET_JSONL=0). Never throws."""
     if os.environ.get("PARAKEET_JSONL", "1") != "1":
         return
     try:
@@ -121,12 +189,18 @@ def _log_event(event: str, **fields):
             "event": event,
             **fields,
         }
+        _safe_makedirs(os.path.dirname(JSONL_PATH))
         with open(JSONL_PATH, "a", encoding="utf-8") as jf:
-            import json as _json
-            _json.dump(rec, jf, ensure_ascii=False)
+            json.dump(rec, jf, ensure_ascii=False)
             jf.write("\n")
     except Exception:
-        pass
+        # fall back to human log so we still see the event if JSONL path vanishes
+        try:
+            if _LOG_FH:
+                _LOG_FH.write(f"[event:{event}] {fields}\n")
+        except Exception:
+            pass
+# --- end bootstrap ---
 
 # Ensure repository modules are importable when launched without a
 # preconfigured PYTHONPATH. Python adds the script directory to
