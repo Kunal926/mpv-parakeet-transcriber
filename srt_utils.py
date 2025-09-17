@@ -83,7 +83,7 @@ def _fmt_ms(total_ms: int) -> str:
 def format_start_ms(t: float) -> str: return _fmt_ms(_ms_ceil (t))
 def format_end_ms  (t: float) -> str: return _fmt_ms(_ms_floor(t))
 
-def _write_diag_sidecar(events, out_path):
+def _write_diag_sidecar(events, out_path, diag_dir: str | None = None):
     rows = []
     for i, ev in enumerate(events, 1):
         d = ev.get("_dbg", {}) or {}
@@ -106,19 +106,25 @@ def _write_diag_sidecar(events, out_path):
             "gave_to_left_ms": d.get("gave_to_left_ms", 0),
             "final_gap_fence_ms": d.get("final_gap_fence_ms", 0),
         })
-    base = out_path
+    # If a diagnostics directory is provided, write the sidecars there,
+    # using the SRT basename (without extension) to keep filenames readable.
+    if diag_dir:
+        os.makedirs(diag_dir, exist_ok=True)
+        base = os.path.join(diag_dir, os.path.splitext(os.path.basename(out_path))[0])
+    else:
+        base = out_path
     with open(base + ".diag.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader(); w.writerows(rows)
     with open(base + ".diag.json", "w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
 
-def write_srt(events: List[Dict[str,Any]], out_path: str) -> None:
+def write_srt(events: List[Dict[str,Any]], out_path: str, diag_dir: str | None = None) -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         for i, ev in enumerate(events, 1):
             f.write(f"{i}\n{format_start_ms(ev['start'])} --> {format_end_ms(ev['end'])}\n{(ev['text'] or '').strip()}\n\n")
     try:
-        _write_diag_sidecar(events, out_path)
+        _write_diag_sidecar(events, out_path, diag_dir)
     except Exception:
         pass
 

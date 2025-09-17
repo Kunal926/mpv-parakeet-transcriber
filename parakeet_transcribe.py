@@ -99,9 +99,15 @@ def _setup_logs():
         # Only purge *old* runs, not everything, to avoid races.
         max_age_h = float(os.environ.get("PARAKEET_PURGE_MAX_AGE_HOURS", "24"))
         _purge_old_runs(root, max_age_h)
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        RUN_DIR = os.path.join(root, f"{stamp}_{RUN_ID[:8]}")
-        _safe_makedirs(RUN_DIR)
+        # If the caller (Lua/mpv) already created a run dir, prefer that.
+        pre_run = os.environ.get("PARAKEET_RUN_DIR")
+        if pre_run:
+            RUN_DIR = pre_run
+            _safe_makedirs(RUN_DIR)
+        else:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            RUN_DIR = os.path.join(root, f"{stamp}_{RUN_ID[:8]}")
+            _safe_makedirs(RUN_DIR)
         LOG_PATH = os.path.join(RUN_DIR, "run.log")
 
     JSONL_PATH = os.path.join(RUN_DIR, "run.jsonl")
@@ -394,8 +400,15 @@ def main():
                         help="Max duration for a packed 2-line block")
     parser.add_argument("--max_merge_gap_ms", type=int, default=360,
                         help="Max gap for orphan merges/borrowing")
+    parser.add_argument("--run_dir", type=str, default=None,
+                        help="Existing run directory to write logs/sidecars (overrides generated RUN_DIR).")
+    parser.add_argument("--diag_dir", type=str, default=None,
+                        help="Directory for .diag.csv/.diag.json (defaults to RUN_DIR).")
     args = parser.parse_args()
 
+    # Allow CLI flags to prime environment for logging bootstrap
+    if args.run_dir:
+        os.environ["PARAKEET_RUN_DIR"] = args.run_dir
     _setup_logs()
 
     audio_path = args.audio_file_path
@@ -644,7 +657,9 @@ def main():
         t3 = time.perf_counter()
         _log_event("postprocess_done", out_events=len(processed), postproc_s=round(t3 - t2, 3))
         _audit(segments, processed)
-        write_srt(processed, srt_path)
+        # Prefer explicit diag_dir, else fall back to current RUN_DIR
+        diag_dir = args.diag_dir or os.environ.get("PARAKEET_DIAG_DIR") or RUN_DIR
+        write_srt(processed, srt_path, diag_dir=diag_dir)
         t4 = time.perf_counter()
         print(
             "TIMINGS  load={:.3f}s  asr={:.3f}s  post={:.3f}s  write={:.3f}s  total={:.3f}s".format(
