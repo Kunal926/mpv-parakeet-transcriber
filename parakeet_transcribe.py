@@ -90,14 +90,21 @@ def _setup_logs():
 
     # Choose destination
     forced_file = os.environ.get("PARAKEET_LOG_FILE")
+    max_age_h = float(os.environ.get("PARAKEET_PURGE_MAX_AGE_HOURS", "24"))
     if forced_file:
         LOG_PATH = forced_file
         RUN_DIR = os.path.dirname(LOG_PATH) or tempfile.gettempdir()
+        root = os.environ.get("PARAKEET_LOG_ROOT")
+        if not root:
+            parent = os.path.dirname(RUN_DIR)
+            if parent and parent != RUN_DIR:
+                root = parent
+        if root:
+            _purge_old_runs(root, max_age_h)
     else:
         root = os.environ.get("PARAKEET_LOG_ROOT") or os.path.join(tempfile.gettempdir(), "parakeet_runs")
         _safe_makedirs(root)
         # Only purge *old* runs, not everything, to avoid races.
-        max_age_h = float(os.environ.get("PARAKEET_PURGE_MAX_AGE_HOURS", "24"))
         _purge_old_runs(root, max_age_h)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         RUN_DIR = os.path.join(root, f"{stamp}_{RUN_ID[:8]}")

@@ -9,6 +9,8 @@
 local mp = require 'mp'
 local utils = require 'mp.utils'
 
+local IS_WINDOWS = package.config:sub(1,1) == '\\'
+
 -- Subtitle alignment and styling are configured via mpv.conf;
 -- this script intentionally avoids forcing ASS overrides.
 
@@ -125,26 +127,36 @@ end
 -- This block checks for the existence of `temp_dir`. If not found, it tries
 -- to create it using OS-specific commands. Warnings are logged if creation fails
 -- or if `temp_dir` points to a root drive on Windows (which `mkdir` cannot create).
+local function run_mkdir(path)
+    if not path or path == "" then return false end
+    local args
+    if IS_WINDOWS then
+        if path:match("^[A-Za-z]:$") then
+            mp.msg.warn("[parakeet_mpv] Cannot 'mkdir' a root drive like '" .. path .. "'.")
+            return false
+        end
+        local win_path = path:gsub("/", "\\")
+        args = {"cmd.exe", "/C", string.format('if not exist "%s" mkdir "%s"', win_path, win_path)}
+    else
+        args = {"mkdir", "-p", path}
+    end
+    local res = utils.subprocess({
+        args = args,
+        cancellable = false,
+        capture_stdout = false,
+        capture_stderr = false,
+    })
+    if not res then return false end
+    if res.error or res.status ~= 0 then return false end
+    return true
+end
+
 if not utils.file_info(temp_dir) then
     mp.msg.warn("[parakeet_mpv] Temporary directory does not exist: " .. temp_dir)
-    local mkdir_cmd
-    if package.config:sub(1,1) == '\\' then -- Windows OS
-        if temp_dir:match("^[A-Za-z]:$") then -- Check if it's a root drive like C:
-            mp.msg.warn("[parakeet_mpv] Cannot 'mkdir' a root drive like '" .. temp_dir .. "'. Please ensure it's accessible and not a root drive itself for mkdir.")
-        else
-            -- For Windows, use cmd /C to handle spaces in paths correctly for mkdir
-            mkdir_cmd = string.format('cmd /C "if not exist "%s" mkdir "%s""', temp_dir:gsub("/", "\\"), temp_dir:gsub("/", "\\"))
-            local _, err_code = os.execute(mkdir_cmd)
-            if err_code == 0 then
-                mp.msg.info("[parakeet_mpv] Attempted to create temp directory: " .. temp_dir)
-            else
-                mp.msg.warn("[parakeet_mpv] Failed to create temp directory. Exit Code: " .. to_str_safe(err_code))
-            end
-        end
-    else -- Linux/macOS
-        mkdir_cmd = string.format('mkdir -p "%s"', temp_dir)
-        os.execute(mkdir_cmd)
+    if run_mkdir(temp_dir) then
         mp.msg.info("[parakeet_mpv] Attempted to create temp directory: " .. temp_dir)
+    else
+        mp.msg.warn("[parakeet_mpv] Failed to create temp directory via subprocess.")
     end
 end
 
@@ -179,23 +191,10 @@ local function ensure_directory(path)
     local info = utils.file_info(path)
     if info and info.is_dir then return true end
     local cmd
-    if package.config:sub(1,1) == '\\' then
-        if path:match("^[A-Za-z]:$") then
-            return false
-        end
-        local win_path = path:gsub("/", "\\")
-        cmd = string.format('cmd /C "if not exist "%s" mkdir "%s""', win_path, win_path)
-    else
-        cmd = string.format('mkdir -p "%s"', path)
+    if IS_WINDOWS and path:match("^[A-Za-z]:$") then
+        return false
     end
-    local ok, _, code = os.execute(cmd)
-    if type(ok) == "number" then
-        return ok == 0
-    end
-    if type(ok) == "boolean" then
-        return ok
-    end
-    return code == 0
+    return run_mkdir(path)
 end
 
 local function allocate_run_directory()
