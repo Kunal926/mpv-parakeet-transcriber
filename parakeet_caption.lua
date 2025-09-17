@@ -70,6 +70,11 @@ local weights_dir = _first_nonempty(
 local ffmpeg_path  = os.getenv("FFMPEG")  or "ffmpeg"
 local ffprobe_path = os.getenv("FFPROBE") or "ffprobe"
 
+-- Small OS helpers
+local function is_windows() return package.config:sub(1,1) == '\\' end
+local function to_native(p) return is_windows() and (p:gsub("/", "\\")) or p end
+local function is_cmd_name(p) return p and p ~= "" and not p:find("[/\\]") and not p:match("^[A-Za-z]:") end
+
 -- Directory for storing temporary audio files.
 -- Always use system temp → <temp>/parakeet_runs/<stamp>_<id>
 local function _tmp_root()
@@ -87,17 +92,21 @@ local function _rand8()
   return string.format("%08x", n)
 end
 local function ensure_dir_quiet(dir)
-  if utils.file_info(dir) then return true end
-  local is_win = package.config:sub(1,1) == '\\'
-  local args = is_win and {"cmd", "/D", "/C", "mkdir", dir} or {"mkdir", "-p", dir}
-  local res = utils.subprocess({ args = args, playback_only = false })
-  if (res and res.status == 0) or utils.file_info(dir) then
+  dir = to_native(dir)
+  local st = utils.file_info(dir)
+  if st and st.is_dir then return true end
+  local args = is_windows() and {"cmd", "/D", "/C", "mkdir", dir} or {"mkdir", "-p", dir}
+  local res  = utils.subprocess({ args = args, playback_only = false, capture_stdout = true, capture_stderr = true })
+  -- Recheck after attempt (handles mkdir creating parents)
+  st = utils.file_info(dir)
+  if st and st.is_dir then
     msg.info("[parakeet_mpv] Ensured directory: " .. dir)
     return true
-  else
-    msg.warn(string.format("[parakeet_mpv] mkdir failed (status=%s): %s", tostring(res and res.status), dir))
-    return false
   end
+  msg.warn(string.format("[parakeet_mpv] mkdir failed (rc=%s): %s%s%s",
+          tostring(res and res.status), dir,
+          res and res.stderr and " | stderr: " or "", res and (res.stderr or "") or ""))
+  return false
 end
 
 local function _prefer_pythonw(p)
@@ -108,12 +117,29 @@ local function _prefer_pythonw(p)
   return p
 end
 
-python_exe = _prefer_pythonw(python_exe)
+-- Resolve python from PATH when user supplied just "python"
+local function resolve_on_path(cmd)
+  if not is_cmd_name(cmd) then return nil end
+  local which = is_windows() and {"where", cmd} or {"which", cmd}
+  local r = utils.subprocess({ args = which, playback_only = false, capture_stdout = true })
+  if r and r.status == 0 and r.stdout and #r.stdout > 0 then
+    local first = r.stdout:gsub("\r",""):gsub("\n+$",""):match("^[^\r\n]+")
+    return first
+  end
+  return nil
+end
+
+-- Prefer pythonw on Windows; allow PATH command names
+do
+  local resolved = resolve_on_path(python_exe)
+  if resolved then python_exe = resolved end
+  python_exe = _prefer_pythonw(python_exe)
+end
 local temp_root = _tmp_root()
 ensure_dir_quiet(temp_root)
 -- Note: Python will also purge old run dirs (>24h) on startup (see _setup_logs).
 -- That already handles lifetime management.
-local run_dir = utils.join_path(temp_root, os.date("%Y%m%d-%H%M%S") .. "_" .. _rand8())
+local run_dir = to_native(utils.join_path(temp_root, os.date("%Y%m%d-%H%M%S") .. "_" .. _rand8()))
 ensure_dir_quiet(run_dir)
 local temp_dir = run_dir
 
@@ -448,10 +474,9 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         transcription_in_progress = false
     end
     -- Step 0: Validations
-    if not utils.file_info(python_exe) then
-        log("error", "Python executable not found: ", python_exe)
-        abort()
-        return
+    if (not is_cmd_name(python_exe)) and (not utils.file_info(python_exe)) then
+        log("error", "Python executable not found on disk: ", python_exe)
+        abort(); return
     end
     if not utils.file_info(parakeet_script_path) then
         log("error", "Parakeet Python script not found: '", parakeet_script_path, "'")
@@ -469,9 +494,11 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         return
     end
     if not utils.file_info(temp_dir) or not utils.file_info(temp_dir).is_dir then
-        log("error", "Temporary directory '", temp_dir, "' does not exist or is not a directory.")
-        abort()
-        return
+        ensure_dir_quiet(temp_dir)
+        if not (utils.file_info(temp_dir) and utils.file_info(temp_dir).is_dir) then
+            log("error", "Temporary directory '", temp_dir, "' does not exist or is not a directory.")
+            abort(); return
+        end
     end
 
     local current_media_path = mp.get_property_native("path")
@@ -708,10 +735,9 @@ local function run_isolate_then_asr(model)
         transcription_in_progress = false
     end
 
-    if not utils.file_info(python_exe) then
-        log("error", "Python executable not found: ", python_exe)
-        abort()
-        return
+    if (not is_cmd_name(python_exe)) and (not utils.file_info(python_exe)) then
+        log("error", "Python executable not found on disk: ", python_exe)
+        abort(); return
     end
     if not utils.file_info(parakeet_script_path) then
         log("error", "Parakeet Python script not found: '", parakeet_script_path, "'")
@@ -724,9 +750,11 @@ local function run_isolate_then_asr(model)
         return
     end
     if not utils.file_info(temp_dir) or not utils.file_info(temp_dir).is_dir then
-        log("error", "Temporary directory '", temp_dir, "' does not exist or is not a directory.")
-        abort()
-        return
+        ensure_dir_quiet(temp_dir)
+        if not (utils.file_info(temp_dir) and utils.file_info(temp_dir).is_dir) then
+            log("error", "Temporary directory '", temp_dir, "' does not exist or is not a directory.")
+            abort(); return
+        end
     end
 
     local current_media_path = mp.get_property_native("path")
