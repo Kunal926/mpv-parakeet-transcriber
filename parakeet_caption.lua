@@ -6,9 +6,9 @@
 -- - SRT loading now attempted immediately after Python script finishes.
 -- - Temporary file cleanup moved to MPV shutdown event.
 
-local mp = require 'mp'
-local utils = require 'mp.utils'
-local msg   = mp.msg
+local mp   = require 'mp'
+local utils= require 'mp.utils'
+local msg  = mp.msg
 
 local osd_duration_default = 3 -- seconds
 
@@ -86,23 +86,35 @@ local function _rand8()
   local n = math.random(0, 0xffffffff)
   return string.format("%08x", n)
 end
-local function _ensure_dir(p)
-  if utils.file_info(p) then return end
+local function ensure_dir_quiet(dir)
+  if utils.file_info(dir) then return true end
   local is_win = package.config:sub(1,1) == '\\'
-  local args
-  if is_win then
-    args = {"cmd", "/C", "mkdir", p}
+  local args = is_win and {"cmd", "/D", "/C", "mkdir", dir} or {"mkdir", "-p", dir}
+  local res = utils.subprocess({ args = args, playback_only = false })
+  if (res and res.status == 0) or utils.file_info(dir) then
+    msg.info("[parakeet_mpv] Ensured directory: " .. dir)
+    return true
   else
-    args = {"mkdir", "-p", p}
+    msg.warn(string.format("[parakeet_mpv] mkdir failed (status=%s): %s", tostring(res and res.status), dir))
+    return false
   end
-  utils.subprocess({ args = args, cancellable = false })
 end
+
+local function _prefer_pythonw(p)
+  if package.config:sub(1,1) ~= '\\' then return p end
+  if not p or p == "" then return p end
+  local alt = p:gsub("[Pp]ython.exe$", "pythonw.exe")
+  if alt ~= p and utils.file_info(alt) then return alt end
+  return p
+end
+
+python_exe = _prefer_pythonw(python_exe)
 local temp_root = _tmp_root()
-_ensure_dir(temp_root)
+ensure_dir_quiet(temp_root)
 -- Note: Python will also purge old run dirs (>24h) on startup (see _setup_logs).
 -- That already handles lifetime management.
 local run_dir = utils.join_path(temp_root, os.date("%Y%m%d-%H%M%S") .. "_" .. _rand8())
-_ensure_dir(run_dir)
+ensure_dir_quiet(run_dir)
 local temp_dir = run_dir
 
 -- Keybindings for different transcription modes.
@@ -190,33 +202,6 @@ end
 local function to_str_safe(val)
     if val == nil then return "nil" end
     return tostring(val)
-end
-
--- Ensure the temporary directory exists. Attempt to create it if it doesn't.
--- This block checks for the existence of `temp_dir`. If not found, it tries
--- to create it using OS-specific commands. Warnings are logged if creation fails
--- or if `temp_dir` points to a root drive on Windows (which `mkdir` cannot create).
-if not utils.file_info(temp_dir) then
-    mp.msg.warn("[parakeet_mpv] Temporary directory does not exist: " .. temp_dir)
-    local mkdir_cmd
-    if package.config:sub(1,1) == '\\' then -- Windows OS
-        if temp_dir:match("^[A-Za-z]:$") then -- Check if it's a root drive like C:
-            mp.msg.warn("[parakeet_mpv] Cannot 'mkdir' a root drive like '" .. temp_dir .. "'. Please ensure it's accessible and not a root drive itself for mkdir.")
-        else
-            -- For Windows, use cmd /C to handle spaces in paths correctly for mkdir
-            mkdir_cmd = string.format('cmd /C "if not exist "%s" mkdir "%s""', temp_dir:gsub("/", "\\"), temp_dir:gsub("/", "\\"))
-            local _, err_code = os.execute(mkdir_cmd)
-            if err_code == 0 then
-                mp.msg.info("[parakeet_mpv] Attempted to create temp directory: " .. temp_dir)
-            else
-                mp.msg.warn("[parakeet_mpv] Failed to create temp directory. Exit Code: " .. to_str_safe(err_code))
-            end
-        end
-    else -- Linux/macOS
-        mkdir_cmd = string.format('mkdir -p "%s"', temp_dir)
-        os.execute(mkdir_cmd)
-        mp.msg.info("[parakeet_mpv] Attempted to create temp directory: " .. temp_dir)
-    end
 end
 
 --- Internal logging function for the script.
