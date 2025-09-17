@@ -27,9 +27,9 @@ local osd_duration_default = 3 -- seconds
 -- Edit just these 3 and you should be good on a new machine.
 -- ─────────────────────────────────────────────────────────────────────────────
 local OVERRIDE = {
-  python_exe = "",
-  script_path = "",
-  weights_dir = "",
+  python_exe = "C:/venvs/nemo_mpv_py312/Scripts/python.exe",
+  script_path = "C:/Parakeet_Caption/parakeet_transcribe.py",
+  weights_dir = "C:/Parakeet_Caption/weights",
 }
 
 -- Helpers
@@ -1003,3 +1003,4 @@ mp.register_event("shutdown", function()
     if attach_timer then attach_timer:kill(); attach_timer = nil end
     log("info", "Parakeet shutdown cleanup finished.")
 end)
+
