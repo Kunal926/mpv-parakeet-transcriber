@@ -16,50 +16,77 @@ local osd_duration_default = 3 -- seconds
 -- this script intentionally avoids forcing ASS overrides.
 
 -- ########## Configuration ##########
--- These paths should be configured by the user.
+-- Prefer environment variables; fall back to discoverable defaults.
+-- This makes fresh installs work without editing the file.
 
---- Path to the Python executable within the virtual environment.
+--- Path to the Python executable (env: PARAKEET_PYTHON_EXE). Falls back to 'python' on PATH.
 -- This should be the full path to the `python.exe` (Windows) or `python` (Linux/macOS)
 -- located inside the `Scripts` or `bin` directory of your Python virtual environment
 -- where Riva Canary ASR / Parakeet is installed.
 -- @type string
 -- @example "C:/venvs/nemo_mpv_py312/Scripts/python.exe"
 -- @example "/home/user/venvs/nemo_mpv_py312/bin/python"
-local python_exe = "C:/venvs/nemo_mpv_py312/Scripts/python.exe"
+local python_exe = os.getenv("PARAKEET_PYTHON_EXE") or "python"
 
---- Path to the parakeet_transcribe.py script.
--- This is the full path to the Python script responsible for performing the audio transcription.
--- @type string
--- @example "C:/Parakeet_Caption/parakeet_transcribe.py"
--- @example "/home/user/Parakeet_Caption/parakeet_transcribe.py"
-local parakeet_script_path = "C:/Parakeet_Caption/parakeet_transcribe.py"
+--- Path to the parakeet_transcribe.py script (env: PARAKEET_SCRIPT_PATH).
+local function _script_dir()
+  local src = debug.getinfo(1, "S").source or ""
+  local dir = src:match("^@(.*)[/\\]") or ""
+  if dir == "" then
+    local cwd = utils.getcwd()
+    return cwd or "."
+  end
+  return dir
+end
+local parakeet_script_path = os.getenv("PARAKEET_SCRIPT_PATH") or (utils.join_path(_script_dir(), "parakeet_transcribe.py"))
 
 --- Path to the FFmpeg executable.
--- Can be set to just "ffmpeg" if the directory containing ffmpeg.exe (Windows) or ffmpeg (Linux/macOS)
--- is included in the system's PATH environment variable. Otherwise, provide the full path.
--- FFmpeg is used for extracting and pre-processing audio from the media file.
--- @type string
--- @example "ffmpeg"
--- @example "C:/ffmpeg/bin/ffmpeg.exe"
+-- (env: FFMPEG). Default to 'ffmpeg' on PATH.
 local ffmpeg_path = "ffmpeg"
+if os.getenv("FFMPEG") and os.getenv("FFMPEG") ~= "" then ffmpeg_path = os.getenv("FFMPEG") end
 
 --- Path to the FFprobe executable.
--- Can be set to just "ffprobe" if the directory containing ffprobe.exe (Windows) or ffprobe (Linux/macOS)
--- is included in the system's PATH environment variable. Otherwise, provide the full path.
--- FFprobe is used to gather information about audio streams in the media file.
--- @type string
--- @example "ffprobe"
--- @example "C:/ffmpeg/bin/ffprobe.exe"
+-- (env: FFPROBE). Default to 'ffprobe' on PATH.
 local ffprobe_path = "ffprobe"
+if os.getenv("FFPROBE") and os.getenv("FFPROBE") ~= "" then ffprobe_path = os.getenv("FFPROBE") end
 
 --- Directory for storing temporary audio files.
--- This directory must exist and be writable by MPV and the user running MPV.
--- Temporary WAV files extracted from the media will be stored here before transcription.
--- These files are cleaned up when MPV shuts down.
--- @type string
--- @example "C:/temp_audio_mpv"
--- @example "/tmp/mpv_parakeet_audio"
-local temp_dir = "C:/temp"
+-- We create one per-run directory under %TEMP%/parakeet_runs to match Python logs.
+local function _tmp_root()
+  local t = os.getenv("PARAKEET_LOG_ROOT")
+  if not t or t == "" then
+    t = os.getenv("TEMP") or os.getenv("TMPDIR") or "/tmp"
+  end
+  return utils.join_path(t, "parakeet_runs")
+end
+local _rand_seeded = false
+local function _rand8()
+  if not _rand_seeded then
+    local jitter = math.floor((mp.get_time() or 0) * 1000)
+    math.randomseed(os.time() + jitter)
+    _rand_seeded = true
+  end
+  local n = math.random(0, 0xffffffff)
+  return string.format("%08x", n)
+end
+local function _ensure_dir(p)
+  if utils.file_info(p) then return end
+  local is_win = package.config:sub(1,1) == '\\'
+  local args
+  if is_win then
+    args = {"cmd", "/C", "mkdir", p}
+  else
+    args = {"mkdir", "-p", p}
+  end
+  utils.subprocess({ args = args, cancellable = false })
+end
+local temp_root = _tmp_root()
+_ensure_dir(temp_root)
+-- Note: Python will also purge old run dirs (>24h) on startup (see _setup_logs).
+-- That already handles lifetime management.
+local run_dir = utils.join_path(temp_root, os.date("%Y%m%d-%H%M%S") .. "_" .. _rand8())
+_ensure_dir(run_dir)
+local temp_dir = run_dir
 
 -- Keybindings for different transcription modes.
 local key_binding_default = "Alt+4"             -- Standard transcription (no FFmpeg preprocessing, default Python precision)
@@ -630,6 +657,9 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         srt_output_path,       -- Output SRT file path
         "--audio_start_offset", tostring(audio_stream_offset_seconds) -- Pass the determined start offset
     }
+    -- Make Python use the same run directory for logs & diagnostics
+    table.insert(python_command_args, "--run_dir"); table.insert(python_command_args, run_dir)
+    table.insert(python_command_args, "--diag_dir"); table.insert(python_command_args, run_dir)
     if force_python_float32_flag then
         table.insert(python_command_args, "--force_float32")
     end
@@ -657,6 +687,12 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
       playback_only = false,
       capture_stdout = false,
       capture_stderr = false,
+      env = {
+        -- keep Python bootstrap behavior consistent with our run dir
+        ["PARAKEET_LOG_ROOT"] = temp_root,
+        ["PARAKEET_RUN_DIR"]  = run_dir,
+        ["PARAKEET_DIAG_DIR"] = run_dir,
+      }
     }, function(success, res, err)
       local rc = (res and res.status) or -1
       if not success or rc ~= 0 then
@@ -839,6 +875,8 @@ local function run_isolate_then_asr(model)
         python_exe, parakeet_script_path, temp_vocals_16k, srt_output_path,
         "--audio_start_offset", tostring(audio_offset_seconds)
     }
+    table.insert(parakeet_args, "--run_dir"); table.insert(parakeet_args, run_dir)
+    table.insert(parakeet_args, "--diag_dir"); table.insert(parakeet_args, run_dir)
     for _,v in ipairs(seg_args) do table.insert(parakeet_args, v) end
     local fps = mp.get_property_native("container-fps") or mp.get_property_native("fps") or 24
     table.insert(parakeet_args, "--fps=" .. string.format("%.3f", fps))
@@ -848,6 +886,11 @@ local function run_isolate_then_asr(model)
       playback_only = false,
       capture_stdout = false,
       capture_stderr = false,
+      env = {
+        ["PARAKEET_LOG_ROOT"] = temp_root,
+        ["PARAKEET_RUN_DIR"]  = run_dir,
+        ["PARAKEET_DIAG_DIR"] = run_dir,
+      }
     }
     local initial_stat = _stat(srt_output_path)
     attach_when_ready(srt_output_path, {
