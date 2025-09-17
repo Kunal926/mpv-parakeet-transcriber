@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import List, Dict, Any, Tuple
-import math, sys, os, time, re
+import math, sys, os, time, re, csv, json
 from segmenter import segment_by_pause_and_phrase, shape_words_into_two_lines_balanced
 
 # ---------- tiny helpers ----------
@@ -39,6 +39,32 @@ SPACES = re.compile(r"\s+")
 def normalize_text(t: str) -> str:
     return SPACES.sub(" ", (t or "")).strip()
 
+# --- diagnostics helpers ---
+def _dbg(ev):
+    d = ev.get("_dbg")
+    if d is None:
+        d = {}
+        ev["_dbg"] = d
+    return d
+
+def _dbg_add_ms(ev, key, ms):
+    if ms <= 0:
+        return
+    d = _dbg(ev)
+    d[key] = int(d.get(key, 0) + round(ms))
+
+def _last_word_end(ev):
+    w = ev.get("words") or []
+    return float(w[-1]["end"]) if w else float(ev["end"])
+
+def _final_linger_ms(ev) -> int:
+    audio_end = _last_word_end(ev)
+    return max(0, int(round((ev["end"] - audio_end) * 1000)))
+
+def _chars(ev):
+    """Character count of rendered text (shaped with line breaks removed)."""
+    return len((ev.get("text") or "").replace("\n", ""))
+
 def _ms_floor(t: float) -> int:
     return 0 if not math.isfinite(t) or t < 0 else math.floor(t * 1000 + 1e-9)
 
@@ -54,13 +80,47 @@ def _fmt_ms(total_ms: int) -> str:
     h = total_m // 60
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
-def format_start_ms(t: float) -> str: return _fmt_ms(_ms_floor(t))
-def format_end_ms  (t: float) -> str: return _fmt_ms(_ms_ceil (t))
+def format_start_ms(t: float) -> str: return _fmt_ms(_ms_ceil (t))
+def format_end_ms  (t: float) -> str: return _fmt_ms(_ms_floor(t))
+
+def _write_diag_sidecar(events, out_path):
+    rows = []
+    for i, ev in enumerate(events, 1):
+        d = ev.get("_dbg", {}) or {}
+        dur_f = max(1e-9, ev["end"] - ev["start"])
+        cps_f = _chars(ev) / dur_f
+        s_ms = _ms_ceil(ev["start"])
+        e_ms = _ms_floor(ev["end"])
+        dur_ms_render = max(0, e_ms - s_ms)
+        rows.append({
+            "idx": i,
+            "start": ev["start"],
+            "end": ev["end"],
+            "dur_ms": int(round(dur_f * 1000)),
+            "cps_float": round(cps_f, 2),
+            "dur_ms_rendered": dur_ms_render,
+            "linger_ms": _final_linger_ms(ev),
+            "linger_added_ms": int(d.get("linger_ms", 0)),
+            "linger_clamped": bool(d.get("linger_clamped", False)),
+            "borrow_from_right_ms": d.get("borrow_from_right_ms", 0),
+            "gave_to_left_ms": d.get("gave_to_left_ms", 0),
+            "final_gap_fence_ms": d.get("final_gap_fence_ms", 0),
+        })
+    base = out_path
+    with open(base + ".diag.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader(); w.writerows(rows)
+    with open(base + ".diag.json", "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
 
 def write_srt(events: List[Dict[str,Any]], out_path: str) -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         for i, ev in enumerate(events, 1):
-            f.write(f"{i}\n{format_start_ms(ev['start'])} --> {format_end_ms(ev['end'])}\n{ev['text'].strip()}\n\n")
+            f.write(f"{i}\n{format_start_ms(ev['start'])} --> {format_end_ms(ev['end'])}\n{(ev['text'] or '').strip()}\n\n")
+    try:
+        _write_diag_sidecar(events, out_path)
+    except Exception:
+        pass
 
 # helper: cps of an event
 def _cps_of(ev: Dict[str, Any]) -> float:
@@ -214,26 +274,40 @@ def enforce_min_readable_v2(
         # try merge with prev/next (score by 2-line fit & cps)
         def score_merge(left, right, _shaper=shaper):
             lw, rw = (left.get("words") or []), (right.get("words") or [])
-            if not lw or not rw: return -1e9, None
+            if not lw or not rw:
+                return -1e9, None
             # Respect gap limit for borrowing/merge
             gap_ms = int(round((right["start"] - left["end"]) * 1000))
             if gap_ms > max_merge_gap_ms:
                 return -1e9, None
-            cand = _merged_words(left, right)
+            cand = lw + rw
             lines, used, overflow = _shaper(
                 cand,
                 max_chars=max_chars_per_line,
                 prefer_two_lines=True,
-                two_line_threshold=0.55,
+                two_line_threshold=0.60,
                 min_two_line_chars=min_two_line_chars,
             )
-            # If overflow, refuse this merge in the scoring path (we'll handle overflow in explicit merges)
-            if overflow: return -1e9, None
-            txt = " ".join((w.get("word","") or "").strip() for w in cand)
-            cps = len(txt) / max(0.001, (right["end"] - left["start"]))
-            if cps > cps_target: return -1e9, None
+            if overflow:
+                return -1e9, None
+            txt = " ".join((w.get("word", "") or "").strip() for w in cand)
+            dur = max(0.001, right["end"] - left["start"])
+            cps = len(txt) / dur
+            # New policy: allow merge when merged CPS strictly decreases
+            # versus the worst local CPS, even if still above target.
+            if cps > cps_target:
+                def _cps_of(ev):
+                    t = (ev.get("text") or "")
+                    if not t:
+                        t = " ".join((w.get("word", "") or "").strip() for w in (ev.get("words") or []))
+                    d = max(0.001, ev["end"] - ev["start"])
+                    return len(t.replace("\n", " ")) / d
+                worst_local = max(_cps_of(left), _cps_of(right))
+                # Require a strictly lower CPS (epsilon for float noise)
+                if cps >= worst_local - 1e-6:
+                    return -1e9, None
             diff = abs(len(lines[0]) - len(lines[-1]))
-            return -(diff + cps*0.4), (cand, "\n".join(lines[:2]))
+            return -(diff + cps * 0.4), (cand, "\n".join(lines[:2]))
         best = None
         if i>0:
             s,p = score_merge(events[i-1], e)
@@ -384,7 +458,13 @@ def normalize_timing_netflix(
     max_block_duration_s: float = 7.0,
     validate: bool = True,
 ) -> List[Dict[str,Any]]:
-    if not events: return events
+    if not events:
+        return events
+    for ev in events:
+        dbg = ev.get("_dbg")
+        if dbg:
+            dbg.pop("linger_ms", None)
+            dbg.pop("linger_clamped", None)
     spf=_spf(fps)
     is_24ish = abs(fps-24.0)<0.2 or abs(fps-23.976)<0.2
     # 1) Start on first audio frame; End on last audio frame (we'll linger later if safe)
@@ -403,11 +483,11 @@ def normalize_timing_netflix(
         dur = ev["end"] - ev["start"]
         if dur < min_dur:
             # Try merge forward if gap small and mergeable
-            if i+1 < len(events):
-                gap_to_next = events[i+1]["start"] - ev["end"]
+            if i + 1 < len(events):
+                gap_to_next = events[i + 1]["start"] - ev["end"]
                 if gap_to_next <= small_gap_floor_s:
                     ok, payload = _can_merge_pair(
-                        ev, events[i+1],
+                        ev, events[i + 1],
                         max_chars_per_line, cps_target,
                         two_line_threshold, min_two_line_chars,
                         max_block_duration_s, shaper,
@@ -416,32 +496,52 @@ def normalize_timing_netflix(
                     if ok and payload:
                         words, text = payload
                         ev["text"] = text
-                        ev["end"] = events[i+1]["end"]
-                        ev["words"] = _merged_words(ev, events[i+1])
-                        del events[i+1]
+                        ev["end"] = events[i + 1]["end"]
+                        ev["words"] = _merged_words(ev, events[i + 1])
+                        del events[i + 1]
                         dur = ev["end"] - ev["start"]
                         # re-evaluate same index after merge
                         continue
-            # Extend towards next cue if room
-            if i+1 < len(events):
-                max_end = events[i+1]["start"] - min_gap_frames*spf
-                target = min(ev["start"] + min_dur, max_end)
-                if target > ev["end"]:
-                    ev["end"] = target
-                    dur = ev["end"] - ev["start"]
-            # If still short, try merge backward
-            if dur < min_dur and i > 0:
-                gap_to_prev = ev["start"] - events[i-1]["end"]
+            # If forward merge failed, try merge backward next
+            if i > 0:
+                gap_to_prev = ev["start"] - events[i - 1]["end"]
                 if gap_to_prev <= small_gap_floor_s:
                     ok, payload = _can_merge_pair(
-                        events[i-1], ev,
+                        events[i - 1], ev,
                         max_chars_per_line, cps_target,
                         two_line_threshold, min_two_line_chars,
                         max_block_duration_s, shaper,
                         allow_cps_decrease=True,
                     )
                     if ok and payload:
-                        prev = events[i-1]
+                        prev = events[i - 1]
+                        words, text = payload
+                        prev["text"] = text
+                        prev["end"] = ev["end"]
+                        prev["words"] = _merged_words(prev, ev)
+                        del events[i]
+                        i -= 1
+                        continue
+            # Extend towards next cue if room
+            if i + 1 < len(events):
+                max_end = events[i + 1]["start"] - min_gap_frames * spf
+                target = min(ev["start"] + min_dur, max_end)
+                if target > ev["end"]:
+                    ev["end"] = target
+                    dur = ev["end"] - ev["start"]
+            # If still short, try merge backward again
+            if dur < min_dur and i > 0:
+                gap_to_prev = ev["start"] - events[i - 1]["end"]
+                if gap_to_prev <= small_gap_floor_s:
+                    ok, payload = _can_merge_pair(
+                        events[i - 1], ev,
+                        max_chars_per_line, cps_target,
+                        two_line_threshold, min_two_line_chars,
+                        max_block_duration_s, shaper,
+                        allow_cps_decrease=True,
+                    )
+                    if ok and payload:
+                        prev = events[i - 1]
                         words, text = payload
                         prev["text"] = text
                         prev["end"] = ev["end"]
@@ -454,22 +554,30 @@ def normalize_timing_netflix(
     #    Safe = next.start - last_audio_end >= 0.5s. Otherwise don't linger here.
     for i,ev in enumerate(events):
         ws = ev.get("words") or []
-        if not ws: continue
-        last_audio_end = ws[-1]["end"]
+        if not ws:
+            continue
+        audio_end = _last_word_end(ev)
+        target = ev["end"]
         if i+1 < len(events):
-            gap_to_next = events[i+1]["start"] - last_audio_end
+            gap_to_next = events[i+1]["start"] - audio_end
             if gap_to_next >= small_gap_floor_s:
-                target = min(
-                    last_audio_end + linger_after_audio_ms/1000.0,
+                candidate = min(
+                    audio_end + linger_after_audio_ms/1000.0,
                     events[i+1]["start"] - min_gap_frames*spf,
                 )
-                if target > ev["end"]:
-                    ev["end"] = target
+                if candidate > ev["end"]:
+                    target = candidate
         else:
             # last cue in file
-            target = last_audio_end + linger_after_audio_ms/1000.0
-            if target > ev["end"]:
-                ev["end"] = target
+            candidate = audio_end + linger_after_audio_ms/1000.0
+            if candidate > ev["end"]:
+                target = candidate
+        prev_end = ev["end"]
+        ev["end"] = target
+        _linger_ms = max(0.0, (target - audio_end) * 1000.0)
+        _dbg_add_ms(ev, "linger_ms", _linger_ms)
+        if target < audio_end + linger_after_audio_ms/1000.0 - 1e-9:
+            _dbg(ev)["linger_clamped"] = True
     # 4) Chaining / closing gaps
     i = 0
     while i < len(events) - 1:
@@ -572,6 +680,7 @@ def normalize_timing_netflix(
         orig_end = cur["end"]
         orig_start_nxt = nxt["start"]
         orig_end_nxt = nxt["end"]
+        give = 0.0
         take = min(spare_gap, borrow)
         # use silent gap without shifting the next cue's start
         cur["end"] += take
@@ -579,6 +688,7 @@ def normalize_timing_netflix(
         if borrow > 0:
             cur["end"] += borrow
             nxt["start"] += borrow
+            give = borrow
             ws = nxt.get("words") or []
             if ws:
                 audio_start = _floor(ws[0]["start"], fps)
@@ -604,6 +714,8 @@ def normalize_timing_netflix(
             nxt["start"] = orig_start_nxt
             nxt["end"] = orig_end_nxt
             return False
+        _dbg_add_ms(cur, "borrow_from_right_ms", give * 1000.0)
+        _dbg_add_ms(nxt, "gave_to_left_ms", give * 1000.0)
         return True
 
     def _borrow_from_left(idx: int, need: float, tolerance: float = 0.002) -> bool:
@@ -885,24 +997,12 @@ def rebalance_cps_borrow_time(
                     nx["end"] = new_nx_end
                     e["end"] = new_e_end
                     need -= give
+                    _dbg_add_ms(e, "borrow_from_right_ms", give * 1000.0)
+                    _dbg_add_ms(nx, "gave_to_left_ms", give * 1000.0)
 
         i += 1
     return events
 
-
-# ensure a hard minimum gap between events regardless of prior passes
-def _force_min_gap(
-    events: List[Dict[str, Any]],
-    fps: float = 25.0,
-    min_gap_frames: int = 2,
-) -> List[Dict[str, Any]]:
-    spf = 1.0 / fps
-    for i in range(len(events) - 1):
-        if events[i + 1]["start"] - events[i]["end"] < min_gap_frames * spf - 1e-9:
-            events[i]["end"] = events[i + 1]["start"] - min_gap_frames * spf
-            if events[i]["end"] <= events[i]["start"]:
-                events[i]["end"] = events[i]["start"] + spf
-    return events
 
 
 # ---------- top-level postprocess ----------
@@ -1035,7 +1135,6 @@ def postprocess_segments(
         else:
             timed_out = True
         _trace(f"netflix re-snap out: {len(events)}")
-    events = _force_min_gap(events, fps=snap_fps or 25.0, min_gap_frames=2)
     if snap_fps and os.environ.get("PARAKEET_DISABLE_NETFLIX") != "1":
         _trace("final snap/validate in")
         _e = _with_timeout(3.0, normalize_timing_netflix,
@@ -1054,4 +1153,30 @@ def postprocess_segments(
                            validate=not timed_out)
         if _e is not None:
             events = _e
+    def _infer_fps(events):
+        # fallback if snap_fps is falsy; picks closest known grid
+        cand = [23.976, 24.0, 25.0, 29.97, 30.0]
+        def rmse(fps):
+            spf = 1.0 / max(1e-9, fps)
+            import math
+            # measure how close starts/ends are to frame grid
+            err = []
+            for ev in events:
+                for t in (ev["start"], ev["end"]):
+                    q = round(t / spf)
+                    err.append((t - q * spf) ** 2)
+            return (sum(err) / max(1, len(err))) ** 0.5
+        return min(cand, key=rmse)
+
+    eff_fps = snap_fps or _infer_fps(events)
+    spf = 1.0 / eff_fps
+    for i in range(len(events) - 1):
+        ns = events[i + 1]["start"]
+        pe = events[i]["end"]
+        min_gap = 2 * spf
+        if ns - pe < min_gap - 1e-9:
+            new_end = ns - min_gap
+            if pe - new_end > 1e-9:
+                _dbg_add_ms(events[i], "final_gap_fence_ms", (pe - new_end) * 1000.0)
+            events[i]["end"] = max(new_end, events[i]["start"] + spf)
     return events
