@@ -56,7 +56,7 @@ local ffprobe_path = "ffprobe"
 -- @type string
 -- @example "C:/temp_audio_mpv"
 -- @example "/tmp/mpv_parakeet_audio"
-local temp_dir = "C:/temp"
+local temp_dir = "C:/Users/mrkun/AppData/Local/Temp/parakeet_runs"
 
 -- Keybindings for different transcription modes.
 local key_binding_default = "Alt+4"             -- Standard transcription (no FFmpeg preprocessing, default Python precision)

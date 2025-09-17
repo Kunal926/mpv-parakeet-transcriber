@@ -1,6 +1,7 @@
 from __future__ import annotations
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import math, sys, os, time, re, csv, json
+from pathlib import Path
 from segmenter import segment_by_pause_and_phrase, shape_words_into_two_lines_balanced
 
 # ---------- tiny helpers ----------
@@ -83,7 +84,14 @@ def _fmt_ms(total_ms: int) -> str:
 def format_start_ms(t: float) -> str: return _fmt_ms(_ms_ceil (t))
 def format_end_ms  (t: float) -> str: return _fmt_ms(_ms_floor(t))
 
-def _write_diag_sidecar(events, out_path):
+def _ensure_dir(path: Path) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _write_diag_sidecar(events, out_path, diag_root: Optional[str] = None):
     rows = []
     for i, ev in enumerate(events, 1):
         d = ev.get("_dbg", {}) or {}
@@ -106,19 +114,25 @@ def _write_diag_sidecar(events, out_path):
             "gave_to_left_ms": d.get("gave_to_left_ms", 0),
             "final_gap_fence_ms": d.get("final_gap_fence_ms", 0),
         })
-    base = out_path
-    with open(base + ".diag.csv", "w", newline="", encoding="utf-8") as f:
+    base_path = Path(out_path)
+    if diag_root:
+        base_dir = Path(diag_root)
+    else:
+        base_dir = base_path.parent
+    _ensure_dir(base_dir)
+    base = base_dir / base_path.stem
+    with open(str(base) + ".diag.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader(); w.writerows(rows)
-    with open(base + ".diag.json", "w", encoding="utf-8") as f:
+    with open(str(base) + ".diag.json", "w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
 
-def write_srt(events: List[Dict[str,Any]], out_path: str) -> None:
+def write_srt(events: List[Dict[str,Any]], out_path: str, diag_root: Optional[str] = None) -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         for i, ev in enumerate(events, 1):
             f.write(f"{i}\n{format_start_ms(ev['start'])} --> {format_end_ms(ev['end'])}\n{(ev['text'] or '').strip()}\n\n")
     try:
-        _write_diag_sidecar(events, out_path)
+        _write_diag_sidecar(events, out_path, diag_root)
     except Exception:
         pass
 

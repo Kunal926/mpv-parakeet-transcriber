@@ -644,7 +644,7 @@ def main():
         t3 = time.perf_counter()
         _log_event("postprocess_done", out_events=len(processed), postproc_s=round(t3 - t2, 3))
         _audit(segments, processed)
-        write_srt(processed, srt_path)
+        write_srt(processed, srt_path, diag_root=RUN_DIR)
         t4 = time.perf_counter()
         print(
             "TIMINGS  load={:.3f}s  asr={:.3f}s  post={:.3f}s  write={:.3f}s  total={:.3f}s".format(
