@@ -19,16 +19,20 @@ local osd_duration_default = 3 -- seconds
 -- Prefer environment variables; fall back to discoverable defaults.
 -- This makes fresh installs work without editing the file.
 
---- Path to the Python executable (env: PARAKEET_PYTHON_EXE). Falls back to 'python' on PATH.
--- This should be the full path to the `python.exe` (Windows) or `python` (Linux/macOS)
--- located inside the `Scripts` or `bin` directory of your Python virtual environment
--- where Riva Canary ASR / Parakeet is installed.
--- @type string
--- @example "C:/venvs/nemo_mpv_py312/Scripts/python.exe"
--- @example "/home/user/venvs/nemo_mpv_py312/bin/python"
-local python_exe = os.getenv("PARAKEET_PYTHON_EXE") or "python"
+-- ─────────────────────────────────────────────────────────────────────────────
+-- User-configurable overrides (leave "" to skip and use ENV/auto)
+--   • python_exe: point this to your venv’s python
+--   • script_path: absolute path to parakeet_transcribe.py
+--   • weights_dir: root folder of your model weights
+-- Edit just these 3 and you should be good on a new machine.
+-- ─────────────────────────────────────────────────────────────────────────────
+local OVERRIDE = {
+  python_exe = "",
+  script_path = "",
+  weights_dir = "",
+}
 
---- Path to the parakeet_transcribe.py script (env: PARAKEET_SCRIPT_PATH).
+-- Helpers
 local function _script_dir()
   local src = debug.getinfo(1, "S").source or ""
   local dir = src:match("^@(.*)[/\\]") or ""
@@ -38,25 +42,38 @@ local function _script_dir()
   end
   return dir
 end
-local parakeet_script_path = os.getenv("PARAKEET_SCRIPT_PATH") or (utils.join_path(_script_dir(), "parakeet_transcribe.py"))
 
---- Path to the FFmpeg executable.
--- (env: FFMPEG). Default to 'ffmpeg' on PATH.
-local ffmpeg_path = "ffmpeg"
-if os.getenv("FFMPEG") and os.getenv("FFMPEG") ~= "" then ffmpeg_path = os.getenv("FFMPEG") end
+local function _first_nonempty(a, b, c)
+  if a and a ~= "" then return a end
+  if b and b ~= "" then return b end
+  return c
+end
 
---- Path to the FFprobe executable.
--- (env: FFPROBE). Default to 'ffprobe' on PATH.
-local ffprobe_path = "ffprobe"
-if os.getenv("FFPROBE") and os.getenv("FFPROBE") ~= "" then ffprobe_path = os.getenv("FFPROBE") end
+-- Resolve python exe / script path / weights dir
+local python_exe = _first_nonempty(
+  OVERRIDE.python_exe,
+  os.getenv("PARAKEET_PYTHON_EXE"),
+  "python"
+)
+local parakeet_script_path = _first_nonempty(
+  OVERRIDE.script_path,
+  os.getenv("PARAKEET_SCRIPT_PATH"),
+  utils.join_path(_script_dir(), "parakeet_transcribe.py")
+)
+local weights_dir = _first_nonempty(
+  OVERRIDE.weights_dir,
+  os.getenv("PARAKEET_WEIGHTS_DIR"),
+  utils.join_path(_script_dir(), "weights")
+)
 
---- Directory for storing temporary audio files.
--- We create one per-run directory under %TEMP%/parakeet_runs to match Python logs.
+-- ffmpeg/ffprobe strictly from ENV (or fall back to PATH name)
+local ffmpeg_path  = os.getenv("FFMPEG")  or "ffmpeg"
+local ffprobe_path = os.getenv("FFPROBE") or "ffprobe"
+
+-- Directory for storing temporary audio files.
+-- Always use system temp → <temp>/parakeet_runs/<stamp>_<id>
 local function _tmp_root()
-  local t = os.getenv("PARAKEET_LOG_ROOT")
-  if not t or t == "" then
-    t = os.getenv("TEMP") or os.getenv("TMPDIR") or "/tmp"
-  end
+  local t = os.getenv("TEMP") or os.getenv("TMPDIR") or "/tmp"
   return utils.join_path(t, "parakeet_runs")
 end
 local _rand_seeded = false
@@ -95,10 +112,6 @@ local key_binding_ffmpeg_preprocess = "Alt+6"   -- FFmpeg Preprocessing (default
 local key_binding_ffmpeg_py_float32 = "Alt+7" -- FFmpeg Preprocessing + Python Float32 Precision
 local key_binding_isolate_asr_fast = "Alt+8"   -- Vocal isolation + ASR (fast)
 local key_binding_isolate_asr_slow = "Alt+9"   -- Vocal isolation + ASR (high quality)
-
--- Root directory containing separation model weights.
--- Provide the full path so Python can locate the YAML and checkpoint files reliably.
-local weights_dir = "C:/Parakeet_Caption/weights"
 
 -- === Separation models you selected in A/B ===
 local sep_fast = {
@@ -686,13 +699,7 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
       args = python_command_args,
       playback_only = false,
       capture_stdout = false,
-      capture_stderr = false,
-      env = {
-        -- keep Python bootstrap behavior consistent with our run dir
-        ["PARAKEET_LOG_ROOT"] = temp_root,
-        ["PARAKEET_RUN_DIR"]  = run_dir,
-        ["PARAKEET_DIAG_DIR"] = run_dir,
-      }
+      capture_stderr = false
     }, function(success, res, err)
       local rc = (res and res.status) or -1
       if not success or rc ~= 0 then
@@ -885,12 +892,7 @@ local function run_isolate_then_asr(model)
       args = parakeet_args,
       playback_only = false,
       capture_stdout = false,
-      capture_stderr = false,
-      env = {
-        ["PARAKEET_LOG_ROOT"] = temp_root,
-        ["PARAKEET_RUN_DIR"]  = run_dir,
-        ["PARAKEET_DIAG_DIR"] = run_dir,
-      }
+      capture_stderr = false
     }
     local initial_stat = _stat(srt_output_path)
     attach_when_ready(srt_output_path, {
