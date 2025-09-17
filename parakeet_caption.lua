@@ -104,13 +104,6 @@ local seg_args = { "--segmenter","word","--max_words","12","--max_duration","6.0
 local ffmpeg_audio_filters = "loudnorm=I=-16:LRA=7:TP=-1.5"
 -- ###################################
 
---- Table to store paths of temporary files for cleanup on MPV shutdown.
--- When temporary audio files are created, their paths are added to this table.
--- The `mp.register_event("shutdown", ...)` function iterates through this table
--- to remove these files when MPV closes.
--- @type table<string>
-local files_to_cleanup_on_shutdown = {}
-
 --- Flag to prevent concurrent transcription runs.
 -- When true, additional transcription requests are ignored until completion.
 -- @type boolean
@@ -204,26 +197,6 @@ local function log(level, ...)
     if level == "error" then mp.osd_message("Parakeet Error: " .. message, 7) -- Duration 7 seconds
     elseif level == "warn" then mp.osd_message("Parakeet Warning: " .. message, 5) -- Duration 5 seconds
     elseif level == "info" then mp.osd_message("Parakeet: " .. message, 3) -- Duration 3 seconds
-    end
-end
-
---- Safely removes a file from the filesystem.
--- Checks if the file exists before attempting removal. Logs the action (success or failure)
--- using the `log` function at "debug" or "warn" level.
--- @param filepath string The path to the file to be removed. If `nil`, the function returns immediately.
--- @param description string (optional) A description of the file for logging purposes (e.g., "raw audio", "filtered audio"). Defaults to "unspecified".
--- @usage safe_remove("/path/to/temp.wav", "temporary audio")
-local function safe_remove(filepath, description)
-    if not filepath then return end
-    if utils.file_info(filepath) then
-        local success, err_msg = os.remove(filepath)
-        if success then
-            log("debug", "Cleaned up temporary file (" .. (description or "unspecified") .. "): ", filepath)
-        else
-            log("warn", "Failed to remove temporary file (" .. (description or "unspecified") .. "): ", filepath, " - Error: ", (err_msg or "unknown"))
-        end
-    else
-        log("debug", "Temporary file (" .. (description or "unspecified") .. ") not found for removal, skipping: ", filepath)
     end
 end
 
@@ -438,7 +411,6 @@ end
 -- 6. Invokes the `parakeet_transcribe.py` script with the appropriate temporary audio file and parameters (including start offset and float32 flag).
 -- 7. Attempts to load the generated SRT subtitle file into MPV using `sub-add` with the `select` flag to make it active.
 -- 8. Logs progress and errors, displaying OSD messages for user feedback.
--- Temporary audio files created during this process are added to `files_to_cleanup_on_shutdown`.
 --
 -- @param force_python_float32_flag boolean If `true`, the "--force_float32" argument is passed to
 -- the `parakeet_transcribe.py` script, potentially changing its processing precision.
@@ -522,7 +494,6 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     local temp_audio_for_python = temp_audio_raw_path -- This will be the input to Python
 
     -- Ensure raw temp audio path is scheduled for cleanup, regardless of success/failure later
-    table.insert(files_to_cleanup_on_shutdown, temp_audio_raw_path)
 
     local mode_description = "Standard (Alt+4)"
     if force_python_float32_flag and apply_ffmpeg_filters_flag then mode_description = "FFmpeg Preproc + Python Float32 (Alt+7)"
@@ -626,7 +597,6 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     if apply_ffmpeg_filters_flag then
         temp_audio_for_python = utils.join_path(run_dir, sanitized_base_name .. "_audio_filtered.wav")
         if temp_audio_raw_path ~= temp_audio_for_python then
-             table.insert(files_to_cleanup_on_shutdown, temp_audio_for_python)
         end
         log("info", "Step 1.5: Applying FFmpeg audio filters: ", ffmpeg_audio_filters)
         mp.osd_message("Parakeet: Applying FFmpeg audio filters...", 5)
@@ -702,7 +672,7 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
       capture_stdout = false,
       capture_stderr = false,
       env = {
-        PARAKEET_LOG_FILE = utils.join_path(run_dir, "run.log"),
+        string.format("PARAKEET_LOG_FILE=%s", utils.join_path(run_dir, "run.log")),
       },
     }, function(success, res, err)
       local rc = (res and res.status) or -1
@@ -783,9 +753,6 @@ local function run_isolate_then_asr(model)
     local temp_stereo = utils.join_path(run_dir, sanitized_base_name .. "_stereo_44k.wav")
     local temp_vocals_44k = utils.join_path(run_dir, sanitized_base_name .. "_vocals_44k.wav")
     local temp_vocals_16k = utils.join_path(run_dir, sanitized_base_name .. "_vocals_16k.wav")
-    table.insert(files_to_cleanup_on_shutdown, temp_stereo)
-    table.insert(files_to_cleanup_on_shutdown, temp_vocals_44k)
-    table.insert(files_to_cleanup_on_shutdown, temp_vocals_16k)
 
     local audio_offset_seconds, audio_stream_idx = get_audio_stream_info(current_media_path, "eng")
     if not audio_offset_seconds then audio_offset_seconds = 0.0 end
@@ -904,7 +871,7 @@ local function run_isolate_then_asr(model)
       capture_stdout = false,
       capture_stderr = false,
       env = {
-        PARAKEET_LOG_FILE = utils.join_path(run_dir, "run.log"),
+        string.format("PARAKEET_LOG_FILE=%s", utils.join_path(run_dir, "run.log")),
       },
     }
     local initial_stat = _stat(srt_output_path)
@@ -971,7 +938,7 @@ mp.add_forced_key_binding(key_binding_isolate_asr_slow, "parakeet_slow", functio
 
 log("info", "Parakeet (Multi-Mode) script loaded.")
 log("info", "SRT will be loaded immediately after transcription and selected.")
-log("info", "Temporary files will be cleaned up on MPV shutdown.")
+log("info", "Temporary files are retained in the Parakeet run directory for later review.")
 log("info", "Press '", key_binding_default, "' for Standard Transcription.")
 log("info", "Press '", key_binding_py_float32, "' for Python Float32 Precision.")
 log("info", "Press '", key_binding_ffmpeg_preprocess, "' for FFmpeg Preprocessing (Default Python Precision).")
@@ -986,20 +953,9 @@ log("info", "Temporary file root directory: ", temp_dir)
 log("info", "FFmpeg pre-processing filters: ", ffmpeg_audio_filters)
 
 --- Event handler for MPV's "shutdown" event.
--- This function is called when MPV is closing. It iterates through the
--- `files_to_cleanup_on_shutdown` table and attempts to remove each file
--- listed, using `safe_remove` to handle errors and logging.
--- After attempting cleanup, the `files_to_cleanup_on_shutdown` table is cleared.
+-- Leave per-run artifacts intact so Python-side cleanup can purge old runs.
 mp.register_event("shutdown", function()
-    log("info", "MPV shutdown event. Cleaning up temporary Parakeet files...")
-    if #files_to_cleanup_on_shutdown > 0 then
-        for _, filepath in ipairs(files_to_cleanup_on_shutdown) do
-            safe_remove(filepath, "Shutdown cleanup")
-        end
-        files_to_cleanup_on_shutdown = {} -- Clear the table after attempting cleanup
-    else
-        log("info", "No temporary files registered for cleanup.")
-    end
+    log("info", "MPV shutdown event. Parakeet run artifacts remain available under the temp root.")
     if attach_timer then attach_timer:kill(); attach_timer = nil end
-    log("info", "Parakeet shutdown cleanup finished.")
+    log("info", "Parakeet shutdown handling finished.")
 end)
