@@ -58,6 +58,8 @@ local ffprobe_path = "ffprobe"
 -- @example "/tmp/mpv_parakeet_audio"
 local temp_dir = "C:/Users/mrkun/AppData/Local/Temp/parakeet_runs"
 
+math.randomseed(os.time() + math.floor((mp.get_time() or 0) * 1000) % 1000)
+
 -- Keybindings for different transcription modes.
 local key_binding_default = "Alt+4"             -- Standard transcription (no FFmpeg preprocessing, default Python precision)
 local key_binding_py_float32 = "Alt+5"          -- Python Float32 precision (no FFmpeg preprocessing)
@@ -197,6 +199,40 @@ local function safe_remove(filepath, description)
     else
         log("debug", "Temporary file (" .. (description or "unspecified") .. ") not found for removal, skipping: ", filepath)
     end
+end
+
+local function ensure_directory(path)
+    if not path or path == "" then return false end
+    local info = utils.file_info(path)
+    if info and info.is_dir then return true end
+    local cmd
+    if package.config:sub(1,1) == '\\' then
+        if path:match("^[A-Za-z]:$") then
+            return false
+        end
+        local win_path = path:gsub("/", "\\")
+        cmd = string.format('cmd /C "if not exist "%s" mkdir "%s""', win_path, win_path)
+    else
+        cmd = string.format('mkdir -p "%s"', path)
+    end
+    local ok, _, code = os.execute(cmd)
+    if type(ok) == "number" then
+        return ok == 0
+    end
+    if type(ok) == "boolean" then
+        return ok
+    end
+    return code == 0
+end
+
+local function allocate_run_directory()
+    local stamp = os.date("%Y%m%d-%H%M%S")
+    local suffix = string.format("%08x", math.random(0, 0xffffffff))
+    local run_dir = utils.join_path(temp_dir, stamp .. "_" .. suffix)
+    if ensure_directory(run_dir) then
+        return run_dir
+    end
+    return nil
 end
 
 --- Determines if a media path points to a remote resource (e.g., HTTP/HTTPS).
@@ -339,6 +375,14 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         return
     end
 
+    local run_dir = allocate_run_directory()
+    if not run_dir then
+        log("error", "Failed to create run directory inside '", temp_dir, "'.")
+        abort()
+        return
+    end
+    log("info", "Using run temp directory: ", run_dir)
+
     local current_media_path = mp.get_property_native("path")
     if not current_media_path or current_media_path == "" then
         log("error", "No media file is currently playing.")
@@ -370,7 +414,7 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
         srt_output_path = utils.join_path(media_dir, base_name .. ".srt") -- SRT next to media
     end
 
-    local temp_audio_raw_path = utils.join_path(temp_dir, sanitized_base_name .. "_audio_raw.wav")
+    local temp_audio_raw_path = utils.join_path(run_dir, sanitized_base_name .. "_audio_raw.wav")
     local temp_audio_for_python = temp_audio_raw_path -- This will be the input to Python
 
     -- Ensure raw temp audio path is scheduled for cleanup, regardless of success/failure later
@@ -476,7 +520,7 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     log("info", "FFmpeg raw audio extraction successful: ", temp_audio_raw_path)
 
     if apply_ffmpeg_filters_flag then
-        temp_audio_for_python = utils.join_path(temp_dir, sanitized_base_name .. "_audio_filtered.wav")
+        temp_audio_for_python = utils.join_path(run_dir, sanitized_base_name .. "_audio_filtered.wav")
         if temp_audio_raw_path ~= temp_audio_for_python then
              table.insert(files_to_cleanup_on_shutdown, temp_audio_for_python)
         end
@@ -536,7 +580,15 @@ local function do_transcription_core(force_python_float32_flag, apply_ffmpeg_fil
     table.insert(python_command_args, "--fps=" .. string.format("%.3f", fps))
 
     log("debug", "Running Python script: ", table.concat(python_command_args, " "))
-    local python_res = utils.subprocess({ args = python_command_args, cancellable = false, capture_stdout = true, capture_stderr = true })
+    local python_res = utils.subprocess({
+        args = python_command_args,
+        cancellable = false,
+        capture_stdout = true,
+        capture_stderr = true,
+        env = {
+            PARAKEET_LOG_FILE = utils.join_path(run_dir, "run.log"),
+        },
+    })
 
     if python_res.error then
         log("error", "Failed to launch Parakeet Python script: ", (python_res.error or "Unknown error"))
@@ -603,6 +655,14 @@ local function run_isolate_then_asr(model)
         return
     end
 
+    local run_dir = allocate_run_directory()
+    if not run_dir then
+        log("error", "Failed to create run directory inside '", temp_dir, "'.")
+        abort()
+        return
+    end
+    log("info", "Using run temp directory: ", run_dir)
+
     local current_media_path = mp.get_property_native("path")
     if not current_media_path or current_media_path == "" then
         log("error", "No media file is currently playing.")
@@ -633,8 +693,8 @@ local function run_isolate_then_asr(model)
     end
 
     -- temp_stereo retains source sample rate (no pre-resample)
-    local temp_stereo = utils.join_path(temp_dir, sanitized_base_name .. "_stereo.wav")
-    local temp_vocals = utils.join_path(temp_dir, sanitized_base_name .. "_vocals_16k_mono.wav")
+    local temp_stereo = utils.join_path(run_dir, sanitized_base_name .. "_stereo.wav")
+    local temp_vocals = utils.join_path(run_dir, sanitized_base_name .. "_vocals_16k_mono.wav")
     table.insert(files_to_cleanup_on_shutdown, temp_stereo)
     table.insert(files_to_cleanup_on_shutdown, temp_vocals)
 
@@ -717,7 +777,15 @@ local function run_isolate_then_asr(model)
     for _,v in ipairs(seg_args) do table.insert(parakeet_args, v) end
     local fps = mp.get_property_native("container-fps") or mp.get_property_native("fps") or 24
     table.insert(parakeet_args, "--fps=" .. string.format("%.3f", fps))
-    local python_opts = { args = parakeet_args, cancellable = false, capture_stdout = true, capture_stderr = true }
+    local python_opts = {
+        args = parakeet_args,
+        cancellable = false,
+        capture_stdout = true,
+        capture_stderr = true,
+        env = {
+            PARAKEET_LOG_FILE = utils.join_path(run_dir, "run.log"),
+        },
+    }
     local python_res = utils.subprocess(python_opts)
     if python_res.error then
         log("error", "Failed to launch Parakeet Python script: ", to_str_safe(python_res.error))
@@ -792,7 +860,7 @@ log("info", "Using Python from: ", python_exe)
 log("info", "Using FFmpeg from: ", ffmpeg_path)
 log("info", "Using FFprobe from: ", ffprobe_path)
 log("info", "Parakeet script: ", parakeet_script_path)
-log("info", "Temporary file directory: ", temp_dir)
+log("info", "Temporary file root directory: ", temp_dir)
 log("info", "FFmpeg pre-processing filters: ", ffmpeg_audio_filters)
 
 --- Event handler for MPV's "shutdown" event.
