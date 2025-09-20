@@ -165,7 +165,7 @@ local sep_slow = {
 }
 
 -- Word segmenter knobs (what you used in batch)
-local seg_args = { "--segmenter","word","--max_words","12","--max_duration","6.0","--pause","0.6","--force_float32" }
+local seg_args = { "--segmenter","word","--max_words","12","--max_duration","6.0","--pause","0.6" }
 
 --- FFmpeg audio filter chain for pre-processing mode.
 -- This string defines the audio filters FFmpeg will apply when the
