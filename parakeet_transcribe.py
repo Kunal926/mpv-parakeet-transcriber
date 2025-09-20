@@ -462,7 +462,17 @@ def main():
         model_name = "nvidia/parakeet-tdt-0.6b-v2" # Specify the Parakeet model
         print(f"Loading ASR model '{model_name}'...", file=sys.stderr)
         # Load the ASR model from NeMo's pre-trained models
-        asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=model_name, strict=False)
+        try:
+            asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=model_name, strict=False)
+        except Exception as model_load_exc:
+            err_msg = (
+                f"Failed to load ASR model '{model_name}': {model_load_exc}. "
+                "Check your internet connection or verify the model name."
+            )
+            print(err_msg, file=sys.stderr)
+            _log_event("model_load_failed", error=str(model_load_exc))
+            write_error_srt("Model download failed")
+            sys.exit(1)
 
         model_dtype = torch.float32 # Default to float32
         if use_cuda:
@@ -690,6 +700,10 @@ def main():
         sys.exit(1) 
     except SystemExit: # Allow sys.exit to propagate cleanly
         raise
+    except KeyboardInterrupt:
+        print("Transcription interrupted by user (KeyboardInterrupt).", file=sys.stderr)
+        write_error_srt("Transcription interrupted")
+        sys.exit(1)
     except Exception as e:
         err_msg = f"An unexpected error occurred: {e}"
         print(err_msg, file=sys.stderr)
