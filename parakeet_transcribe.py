@@ -31,6 +31,8 @@ import nemo.collections.asr as nemo_asr
 import numpy as np
 import soundfile as sf
 import torch
+from dataclasses import dataclass
+from typing import Dict, List
 from torch.cuda.amp import autocast
 
 # --- logging bootstrap (robust, race-safe) ---
@@ -207,6 +209,352 @@ def _log_event(event: str, **fields):
         except Exception:
             pass
 # --- end bootstrap ---
+
+
+@dataclass
+class ModelLoadResult:
+    """Container describing the loaded ASR model and runtime settings."""
+
+    model: nemo_asr.models.ASRModel
+    dtype: torch.dtype
+    use_cuda: bool
+    use_amp_autocast: bool
+    load_time_s: float
+    expected_sample_rate: int
+
+
+@dataclass
+class TranscriptionResult:
+    """Structured output of :func:`transcribe_audio`."""
+
+    segments: List[Dict[str, object]]
+    processed_segments: List[Dict[str, object]]
+    audio_duration_seconds: float
+    timings: Dict[str, float]
+    long_audio_settings_applied: bool
+
+
+def write_error_srt(srt_path: str, audio_basename: str, message: str) -> None:
+    """Write a small SRT file describing the encountered error."""
+
+    try:
+        with open(srt_path, "w", encoding="utf-8") as f_err:
+            f_err.write(
+                "1\n00:00:00,000 --> 00:00:01,000\n"
+                f"[{message} for {audio_basename}]\n\n"
+            )
+            f_err.flush()
+            os.fsync(f_err.fileno())
+        print(f"Error SRT written: {message}", file=sys.stderr)
+    except Exception as exc:
+        print(f"Critical error: Could not write error SRT: {exc}", file=sys.stderr)
+
+
+def load_model(force_float32: bool, model_name: str = "nvidia/parakeet-tdt-0.6b-v2") -> ModelLoadResult:
+    """Load the Parakeet ASR model and configure precision/device."""
+
+    use_cuda = torch.cuda.is_available()
+    t0 = time.perf_counter()
+    print(f"Loading ASR model '{model_name}'...", file=sys.stderr)
+    try:
+        asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=model_name, strict=False)
+    except Exception as exc:
+        _log_event("model_load_failed", error=str(exc))
+        raise RuntimeError(
+            f"Failed to load ASR model '{model_name}': {exc}. "
+            "Check your internet connection or verify the model name."
+        ) from exc
+
+    model_dtype = torch.float32
+    if use_cuda:
+        print("CUDA is available. Moving model to GPU.", file=sys.stderr)
+        asr_model = asr_model.cuda()
+        if force_float32:
+            asr_model = asr_model.to(dtype=torch.float32)
+            model_dtype = torch.float32
+            print("Model forced to float32 precision on GPU.", file=sys.stderr)
+        else:
+            try:
+                if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+                    asr_model = asr_model.to(dtype=torch.bfloat16)
+                    model_dtype = torch.bfloat16
+                    print("Model explicitly converted to bfloat16 precision.", file=sys.stderr)
+                else:
+                    asr_model = asr_model.half()
+                    model_dtype = torch.float16
+                    print("bfloat16 not supported, model converted to float16 precision.", file=sys.stderr)
+            except Exception as exc:
+                print(
+                    f"Warning: Could not convert model to bfloat16/float16: {exc}. Using float32 on GPU.",
+                    file=sys.stderr,
+                )
+                asr_model = asr_model.to(dtype=torch.float32)
+                model_dtype = torch.float32
+    else:
+        print("CUDA not available. Using CPU (float32).", file=sys.stderr)
+
+    asr_model.eval()
+    t1 = time.perf_counter()
+    load_time = t1 - t0
+    _log_event("model_loaded", use_cuda=use_cuda, dtype=str(model_dtype), load_s=round(load_time, 3))
+
+    target_sr = asr_model.cfg.preprocessor.sample_rate
+    print(f"Model expects sample rate: {target_sr} Hz. Input audio should match this.", file=sys.stderr)
+
+    use_amp_autocast = use_cuda and not force_float32 and model_dtype != torch.float32
+    return ModelLoadResult(
+        model=asr_model,
+        dtype=model_dtype,
+        use_cuda=use_cuda,
+        use_amp_autocast=use_amp_autocast,
+        load_time_s=load_time,
+        expected_sample_rate=target_sr,
+    )
+
+
+def transcribe_audio(
+    audio_path: str,
+    *,
+    model_result: ModelLoadResult,
+    global_offset_seconds: float,
+    segmenter: str,
+    max_words: int,
+    max_duration: float,
+    pause_threshold: float,
+    fps: float,
+    max_chars_per_line: int,
+    pause_ms: int,
+    punct_pause_ms: int,
+    comma_pause_ms: int,
+    cps: float,
+    use_spacy: bool,
+    min_two_line_chars: int,
+    min_readable: float,
+    coalesce_gap_ms: int,
+    two_line_threshold: float,
+    max_block_duration_s: float,
+    max_merge_gap_ms: int,
+) -> TranscriptionResult:
+    """
+    Transcribe *audio_path* using *model_result* and return processed subtitle segments.
+
+    The signature mirrors the CLI arguments so that notebooks or other Python callers can
+    reuse the pipeline programmatically. Errors are raised to the caller, allowing
+    custom handling (e.g., writing SRT files, retrying, etc.).
+    """
+
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"Audio file not found at '{audio_path}'")
+
+    asr_model = model_result.model
+    model_dtype = model_result.dtype
+    audio_duration_seconds = 0.0
+    actual_sr = None
+    actual_channels = None
+    long_audio_settings_applied = False
+
+    print(f"Getting audio info for: '{audio_path}' (expected to be pre-processed)...", file=sys.stderr)
+    try:
+        info = sf.info(audio_path)
+        audio_duration_seconds = info.duration
+        actual_sr = info.samplerate
+        actual_channels = info.channels
+        print(
+            f"Input audio duration: {audio_duration_seconds:.2f}s, Sample rate: {actual_sr}Hz, Channels: {actual_channels}",
+            file=sys.stderr,
+        )
+        if actual_sr != model_result.expected_sample_rate:
+            print(
+                f"CRITICAL WARNING: Input audio sample rate ({actual_sr}Hz) differs from model's expected rate"
+                f" ({model_result.expected_sample_rate}Hz). Results may be suboptimal.",
+                file=sys.stderr,
+            )
+        if actual_channels != 1:
+            print(
+                f"CRITICAL WARNING: Input audio has {actual_channels} channels. Model expects mono (1 channel)."
+                " Results may be suboptimal.",
+                file=sys.stderr,
+            )
+    except Exception as exc:
+        print(
+            f"Warning: Could not get audio info using soundfile: {exc}. Attempting with librosa for duration.",
+            file=sys.stderr,
+        )
+        try:
+            audio_duration_seconds = librosa.get_duration(path=audio_path)
+            print(f"Input audio duration (via librosa): {audio_duration_seconds:.2f}s", file=sys.stderr)
+        except Exception as duration_exc:
+            raise RuntimeError(f"Could not determine audio duration: {duration_exc}") from duration_exc
+
+    _log_event(
+        "audio_info",
+        duration_s=audio_duration_seconds,
+        samplerate=actual_sr,
+        channels=actual_channels,
+    )
+
+    LONG_AUDIO_THRESHOLD_S = 480
+    if audio_duration_seconds > LONG_AUDIO_THRESHOLD_S:
+        _log_event("long_audio_apply_attempt", threshold_s=LONG_AUDIO_THRESHOLD_S, dur_s=audio_duration_seconds)
+        try:
+            print(
+                f"Audio duration ({audio_duration_seconds:.2f}s) > {LONG_AUDIO_THRESHOLD_S}s. Applying long audio settings.",
+                file=sys.stderr,
+            )
+            asr_model.change_attention_model("rel_pos_local_attn", [256, 256])
+            asr_model.change_subsampling_conv_chunking_factor(1)
+            long_audio_settings_applied = True
+            setattr(asr_model, "_parakeet_long_audio_applied", True)
+            print("Long audio settings applied: Local Attention and Auto Conv Chunking.", file=sys.stderr)
+            _log_event("long_audio_applied", ok=True)
+        except Exception as exc:
+            print(f"Warning: Failed to apply long audio settings: {exc}. Proceeding without them.", file=sys.stderr)
+            _log_event("long_audio_applied", ok=False, error=str(exc))
+
+    print(f"Starting transcription for '{audio_path}' (using file path input)...", file=sys.stderr)
+    transcribe_input_files = [audio_path]
+    _log_event("transcribe_begin", amp_autocast=model_result.use_amp_autocast, dtype=str(model_dtype))
+
+    t1 = time.perf_counter()
+    with autocast(
+        dtype=model_dtype if model_result.use_amp_autocast else torch.float32,
+        enabled=model_result.use_amp_autocast,
+    ):
+        print(
+            f"Transcribing with precision: {model_dtype if model_result.use_cuda else 'float32 (CPU)'}. "
+            f"Autocast enabled: {model_result.use_amp_autocast}",
+            file=sys.stderr,
+        )
+        output_from_transcribe = asr_model.transcribe(
+            transcribe_input_files,
+            timestamps=True,
+            return_hypotheses=True,
+        )
+    t2 = time.perf_counter()
+    _log_event("transcribe_done", asr_s=round(t2 - t1, 3))
+
+    if not output_from_transcribe or not isinstance(output_from_transcribe, list) or not output_from_transcribe[0]:
+        raise RuntimeError("Transcription failed or produced no hypotheses")
+
+    first_result = output_from_transcribe[0]
+    full_transcript = None
+
+    if hasattr(first_result, "text") and hasattr(first_result, "timestamp") and first_result.timestamp is not None:
+        print("Processing output as NeMo Hypothesis object.", file=sys.stderr)
+        hypothesis = first_result
+        full_transcript = hypothesis.text
+        segment_timestamps_from_model = hypothesis.timestamp.get("segment", [])
+        word_timestamps_from_model = hypothesis.timestamp.get("word", [])
+    else:
+        err_msg = "Transcription output format not recognized or timestamp data missing"
+        print(f"Error: {err_msg}", file=sys.stderr)
+        print(f"Type of output_from_transcribe[0]: {type(first_result)}", file=sys.stderr)
+        if hasattr(first_result, "__dict__"):
+            print(f"Vars: {vars(first_result)}", file=sys.stderr)
+        raise RuntimeError(err_msg)
+
+    if os.environ.get("PARAKEET_VERBOSE") == "1":
+        print(f"\nFull Transcript:\n{full_transcript}\n", file=sys.stderr, flush=True)
+
+    segments: List[Dict[str, object]] = []
+    if segment_timestamps_from_model:
+        for seg in segment_timestamps_from_model:
+            text_val = seg.get("segment")
+            start_s = seg.get("start")
+            end_s = seg.get("end")
+            if start_s is None or end_s is None or text_val is None:
+                continue
+            words = []
+            if word_timestamps_from_model:
+                for word_ts in word_timestamps_from_model:
+                    ws = word_ts.get("start")
+                    we = word_ts.get("end")
+                    word = word_ts.get("word")
+                    if ws is None or we is None or word is None:
+                        continue
+                    if ws >= start_s and we <= end_s:
+                        words.append({"word": str(word), "start": float(ws), "end": float(we)})
+            segments.append(
+                {"start": float(start_s), "end": float(end_s), "text": str(text_val), "words": words}
+            )
+    elif word_timestamps_from_model:
+        words_list = []
+        for word_ts in word_timestamps_from_model:
+            ws = word_ts.get("start")
+            we = word_ts.get("end")
+            word = word_ts.get("word")
+            if ws is None or we is None or word is None:
+                continue
+            words_list.append({"word": str(word), "start": float(ws), "end": float(we)})
+        if words_list:
+            text = " ".join(word_info["word"] for word_info in words_list)
+            segments.append(
+                {
+                    "start": words_list[0]["start"],
+                    "end": words_list[-1]["end"],
+                    "text": text,
+                    "words": words_list,
+                }
+            )
+    elif full_transcript is not None:
+        segments.append({"start": 0.0, "end": audio_duration_seconds, "text": full_transcript})
+
+    _log_event(
+        "segments_built",
+        n_segments=len(segments),
+        n_words=sum(len(segment.get("words") or []) for segment in segments),
+    )
+
+    if not segments:
+        raise RuntimeError("No transcript text available")
+
+    if global_offset_seconds != 0.0:
+        print(
+            f"Applying global start offset of {global_offset_seconds:.3f} seconds to all timestamps.",
+            file=sys.stderr,
+        )
+        for seg in segments:
+            seg["start"] += global_offset_seconds
+            seg["end"] += global_offset_seconds
+            if seg.get("words"):
+                for word in seg["words"]:
+                    word["start"] += global_offset_seconds
+                    word["end"] += global_offset_seconds
+
+    processed = postprocess_segments(
+        segments,
+        max_chars_per_line=max_chars_per_line,
+        max_lines=2,
+        pause_ms=pause_ms,
+        punct_pause_ms=punct_pause_ms,
+        comma_pause_ms=comma_pause_ms,
+        cps_target=cps,
+        snap_fps=fps,
+        use_spacy=use_spacy,
+        coalesce_gap_ms=coalesce_gap_ms,
+        two_line_threshold=two_line_threshold,
+        min_readable=min_readable,
+        min_two_line_chars=min_two_line_chars,
+        max_block_duration_s=max_block_duration_s,
+        max_merge_gap_ms=max_merge_gap_ms,
+    )
+    t3 = time.perf_counter()
+    _log_event("postprocess_done", out_events=len(processed), postproc_s=round(t3 - t2, 3))
+    _audit(segments, processed)
+
+    timings = {
+        "asr_s": round(t2 - t1, 3),
+        "postproc_s": round(t3 - t2, 3),
+        "transcribe_total_s": round(t3 - t1, 3),
+    }
+
+    return TranscriptionResult(
+        segments=segments,
+        processed_segments=processed,
+        audio_duration_seconds=audio_duration_seconds,
+        timings=timings,
+        long_audio_settings_applied=long_audio_settings_applied,
+    )
 
 # Ensure repository modules are importable when launched without a
 # preconfigured PYTHONPATH. Python adds the script directory to
@@ -406,13 +754,13 @@ def main():
                         help="Directory for .diag.csv/.diag.json (defaults to RUN_DIR).")
     args = parser.parse_args()
 
-    # Allow CLI flags to prime environment for logging bootstrap
     if args.run_dir:
         os.environ["PARAKEET_RUN_DIR"] = args.run_dir
     _setup_logs()
 
     audio_path = args.audio_file_path
     srt_path = args.srt_output_file_path
+    audio_basename = os.path.basename(audio_path)
     global_offset_seconds = args.audio_start_offset
     force_float32 = args.force_float32
     segmenter = args.segmenter
@@ -433,258 +781,73 @@ def main():
     max_block_duration_s = args.max_block_duration_s
     max_merge_gap_ms = args.max_merge_gap_ms
 
-    # Define a helper function to write error SRTs immediately
-    def write_error_srt(message: str):
-        """Writes a standardized error message to the SRT file and flushes it."""
-        try:
-            with open(srt_path, 'w', encoding='utf-8') as f_err:
-                # Create a minimal SRT with the error message
-                f_err.write(f"1\n00:00:00,000 --> 00:00:01,000\n[{message} for {os.path.basename(audio_path)}]\n\n")
-                f_err.flush() # Ensure the error message is written out
-                os.fsync(f_err.fileno()) # Force write to disk
-            print(f"Error SRT written: {message}", file=sys.stderr)
-        except Exception as e_write:
-            # This is a critical failure if even the error SRT cannot be written
-            print(f"Critical error: Could not write error SRT: {e_write}", file=sys.stderr)
-
     if not os.path.exists(audio_path):
         print(f"Error: Audio file not found at '{audio_path}'", file=sys.stderr)
-        write_error_srt(f"Audio file not found: {os.path.basename(audio_path)}")
+        write_error_srt(srt_path, audio_basename, f"Audio file not found: {audio_basename}")
         sys.exit(1)
 
+    overall_start = time.perf_counter()
+    model_result = None
     asr_model = None
-    long_audio_settings_applied = False # Flag to track if long audio settings were changed
-    use_cuda = torch.cuda.is_available()
-    audio_duration_seconds = 0.0
-
     try:
-        t0 = time.perf_counter()
-        model_name = "nvidia/parakeet-tdt-0.6b-v2" # Specify the Parakeet model
-        print(f"Loading ASR model '{model_name}'...", file=sys.stderr)
-        # Load the ASR model from NeMo's pre-trained models
-        try:
-            asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=model_name, strict=False)
-        except Exception as model_load_exc:
-            err_msg = (
-                f"Failed to load ASR model '{model_name}': {model_load_exc}. "
-                "Check your internet connection or verify the model name."
-            )
-            print(err_msg, file=sys.stderr)
-            _log_event("model_load_failed", error=str(model_load_exc))
-            write_error_srt("Model download failed")
-            sys.exit(1)
+        model_result = load_model(force_float32)
+        asr_model = model_result.model
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        write_error_srt(srt_path, audio_basename, "Model download failed")
+        sys.exit(1)
 
-        model_dtype = torch.float32 # Default to float32
-        if use_cuda:
-            print("CUDA is available. Moving model to GPU.", file=sys.stderr)
-            asr_model = asr_model.cuda()
-            if force_float32:
-                asr_model = asr_model.to(dtype=torch.float32)
-                model_dtype = torch.float32
-                print("Model forced to float32 precision on GPU.", file=sys.stderr)
-            else:
-                # Attempt to use bfloat16 or float16 for better performance if available
-                try:
-                    if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
-                        asr_model = asr_model.to(dtype=torch.bfloat16)
-                        model_dtype = torch.bfloat16
-                        print("Model explicitly converted to bfloat16 precision.", file=sys.stderr)
-                    else:
-                        asr_model = asr_model.half() # .half() corresponds to float16
-                        model_dtype = torch.float16
-                        print("bfloat16 not supported, model converted to float16 precision.", file=sys.stderr)
-                except Exception as e_prec:
-                    print(f"Warning: Could not convert model to bfloat16/float16: {e_prec}. Using float32 on GPU.", file=sys.stderr)
-                    asr_model = asr_model.to(dtype=torch.float32) # Fallback to float32
-                    model_dtype = torch.float32
-        else:
-            print("CUDA not available. Using CPU (float32).", file=sys.stderr)
-        
-        asr_model.eval() # Set model to evaluation mode
-        t1 = time.perf_counter()
-        _log_event("model_loaded", use_cuda=use_cuda, dtype=str(model_dtype), load_s=round(t1 - t0, 3))
-
-        # Get model's expected sample rate
-        target_sr_from_model_cfg = asr_model.cfg.preprocessor.sample_rate
-        print(f"Model expects sample rate: {target_sr_from_model_cfg} Hz. Input audio should match this.", file=sys.stderr)
-
-        print(f"Getting audio info for: '{audio_path}' (expected to be pre-processed)...", file=sys.stderr)
-        try:
-            # Use soundfile to get audio information
-            info = sf.info(audio_path)
-            audio_duration_seconds = info.duration
-            actual_sr = info.samplerate
-            actual_channels = info.channels
-            print(f"Input audio duration: {audio_duration_seconds:.2f}s, Sample rate: {actual_sr}Hz, Channels: {actual_channels}", file=sys.stderr)
-            # Crucial checks for audio properties
-            if actual_sr != target_sr_from_model_cfg:
-                  print(f"CRITICAL WARNING: Input audio sample rate ({actual_sr}Hz) differs from model's expected rate ({target_sr_from_model_cfg}Hz). Results may be suboptimal.", file=sys.stderr)
-            if actual_channels != 1:
-                  print(f"CRITICAL WARNING: Input audio has {actual_channels} channels. Model expects mono (1 channel). Results may be suboptimal.", file=sys.stderr)
-        except Exception as e_info:
-            print(f"Warning: Could not get audio info using soundfile: {e_info}. Attempting with librosa for duration.", file=sys.stderr)
-            try:
-                # Fallback to librosa for duration if soundfile fails
-                audio_duration_seconds = librosa.get_duration(path=audio_path)
-                print(f"Input audio duration (via librosa): {audio_duration_seconds:.2f}s", file=sys.stderr)
-            except Exception as e_lib_dur:
-                err_msg = f"Could not determine audio duration: {e_lib_dur}"
-                print(f"Error: {err_msg}", file=sys.stderr)
-                write_error_srt(err_msg)
-                sys.exit(1)
-        _log_event("audio_info", duration_s=audio_duration_seconds, samplerate=actual_sr if 'actual_sr' in locals() else None,
-                   channels=actual_channels if 'actual_channels' in locals() else None)
-
-        # Configure model for long audio if duration exceeds threshold
-        LONG_AUDIO_THRESHOLD_S = 480 # 8 minutes
-        if audio_duration_seconds > LONG_AUDIO_THRESHOLD_S:
-            _log_event("long_audio_apply_attempt", threshold_s=LONG_AUDIO_THRESHOLD_S, dur_s=audio_duration_seconds)
-            try:
-                print(f"Audio duration ({audio_duration_seconds:.2f}s) > {LONG_AUDIO_THRESHOLD_S}s. Applying long audio settings.", file=sys.stderr)
-                # Change attention mechanism and subsampling for longer audio files
-                asr_model.change_attention_model("rel_pos_local_attn", [256,256])
-                asr_model.change_subsampling_conv_chunking_factor(1)
-                long_audio_settings_applied = True
-                print("Long audio settings applied: Local Attention and Auto Conv Chunking.", file=sys.stderr)
-                _log_event("long_audio_applied", ok=True)
-            except Exception as setting_e:
-                print(f"Warning: Failed to apply long audio settings: {setting_e}. Proceeding without them.", file=sys.stderr)
-                _log_event("long_audio_applied", ok=False, error=str(setting_e))
-        
-        print(f"Starting transcription for '{audio_path}' (using file path input)...", file=sys.stderr)
-        
-        transcribe_input_files = [audio_path] # Model expects a list of file paths
-        # Determine if automatic mixed precision (AMP) should be used with autocast
-        use_amp_autocast = use_cuda and not force_float32 and model_dtype != torch.float32
-
-        _log_event("transcribe_begin", amp_autocast=use_amp_autocast, dtype=str(model_dtype))
-        # Perform transcription within autocast context if using mixed precision
-        with autocast(dtype=model_dtype if use_amp_autocast else torch.float32, enabled=use_amp_autocast):
-              print(f"Transcribing with precision: {model_dtype if use_cuda else 'float32 (CPU)'}. Autocast enabled: {use_amp_autocast}", file=sys.stderr)
-              # Call the transcribe method with timestamp and hypothesis options
-              output_from_transcribe = asr_model.transcribe(transcribe_input_files, timestamps=True, return_hypotheses=True)
-        t2 = time.perf_counter()
-        _log_event("transcribe_done", asr_s=round(t2 - t1, 3))
-
-        if not output_from_transcribe or not isinstance(output_from_transcribe, list) or not output_from_transcribe[0]:
-            err_msg = "Transcription failed or produced no hypotheses"
-            print(f"Error: {err_msg}", file=sys.stderr)
-            write_error_srt(err_msg)
-            sys.exit(1)
-        
-        # The result for a single file is the first element of the list
-        first_result = output_from_transcribe[0]
-        full_transcript = None
-        
-        # Check if the output is a NeMo Hypothesis object and extract data
-        if hasattr(first_result, 'text') and hasattr(first_result, 'timestamp') and first_result.timestamp is not None:
-            print("Processing output as NeMo Hypothesis object.", file=sys.stderr)
-            hypothesis = first_result
-            full_transcript = hypothesis.text
-            # Get segment-level and word-level timestamps if available
-            segment_timestamps_from_model = hypothesis.timestamp.get('segment', [])
-            word_timestamps_from_model = hypothesis.timestamp.get('word', [])
-        else:
-            err_msg = "Transcription output format not recognized or timestamp data missing"
-            print(f"Error: {err_msg}", file=sys.stderr)
-            # Debugging information about the received output
-            print(f"Type of output_from_transcribe[0]: {type(first_result)}", file=sys.stderr)
-            if hasattr(first_result, '__dict__'): print(f"Vars: {vars(first_result)}", file=sys.stderr)
-            write_error_srt(err_msg)
-            sys.exit(1)
-            
-        if os.environ.get("PARAKEET_VERBOSE") == "1":
-            print(f"\nFull Transcript:\n{full_transcript}\n", file=sys.stderr, flush=True)
-
-        # Build segments for post-processing
-        segments = []
-        if segment_timestamps_from_model:
-            for seg in segment_timestamps_from_model:
-                text_val = seg.get("segment")
-                start_s = seg.get("start")
-                end_s = seg.get("end")
-                if start_s is None or end_s is None or text_val is None:
-                    continue
-                words = []
-                if word_timestamps_from_model:
-                    for w in word_timestamps_from_model:
-                        ws = w.get("start")
-                        we = w.get("end")
-                        word = w.get("word")
-                        if ws is None or we is None or word is None:
-                            continue
-                        if ws >= start_s and we <= end_s:
-                            words.append({"word": str(word), "start": float(ws), "end": float(we)})
-                segments.append({"start": float(start_s), "end": float(end_s), "text": str(text_val), "words": words})
-        elif word_timestamps_from_model:
-            words_list = []
-            for w in word_timestamps_from_model:
-                ws = w.get("start")
-                we = w.get("end")
-                word = w.get("word")
-                if ws is None or we is None or word is None:
-                    continue
-                words_list.append({"word": str(word), "start": float(ws), "end": float(we)})
-            if words_list:
-                text = " ".join(w["word"] for w in words_list)
-                segments.append({"start": words_list[0]["start"], "end": words_list[-1]["end"], "text": text, "words": words_list})
-        elif full_transcript is not None:
-            segments.append({"start": 0.0, "end": audio_duration_seconds, "text": full_transcript})
-        _log_event("segments_built", n_segments=len(segments),
-                   n_words=sum(len(s.get("words") or []) for s in segments))
-
-        if not segments:
-            write_error_srt("No transcript text available")
-            return
-
-        if global_offset_seconds != 0.0:
-            print(f"Applying global start offset of {global_offset_seconds:.3f} seconds to all timestamps.", file=sys.stderr)
-            for seg in segments:
-                seg["start"] += global_offset_seconds
-                seg["end"] += global_offset_seconds
-                if seg.get("words"):
-                    for w in seg["words"]:
-                        w["start"] += global_offset_seconds
-                        w["end"] += global_offset_seconds
-
-        processed = postprocess_segments(
-            segments,
+    transcription_result = None
+    try:
+        transcription_result = transcribe_audio(
+            audio_path,
+            model_result=model_result,
+            global_offset_seconds=global_offset_seconds,
+            segmenter=segmenter,
+            max_words=max_words,
+            max_duration=max_duration,
+            pause_threshold=pause_threshold,
+            fps=fps,
             max_chars_per_line=max_chars_per_line,
-            max_lines=2,
             pause_ms=pause_ms,
             punct_pause_ms=punct_pause_ms,
             comma_pause_ms=comma_pause_ms,
-            cps_target=cps,
-            snap_fps=fps,
+            cps=cps,
             use_spacy=use_spacy,
+            min_two_line_chars=min_two_line_chars,
+            min_readable=min_readable,
             coalesce_gap_ms=coalesce_gap_ms,
             two_line_threshold=two_line_threshold,
-            min_readable=min_readable,
-            min_two_line_chars=min_two_line_chars,
             max_block_duration_s=max_block_duration_s,
             max_merge_gap_ms=max_merge_gap_ms,
         )
-        t3 = time.perf_counter()
-        _log_event("postprocess_done", out_events=len(processed), postproc_s=round(t3 - t2, 3))
-        _audit(segments, processed)
-        # Prefer explicit diag_dir, else fall back to current RUN_DIR
+
+        write_start = time.perf_counter()
         diag_dir = args.diag_dir or os.environ.get("PARAKEET_DIAG_DIR") or RUN_DIR
-        write_srt(processed, srt_path, diag_dir=diag_dir)
-        t4 = time.perf_counter()
+        write_srt(transcription_result.processed_segments, srt_path, diag_dir=diag_dir)
+        write_end = time.perf_counter()
+
+        write_duration = write_end - write_start
+        total_duration = write_end - overall_start
+
         print(
             "TIMINGS  load={:.3f}s  asr={:.3f}s  post={:.3f}s  write={:.3f}s  total={:.3f}s".format(
-                t1 - t0, t2 - t1, t3 - t2, t4 - t3, t4 - t0
+                model_result.load_time_s,
+                transcription_result.timings["asr_s"],
+                transcription_result.timings["postproc_s"],
+                write_duration,
+                total_duration,
             ),
             file=sys.stderr,
             flush=True,
         )
         _log_event(
             "timings",
-            model_load_s=round(t1 - t0, 3),
-            asr_s=round(t2 - t1, 3),
-            postproc_s=round(t3 - t2, 3),
-            write_s=round(t4 - t3, 3),
-            total_s=round(t4 - t0, 3),
+            model_load_s=round(model_result.load_time_s, 3),
+            asr_s=transcription_result.timings["asr_s"],
+            postproc_s=transcription_result.timings["postproc_s"],
+            write_s=round(write_duration, 3),
+            total_s=round(total_duration, 3),
         )
         print(f"SRT file generated at '{srt_path}'", file=sys.stderr)
         _log_event("srt_written")
@@ -696,34 +859,41 @@ def main():
         print(err_msg, file=sys.stderr)
         print("The audio file might be too long for your GPU's VRAM even with long audio settings, or the batch size is too large for the model on this GPU.", file=sys.stderr)
         print("Try reducing batch size if applicable, or using a machine with more VRAM, or processing shorter audio segments.", file=sys.stderr)
-        write_error_srt("CUDA OutOfMemoryError") # Write error to SRT
-        sys.exit(1) 
-    except SystemExit: # Allow sys.exit to propagate cleanly
+        write_error_srt(srt_path, audio_basename, "CUDA OutOfMemoryError")
+        sys.exit(1)
+    except SystemExit:
         raise
     except KeyboardInterrupt:
         print("Transcription interrupted by user (KeyboardInterrupt).", file=sys.stderr)
-        write_error_srt("Transcription interrupted")
+        write_error_srt(srt_path, audio_basename, "Transcription interrupted")
         sys.exit(1)
-    except Exception as e:
-        err_msg = f"An unexpected error occurred: {e}"
+    except Exception as exc:
+        err_msg = f"An unexpected error occurred: {exc}"
         print(err_msg, file=sys.stderr)
         import traceback
-        traceback.print_exc(file=sys.stderr) # Print full traceback for debugging
-        write_error_srt(f"Error during transcription: {str(e)[:100]}") # Write concise error to SRT
+        traceback.print_exc(file=sys.stderr)
+        write_error_srt(srt_path, audio_basename, f"Error during transcription: {str(exc)[:100]}")
         sys.exit(1)
     finally:
+        long_audio_flag = False
+        if model_result is not None:
+            long_audio_flag = (
+                transcription_result.long_audio_settings_applied
+                if transcription_result is not None
+                else getattr(model_result.model, "_parakeet_long_audio_applied", False)
+            )
         _cleanup_t0 = time.perf_counter()
-        _log_event("cleanup_begin", long_audio=long_audio_settings_applied)
-        # Cleanup: revert model settings, move model to CPU, and clear cache
+        _log_event("cleanup_begin", long_audio=long_audio_flag)
+
         revert_s = cpu_move_s = empty_cache_s = None
         if asr_model is not None:
-            if long_audio_settings_applied:
+            if long_audio_flag:
                 _revert_t0 = time.perf_counter()
                 try:
                     print("Reverting long audio settings...", file=sys.stderr)
-                    # Revert to default attention and subsampling settings
-                    asr_model.change_attention_model(self_attention_model="rel_pos") # Default for Parakeet
-                    asr_model.change_subsampling_conv_chunking_factor(-1) # Auto, default
+                    asr_model.change_attention_model(self_attention_model="rel_pos")
+                    asr_model.change_subsampling_conv_chunking_factor(-1)
+                    setattr(asr_model, "_parakeet_long_audio_applied", False)
                     print("Long audio settings reverted.", file=sys.stderr)
                 except Exception as revert_e:
                     print(f"Warning: Failed to revert long audio settings: {revert_e}", file=sys.stderr)
@@ -732,11 +902,10 @@ def main():
 
             _cpu_t0 = time.perf_counter()
             try:
-                # Move model to CPU and clear memory
                 if hasattr(asr_model, 'cpu'):
                     asr_model.cpu()
                 del asr_model
-                gc.collect() # Force garbage collection
+                gc.collect()
             except Exception as cleanup_e:
                 print(f"Error during model cleanup: {cleanup_e}", file=sys.stderr)
             finally:
@@ -745,7 +914,7 @@ def main():
             _cache_t0 = time.perf_counter()
             try:
                 if torch.cuda.is_available():
-                    torch.cuda.empty_cache() # Clear CUDA cache
+                    torch.cuda.empty_cache()
             except Exception as cache_e:
                 print(f"Error during cache cleanup: {cache_e}", file=sys.stderr)
             finally:
