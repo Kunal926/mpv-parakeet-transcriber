@@ -128,9 +128,35 @@ def _build_melband(cfg_model: Dict[str, Any]) -> torch.nn.Module:
 def _build_bs(cfg_model: Dict[str, Any]) -> torch.nn.Module:
     BS = _import_bs_class()
     import inspect
-    # keep minimal set that is common across BS‑RoFormer forks
-    kwargs = {k: cfg_model[k] for k in ("dim", "depth") if k in cfg_model}
-    kwargs = {k: v for k, v in kwargs.items() if k in inspect.signature(BS.__init__).parameters}
+    # BS-Roformer needs more parameters passed through
+    kwargs = {}
+    
+    # Core parameters
+    for k in ["dim", "depth", "stereo", "num_stems", "dim_head", "heads", 
+              "attn_dropout", "ff_dropout", "flash_attn", "dim_freqs_in",
+              "time_transformer_depth", "freq_transformer_depth", 
+              "linear_transformer_depth", "mask_estimator_depth"]:
+        if k in cfg_model:
+            kwargs[k] = cfg_model[k]
+    
+    # Most importantly, freqs_per_bands for BS-Roformer
+    if "freqs_per_bands" in cfg_model:
+        kwargs["freqs_per_bands"] = cfg_model["freqs_per_bands"]
+    
+    # STFT parameters
+    for k in ["stft_n_fft", "stft_hop_length", "stft_win_length", "stft_normalized"]:
+        if k in cfg_model:
+            kwargs[k] = cfg_model[k]
+    
+    # Multi-resolution STFT parameters
+    for k in ["multi_stft_resolution_loss_weight", "multi_stft_resolutions_window_sizes", 
+              "multi_stft_hop_size", "multi_stft_normalized"]:
+        if k in cfg_model:
+            kwargs[k] = cfg_model[k]
+    
+    # Filter to only parameters the constructor accepts
+    sig = inspect.signature(BS.__init__)
+    kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
     return BS(**kwargs)
 
 def load_separator(cfg_path: str, ckpt_path: str, device: str = "cuda", fp16: bool = True) -> Separator:
@@ -139,18 +165,37 @@ def load_separator(cfg_path: str, ckpt_path: str, device: str = "cuda", fp16: bo
 
     audio_cfg   = cfg.get("audio", {})
     model_cfg   = cfg.get("model", {})
-    # Heuristic: mel‑band configs have 'num_bands' and STFT params present (as in your karaoke YAML)
-    is_melband  = "num_bands" in model_cfg or "dim_freqs_in" in model_cfg
+    
+    # FIXED: Correct detection logic
+    # BS-Roformer has 'freqs_per_bands', MelBand has 'num_bands'
+    is_melband = "num_bands" in model_cfg
+    is_bs = "freqs_per_bands" in model_cfg
+    
+    # Debug output to confirm detection
+    print(f"[RoFormer Loader] Config has num_bands: {'num_bands' in model_cfg}")
+    print(f"[RoFormer Loader] Config has freqs_per_bands: {'freqs_per_bands' in model_cfg}")
+    
+    if is_bs:
+        print(f"[RoFormer Loader] Detected BS-Roformer with {len(model_cfg['freqs_per_bands'])} frequency bands")
+    elif is_melband:
+        print(f"[RoFormer Loader] Detected MelBand-Roformer with {model_cfg['num_bands']} mel bands")
+    else:
+        print("[RoFormer Loader] Warning: Could not determine model type, defaulting to MelBand")
+        is_melband = True
 
     sample_rate = int(audio_cfg.get("sample_rate", model_cfg.get("sample_rate", 44100)))
     chunk_size  = int(audio_cfg.get("chunk_size", 262144))
     overlap     = int(cfg.get("inference", {}).get("num_overlap", audio_cfg.get("num_overlap", 0)))
 
     dev = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
-    if is_melband:
+    
+    if is_bs:
+        model = _build_bs(model_cfg)
+    elif is_melband:
         model = _build_melband(model_cfg)
     else:
-        model = _build_bs(model_cfg)
+        # Fallback to melband
+        model = _build_melband(model_cfg)
 
     model.eval().to(dev)
     if fp16 and dev.type == "cuda":
