@@ -151,6 +151,12 @@ local key_binding_ffmpeg_py_float32 = "Alt+7" -- FFmpeg Preprocessing + Python F
 local key_binding_isolate_asr_fast = "Alt+8"   -- Vocal isolation + ASR (fast)
 local key_binding_isolate_asr_slow = "Alt+9"   -- Vocal isolation + ASR (high quality)
 
+-- Tailored vocal post-filters for Alt+8/9 (applied after separation, before ASR)
+-- Choose ONE:
+-- Balanced (recommended):
+local alt8_vocal_filters =
+  "highpass=f=80,afftdn=nr=12:nf=-50,agate=threshold=0.02:range=0.06:ratio=2:attack=20:release=250,dynaudnorm=g=31:f=250,alimiter=limit=0.95"
+
 -- === Separation models you selected in A/B ===
 local sep_fast = {
     cfg   = weights_dir .. "/roformer/voc_fv4/voc_gabox.yaml",
@@ -159,8 +165,8 @@ local sep_fast = {
 }
 
 local sep_slow = {
-    cfg   = weights_dir .. "/roformer/karaoke_viperx/config_mel_band_roformer_karaoke.yaml",
-    ckpt  = weights_dir .. "/roformer/karaoke_viperx/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+    cfg   = weights_dir .. "/roformer/bs_viperx/bs_roformer_ep_317_sdr_12.9755.yaml",
+    ckpt  = weights_dir .. "/roformer/bs_viperx/bs_roformer_ep_317_sdr_12.9755.ckpt",
     target = "vocals"
 }
 
@@ -177,7 +183,10 @@ local seg_args = { "--segmenter","word","--max_words","12","--max_duration","6.0
 -- @example "anlmdn" (Audio Non-Local Means de-noiser)
 -- @example "afftdn" (FFT-based de-noiser)
 -- @example "loudnorm,anlmdn" (Apply multiple filters, comma-separated)
-local ffmpeg_audio_filters = "loudnorm=I=-16:LRA=7:TP=-1.5"
+local ffmpeg_audio_filters =
+  "highpass=f=80:order=2,arnndn=m=rnnoise-model-or-preset,afftdn=nf=-28:nr=10:nt=w,deesser,acompressor=ratio=3:threshold=-18dB:attack=5:release=60,loudnorm=I=-16:LRA=7:TP=-3"
+-- -af "highpass=f=80, afftdn=nr=12:nf=-50, agate=threshold=0.02:range=0.06:ratio=2:attack=20:release=250, dynaudnorm=g=31:f=250, alimiter=limit=0.95"
+
 -- ###################################
 
 --- Table to store paths of temporary files for cleanup on MPV shutdown.
@@ -870,25 +879,34 @@ local function run_isolate_then_asr(model)
         return
     end
 
-    -- Downsample to 16 kHz mono float32 (soxr), exactly like batch_parakeet_srt.py
-    mp.osd_message("Preparing 16 kHz mono for ASR...", 3)
+    -- Filter + downsample to 16 kHz mono float32 (soxr), with timing
+    mp.osd_message("Filtering vocals for ASR…", 3)
+    local t_filter = mp.get_time()
+    -- Append aresample so final is 16k mono float32
+    local chain = alt8_vocal_filters
+    if chain ~= "" then
+      chain = chain .. ",aresample=16000:resampler=soxr:precision=28"
+    else
+      chain = "aresample=16000:resampler=soxr:precision=28"
+    end
     local ds_cmd = {
         ffmpeg_path, "-y",
         "-i", temp_vocals_44k,
+        "-af", chain,
         "-ac", "1",
-        "-af", "aresample=resampler=soxr:precision=28",
-        "-ar", "16000",
         "-c:a", "pcm_f32le",
         temp_vocals_16k
     }
+    log("debug", "Alt+8 FFmpeg filter cmd: ", table.concat(ds_cmd, " "))
     local ds_res = utils.subprocess({ args = ds_cmd, cancellable = false, capture_stdout = true, capture_stderr = true })
+    local dt_filter = mp.get_time() - t_filter
+    log("info", ("Alt+8 FILTER+DS DONE in %.2fs"):format(dt_filter))
     if ds_res.error or ds_res.status ~= 0 or (not utils.file_info(temp_vocals_16k)) or (utils.file_info(temp_vocals_16k).size == 0) then
-        log("error", "Downsample step failed. Stderr: ", to_str_safe(ds_res.stderr))
-        mp.osd_message("Parakeet: 16 kHz prep failed.", 7)
+        log("error", "Filter+downsample failed. Stderr: ", to_str_safe(ds_res.stderr))
+        mp.osd_message("Parakeet: vocal filter failed.", 7)
         abort()
         return
     end
-
     mp.osd_message("Transcribing...", 5)
     log("info", "Step C: Running Parakeet transcription on separated vocals")
     local parakeet_args = {
@@ -1003,4 +1021,3 @@ mp.register_event("shutdown", function()
     if attach_timer then attach_timer:kill(); attach_timer = nil end
     log("info", "Parakeet shutdown cleanup finished.")
 end)
-
