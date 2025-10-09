@@ -401,8 +401,8 @@ def transcribe_audio(
                 f"Audio duration ({audio_duration_seconds:.2f}s) > {LONG_AUDIO_THRESHOLD_S}s. Applying long audio settings.",
                 file=sys.stderr,
             )
-            asr_model.change_attention_model("rel_pos_local_attn", [256, 256])
-            asr_model.change_subsampling_conv_chunking_factor(1)
+            asr_model.change_attention_model("rel_pos_local_attn", [768, 768])
+            #asr_model.change_subsampling_conv_chunking_factor(1)
             long_audio_settings_applied = True
             setattr(asr_model, "_parakeet_long_audio_applied", True)
             print("Long audio settings applied: Local Attention and Auto Conv Chunking.", file=sys.stderr)
